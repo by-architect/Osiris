@@ -1,5 +1,7 @@
 # scripts
 
+Two release wizards for the same Android app: one for F-Droid, one for Google Play.
+
 ## fdroid-submit.sh
 
 Interactive wizard for submitting an Android app to F-Droid — it produces the
@@ -87,3 +89,70 @@ The wizard asks which you want:
 
 - <https://f-droid.org/docs/Submitting_to_F-Droid_Quick_Start_Guide/>
 - <https://f-droid.org/docs/Build_Metadata_Reference/>
+
+## play-submit.sh
+
+Uploads a release to **Google Play** through the Play Developer API
+(androidpublisher v3) — the same endpoints Play Console itself uses.
+
+```bash
+./play-submit.sh                      # the wizard
+./play-submit.sh --dry-run            # upload + validate, then throw the edit away
+./play-submit.sh --yes --track internal --rollout 0.1 --key ~/sa.json   # CI
+./play-submit.sh --help
+```
+
+| flag | effect |
+| --- | --- |
+| `-n`, `--dry-run` | insert the edit, upload, validate, then delete it |
+| `-y`, `--yes` | take the defaults and commit without asking (CI) |
+| `--key FILE` | service account JSON key (or `$PLAY_SERVICE_ACCOUNT_JSON`) |
+| `--package ID` | application id; detected from gradle otherwise |
+| `--artifact FILE` | the `.aab` or `.apk`; found under `build/outputs/` otherwise |
+| `--track NAME` | `internal`, `alpha`, `beta`, `production`, or a closed track |
+| `--rollout F` | staged rollout fraction, `0 < F <= 1` |
+| `--draft` | upload as a draft release instead of releasing it |
+| `--notes FILE` | release notes; fastlane changelogs are used otherwise |
+| `--mapping FILE` | R8/ProGuard `mapping.txt`; auto-detected otherwise |
+| `--no-review` | commit with `changesNotSentForReview=true` |
+| `--no-save`, `--forget` | control `~/.config/play-submit/last.conf` |
+
+One API *edit* per run, committed only at the very end:
+
+```
+edits.insert → bundles.upload → deobfuscationFiles.upload
+             → tracks.update → edits.validate → edits.commit
+```
+
+Nothing reaches Google Play until you confirm; `--dry-run` stops after validate,
+and any run that fails part-way deletes its edit instead of leaving it open.
+
+### What it needs
+
+- a **service account JSON key**: enable the *Google Play Android Developer API*
+  in Google Cloud, create a service account, download a JSON key, then invite
+  that account's email in Play Console under *Users and permissions* and grant
+  it release access to the app
+- the app **already created in Play Console**, with its store listing filled in.
+  The API cannot create an app or its listing — do the first release by hand,
+  everything after that with this script
+- a **signed** `.aab`/`.apk` (the script warns if it finds no signature block)
+
+Release notes are read from the same layout F-Droid uses, so both scripts share
+one source of truth:
+
+```
+fastlane/metadata/android/<locale>/changelogs/<versionCode>.txt
+```
+
+Every locale with a changelog for that versionCode is sent.
+
+Authentication is a signed JWT swapped for an access token (`openssl` +
+`curl`), so there is no SDK or `gcloud` to install — only `curl`, `openssl`
+and `python3`.
+
+### References
+
+- <https://developers.google.com/android-publisher/edits>
+- <https://developers.google.com/android-publisher/api-ref/rest>
+
