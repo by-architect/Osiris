@@ -311,8 +311,25 @@ REPO="${REPO/#\~/$HOME}"
 [ -d "$REPO" ] || die "no such directory: $REPO"
 REPO="$(cd "$REPO" && pwd)"
 
+# Flutter keeps its Android project under <flutter dir>/android and writes
+# its outputs to <flutter dir>/build/app/outputs (same detection as fdroid-submit.sh).
+FLUTTER_DIR=""
+for p in "$REPO/pubspec.yaml" "$REPO"/*/pubspec.yaml "$REPO"/*/*/pubspec.yaml; do
+  [ -f "$p" ] || continue
+  d="$(dirname "$p")"
+  grep -qE '^[[:space:]]+sdk:[[:space:]]*flutter' "$p" || continue
+  [ -f "$d/android/app/build.gradle.kts" ] || [ -f "$d/android/app/build.gradle" ] || continue
+  FLUTTER_DIR="${d#"$REPO"}"; FLUTTER_DIR="${FLUTTER_DIR#/}"; FLUTTER_DIR="${FLUTTER_DIR:-.}"
+  break
+done
+FLUTTER_ANDROID=""
+if [ -n "$FLUTTER_DIR" ]; then
+  FLUTTER_ANDROID="$FLUTTER_DIR/android/app"; FLUTTER_ANDROID="${FLUTTER_ANDROID#./}"
+  ok "Flutter app in ${FLUTTER_DIR}/"
+fi
+
 SUBDIR_GUESS=""
-for cand in "${SAVED_SUBDIR:-}" app mobile android .; do
+for cand in "${SAVED_SUBDIR:-}" "$FLUTTER_ANDROID" app mobile android .; do
   [ -n "$cand" ] || continue
   for gf in build.gradle.kts build.gradle; do
     if [ -f "$REPO/$cand/$gf" ]; then SUBDIR_GUESS="$cand"; break 2; fi
@@ -329,6 +346,7 @@ gval() {  # same detection as fdroid-submit.sh: Kotlin or Groovy DSL, no comment
   sed -e 's,//.*,,' "$GRADLE_FILE" \
     | grep -Eo "(^|[^A-Za-z_.])$1[[:space:]]*(=[[:space:]]*)?[\"']?[A-Za-z0-9_.-]+" \
     | sed -E "s/.*$1[[:space:]]*(=[[:space:]]*)?[\"']?//" \
+    | grep -v '^flutter\.' \
     | sed -n 1p
 }
 
@@ -347,9 +365,13 @@ ok "package: $PKG"
 # --- artifact: prefer the App Bundle, that is what Play wants
 if [ -z "$ARTIFACT" ]; then
   ART_GUESS=""
+  FL_OUT=""
+  [ -n "$FLUTTER_DIR" ] && FL_OUT="$REPO/$FLUTTER_DIR/build/app/outputs"
   for pat in "$REPO/$SUBDIR/build/outputs/bundle/release"/*.aab \
              "$REPO/$SUBDIR/build/outputs/apk/release"/*.apk \
-             "$REPO/build/outputs/bundle/release"/*.aab; do
+             "$REPO/build/outputs/bundle/release"/*.aab \
+             ${FL_OUT:+"$FL_OUT/bundle/release"/*.aab} \
+             ${FL_OUT:+"$FL_OUT/flutter-apk/app-release.apk"}; do
     [ -f "$pat" ] || continue
     if [ -z "$ART_GUESS" ] || [ "$pat" -nt "$ART_GUESS" ]; then ART_GUESS="$pat"; fi
   done
@@ -421,7 +443,8 @@ ok "uploaded — versionCode $VCODE"
 # --- mapping file, so crashes are readable in Play Console
 if [ -z "$MAPPING" ]; then
   for m in "$REPO/$SUBDIR/build/outputs/mapping/release/mapping.txt" \
-           "$REPO/$SUBDIR/build/outputs/mapping/releaseRelease/mapping.txt"; do
+           "$REPO/$SUBDIR/build/outputs/mapping/releaseRelease/mapping.txt" \
+           ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/build/app/outputs/mapping/release/mapping.txt"}; do
     [ -f "$m" ] && { MAPPING="$m"; break; }
   done
   if [ -n "$MAPPING" ]; then
@@ -462,6 +485,10 @@ PY
   ok "release notes from $(basename "$NOTESFILE")"
 else
   FL="$REPO/fastlane/metadata/android"
+  # Flutter projects sometimes keep fastlane inside the Flutter dir.
+  if [ ! -d "$FL" ] && [ -n "$FLUTTER_DIR" ] && [ -d "$REPO/$FLUTTER_DIR/fastlane/metadata/android" ]; then
+    FL="$REPO/$FLUTTER_DIR/fastlane/metadata/android"
+  fi
   FOUND=0
   if [ -d "$FL" ]; then
     : > "$WORK/notes.list"

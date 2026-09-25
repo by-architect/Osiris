@@ -223,9 +223,25 @@ REPO="${REPO/#\~/$HOME}"
 REPO="$(cd "$REPO" && pwd)"
 ok "repo: $REPO"
 
+# --- Flutter? Its Android project lives under <flutter dir>/android, the
+# version lives in pubspec.yaml, and F-Droid needs a different build recipe.
+FLUTTER_DIR=""
+for p in "$REPO/pubspec.yaml" "$REPO"/*/pubspec.yaml "$REPO"/*/*/pubspec.yaml; do
+  [ -f "$p" ] || continue
+  d="$(dirname "$p")"
+  grep -qE '^[[:space:]]+sdk:[[:space:]]*flutter' "$p" || continue
+  [ -f "$d/android/app/build.gradle.kts" ] || [ -f "$d/android/app/build.gradle" ] || continue
+  FLUTTER_DIR="${d#"$REPO"}"; FLUTTER_DIR="${FLUTTER_DIR#/}"; FLUTTER_DIR="${FLUTTER_DIR:-.}"
+  break
+done
+if [ -n "$FLUTTER_DIR" ]; then
+  ok "Flutter app in ${FLUTTER_DIR}/"
+  FLUTTER_ANDROID="$FLUTTER_DIR/android/app"; FLUTTER_ANDROID="${FLUTTER_ANDROID#./}"
+fi
+
 # --- subdir (the gradle module that produces the APK)
 SUBDIR_GUESS=""
-for cand in "${SAVED_SUBDIR:-}" app mobile android .; do
+for cand in "${SAVED_SUBDIR:-}" "${FLUTTER_ANDROID:-}" app mobile android .; do
   [ -n "$cand" ] || continue
   for gf in build.gradle.kts build.gradle; do
     if [ -f "$REPO/$cand/$gf" ] && grep -qE 'applicationId|namespace' "$REPO/$cand/$gf" 2>/dev/null; then
@@ -245,17 +261,28 @@ ok "gradle file: ${GRADLE_FILE#"$REPO"/}"
 
 # --- detect identity and version
 # Handles both Kotlin DSL (`applicationId = "x"`) and Groovy (`applicationId "x"`),
-# ignores // comments, and takes the first hit.
+# ignores // comments, and takes the first hit. References like Flutter's
+# `flutter.versionCode` are not values and are skipped.
 gval() {
   sed -e 's,//.*,,' "$GRADLE_FILE" \
     | grep -Eo "(^|[^A-Za-z_.])$1[[:space:]]*(=[[:space:]]*)?[\"']?[A-Za-z0-9_.-]+" \
     | sed -E "s/.*$1[[:space:]]*(=[[:space:]]*)?[\"']?//" \
+    | grep -v '^flutter\.' \
     | sed -n 1p
 }
 APPID_GUESS="$(gval applicationId)"
 [ -n "$APPID_GUESS" ] || APPID_GUESS="$(gval namespace)"
 VNAME_GUESS="$(gval versionName)"
 VCODE_GUESS="$(gval versionCode)"
+
+# Flutter: `version: 1.2.3+45` in pubspec.yaml is versionName+versionCode.
+if [ -n "$FLUTTER_DIR" ] && [ -z "$VNAME_GUESS$VCODE_GUESS" ]; then
+  PUBSPEC_VERSION="$(sed -nE "s/^version:[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\1/p" \
+                      "$REPO/$FLUTTER_DIR/pubspec.yaml" | sed -n 1p)"
+  VNAME_GUESS="${PUBSPEC_VERSION%%+*}"
+  case "$PUBSPEC_VERSION" in *+*) VCODE_GUESS="${PUBSPEC_VERSION#*+}" ;; esac
+  [ -n "$VNAME_GUESS" ] && ok "version from pubspec.yaml: $PUBSPEC_VERSION"
+fi
 
 while :; do
   ask APPID "Application ID" "$APPID_GUESS"
@@ -328,9 +355,41 @@ else
   ok "no obvious proprietary dependencies"
 fi
 
+# Release builds signed with the debug key (the Flutter template does this).
+# F-Droid wants an unsigned APK to sign itself, and Play rejects debug keys.
+if sed -e 's,//.*,,' "$GRADLE_FILE" \
+     | grep -qE 'signingConfig[[:space:]]*=?[[:space:]]*signingConfigs\.(getByName\("debug"\)|debug)([^A-Za-z0-9_]|$)'; then
+  warn "the release build is signed with the debug key (${GRADLE_FILE#"$REPO"/})"
+  note "make the release signingConfig conditional on your key being present,"
+  note "so builds without it — like F-Droid's — come out unsigned"
+  BLOCKERS=$((BLOCKERS+1))
+fi
+
+if [ -n "$FLUTTER_DIR" ]; then
+  PUBSPEC="$REPO/$FLUTTER_DIR/pubspec.yaml"
+  # Plugins that pull in Google Play services / Firebase / ads.
+  PROPRIETARY_PUB="$(grep -oE '^[[:space:]]+(firebase_[a-z_]+|google_mobile_ads|google_sign_in|google_ml_kit[a-z_]*|in_app_purchase|in_app_review|play_integrity[a-z_]*|google_maps_flutter|flutter_facebook_[a-z_]+):' \
+                      "$PUBSPEC" 2>/dev/null | tr -d ' :' | tr '\n' ' ' || true)"
+  if [ -n "${PROPRIETARY_PUB// /}" ]; then
+    warn "Flutter plugins that usually mean proprietary code: $PROPRIETARY_PUB"
+    note "these usually need removing, or an AntiFeature such as NonFreeDep"
+    BLOCKERS=$((BLOCKERS+1))
+  else
+    ok "no obvious proprietary Flutter plugins"
+  fi
+  # F-Droid pins one Flutter release per build; a dev/beta SDK constraint
+  # means no stable Flutter can build the tag.
+  if sed -n '/^environment:/,/^[^[:space:]]/p' "$PUBSPEC" | grep -qE 'sdk:.*[0-9]-[0-9A-Za-z]'; then
+    warn "pubspec.yaml requires a pre-release Dart SDK — only a dev/master Flutter builds it"
+    note "F-Droid maintainers expect a stable Flutter release; relax the 'sdk:' constraint"
+    BLOCKERS=$((BLOCKERS+1))
+  fi
+fi
+
 # Store listing: F-Droid reads it from the app repo, not from the .yml.
 FASTLANE="$REPO/fastlane/metadata/android/en-US"
-if [ -d "$FASTLANE" ] || [ -d "$REPO/metadata/en-US" ] || [ -d "$REPO/$SUBDIR/src/main/play" ]; then
+if [ -d "$FASTLANE" ] || [ -d "$REPO/metadata/en-US" ] || [ -d "$REPO/$SUBDIR/src/main/play" ] \
+   || { [ -n "$FLUTTER_DIR" ] && [ -d "$REPO/$FLUTTER_DIR/fastlane/metadata/android/en-US" ]; }; then
   ok "store listing (fastlane/triple-t metadata) found in the repo"
 else
   warn "no fastlane metadata — your F-Droid listing will have no description"
@@ -440,20 +499,84 @@ FLAVOURS="$(awk '
 [ -n "${FLAVOURS// /}" ] && note "product flavours found: $FLAVOURS"
 ask_opt GRADLEFLAVOUR "Gradle flavour (blank = 'yes', the default variant)" ""
 
+# --- Flutter: which Flutter F-Droid checks out to build with (a srclib ref)
+FLUTTERREF=""
+if [ -n "$FLUTTER_DIR" ]; then
+  note "F-Droid builds Flutter apps with a pinned Flutter checkout (srclib)."
+  FL_GUESS=""
+  # 1) pinned in the repo by fvm / asdf / mise
+  if [ -f "$REPO/$FLUTTER_DIR/.fvmrc" ]; then
+    FL_GUESS="$(sed -nE 's/.*"flutter"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$REPO/$FLUTTER_DIR/.fvmrc" | sed -n 1p)"
+  elif [ -f "$REPO/$FLUTTER_DIR/.fvm/fvm_config.json" ]; then
+    FL_GUESS="$(sed -nE 's/.*"flutterSdkVersion"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$REPO/$FLUTTER_DIR/.fvm/fvm_config.json" | sed -n 1p)"
+  fi
+  for tv in "$REPO/.tool-versions" "$REPO/$FLUTTER_DIR/.tool-versions"; do
+    [ -z "$FL_GUESS" ] && [ -f "$tv" ] && \
+      FL_GUESS="$(awk '$1 == "flutter" { sub(/-stable$/, "", $2); print $2; exit }' "$tv")"
+  done
+  # 2) whatever this machine builds with
+  FL_CHANNEL=""
+  if [ -z "$FL_GUESS" ] && have flutter; then
+    FL_JSON="$(flutter --version --machine 2>/dev/null || true)"
+    FL_GUESS="$(printf '%s' "$FL_JSON" | sed -nE 's/.*"frameworkVersion"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | sed -n 1p)"
+    FL_CHANNEL="$(printf '%s' "$FL_JSON" | sed -nE 's/.*"channel"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | sed -n 1p)"
+    FL_REV="$(printf '%s' "$FL_JSON" | sed -nE 's/.*"frameworkRevision"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | sed -n 1p)"
+    [ -n "$FL_GUESS" ] && note "local Flutter: $FL_GUESS (${FL_CHANNEL:-unknown channel})"
+    # A pre-release version string is not a tag on flutter/flutter; the
+    # commit it was built from is a ref F-Droid can check out.
+    case "$FL_GUESS" in
+      *-*) [ -n "${FL_REV:-}" ] && FL_GUESS="$FL_REV" ;;
+    esac
+  fi
+  ask FLUTTERREF "Flutter version (a tag like 3.24.5, or a commit)" "$FL_GUESS"
+  if ! printf '%s' "$FLUTTERREF" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    warn "'$FLUTTERREF' is not a stable Flutter release"
+    note "maintainers strongly prefer a stable tag; build and test the app on one"
+  fi
+fi
+
 BUILD_BLOCK="$WORK/build.yml"
 {
   printf "  - versionName: '%s'\n" "$VNAME"
   printf '    versionCode: %s\n' "$VCODE"
   printf '    commit: %s\n' "$TAG"
-  [ "$SUBDIR" != "." ] && printf '    subdir: %s\n' "$SUBDIR"
+  if [ -n "$FLUTTER_DIR" ]; then
+    # Build commands run inside subdir, so that is the Flutter project itself.
+    [ "$FLUTTER_DIR" != "." ] && printf '    subdir: %s\n' "$FLUTTER_DIR"
+  else
+    [ "$SUBDIR" != "." ] && printf '    subdir: %s\n' "$SUBDIR"
+  fi
   if [ -n "$JDK" ]; then
     printf '    sudo:\n'
     printf '      - apt-get update\n'
     printf '      - apt-get install -y openjdk-%s-jdk-headless\n' "$JDK"
     printf '      - update-java-alternatives -a\n'
   fi
-  printf '    gradle:\n'
-  printf "      - '%s'\n" "${GRADLEFLAVOUR:-yes}"
+  if [ -n "$FLUTTER_DIR" ]; then
+    # The standard fdroiddata recipe for Flutter: pub's cache lives inside the
+    # build dir so the scanner can remove its prebuilt bits afterwards.
+    FL_FLAVOR=""; FL_APK="app-release.apk"
+    if [ -n "$GRADLEFLAVOUR" ]; then
+      FL_FLAVOR=" --flavor $GRADLEFLAVOUR"; FL_APK="app-$GRADLEFLAVOUR-release.apk"
+    fi
+    PUBCACHE_PATH=".pub-cache"
+    [ "$FLUTTER_DIR" != "." ] && PUBCACHE_PATH="$FLUTTER_DIR/.pub-cache"
+    printf '    output: build/app/outputs/flutter-apk/%s\n' "$FL_APK"
+    printf '    srclibs:\n'
+    printf '      - flutter@%s\n' "$FLUTTERREF"
+    printf '    prebuild:\n'
+    printf '      - export PUB_CACHE=$(pwd)/.pub-cache\n'
+    printf '      - $$flutter$$/bin/flutter config --no-analytics\n'
+    printf '      - $$flutter$$/bin/flutter pub get\n'
+    printf '    scandelete:\n'
+    printf '      - %s\n' "$PUBCACHE_PATH"
+    printf '    build:\n'
+    printf '      - export PUB_CACHE=$(pwd)/.pub-cache\n'
+    printf '      - $$flutter$$/bin/flutter build apk --release%s\n' "$FL_FLAVOR"
+  else
+    printf '    gradle:\n'
+    printf "      - '%s'\n" "${GRADLEFLAVOUR:-yes}"
+  fi
 } > "$BUILD_BLOCK"
 
 YML="$WORK/$APPID.yml"
@@ -491,15 +614,19 @@ else
   if [ -z "$LIC_GUESS" ]; then
     for f in LICENSE LICENSE.md LICENSE.txt LICENCE LICENCE.md COPYING COPYING.md; do
       [ -f "$REPO/$f" ] || continue
-      if   grep -qi "GNU AFFERO GENERAL PUBLIC LICENSE" "$REPO/$f"; then LIC_GUESS="AGPL-3.0-only"
-      elif grep -qi "GNU LESSER GENERAL PUBLIC LICENSE" "$REPO/$f"; then LIC_GUESS="LGPL-3.0-only"
-      elif grep -qi "GNU GENERAL PUBLIC LICENSE" "$REPO/$f"; then
-        if grep -q "Version 3" "$REPO/$f"; then LIC_GUESS="GPL-3.0-only"; else LIC_GUESS="GPL-2.0-only"; fi
-      elif grep -qi "Apache License" "$REPO/$f";        then LIC_GUESS="Apache-2.0"
-      elif grep -qi "MIT License" "$REPO/$f";           then LIC_GUESS="MIT"
-      elif grep -qi "Mozilla Public License" "$REPO/$f"; then LIC_GUESS="MPL-2.0"
-      elif grep -qi "Redistribution and use in source" "$REPO/$f"; then LIC_GUESS="BSD-3-Clause"
-      elif grep -qi "This is free and unencumbered" "$REPO/$f"; then LIC_GUESS="Unlicense"
+      # Only the head: the GPL-3.0 text itself mentions the Affero license
+      # (section 13), so matching the whole file calls every GPL app AGPL.
+      head -n 30 "$REPO/$f" > "$WORK/license.head"
+      LH="$WORK/license.head"
+      if   grep -qi "GNU AFFERO GENERAL PUBLIC LICENSE" "$LH"; then LIC_GUESS="AGPL-3.0-only"
+      elif grep -qi "GNU LESSER GENERAL PUBLIC LICENSE" "$LH"; then LIC_GUESS="LGPL-3.0-only"
+      elif grep -qi "GNU GENERAL PUBLIC LICENSE" "$LH"; then
+        if grep -q "Version 3" "$LH"; then LIC_GUESS="GPL-3.0-only"; else LIC_GUESS="GPL-2.0-only"; fi
+      elif grep -qi "Apache License" "$LH";        then LIC_GUESS="Apache-2.0"
+      elif grep -qi "MIT License" "$LH";           then LIC_GUESS="MIT"
+      elif grep -qi "Mozilla Public License" "$LH"; then LIC_GUESS="MPL-2.0"
+      elif grep -qi "Redistribution and use in source" "$LH"; then LIC_GUESS="BSD-3-Clause"
+      elif grep -qi "This is free and unencumbered" "$LH"; then LIC_GUESS="Unlicense"
       fi
       [ -n "$LIC_GUESS" ] && { ok "license looks like $LIC_GUESS (from $f)"; break; }
     done
@@ -572,7 +699,8 @@ else
   BINARIES=""; SIGNKEY=""
   if [ "$MODE" = "2" ]; then
     note "use %v where the version goes, e.g. .../releases/download/v%v/App-%v.apk"
-    ask BINARIES "Binaries URL pattern" "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/$(basename "$REPO")-%v.apk}"
+    # Name the file after the project, not the local checkout's folder.
+    ask BINARIES "Binaries URL pattern" "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v.apk}"
     say "The signing certificate SHA-256 of your release APK is needed."
     if confirm "Extract it from a local APK now?" y; then
       ask APKPATH "Path to your signed release APK" ""
@@ -650,6 +778,12 @@ else
     [ -n "$SIGNKEY" ] && printf 'AllowedAPKSigningKeys: %s\n\n' "$SIGNKEY"
     printf 'AutoUpdateMode: %s\n' "$AUM"
     printf 'UpdateCheckMode: Tags\n'
+    # The checker reads versions from gradle, where Flutter only has
+    # references; point it at pubspec.yaml's `version: name+code` instead.
+    if [ -n "$FLUTTER_DIR" ]; then
+      UCD_FILE="pubspec.yaml"; [ "$FLUTTER_DIR" != "." ] && UCD_FILE="$FLUTTER_DIR/pubspec.yaml"
+      printf 'UpdateCheckData: %s|version:\\s.+\\+(\\d+)|.|version:\\s(.+)\\+\n' "$UCD_FILE"
+    fi
     printf "CurrentVersion: '%s'\n" "$VNAME"
     printf 'CurrentVersionCode: %s\n' "$VCODE"
   } > "$YML"

@@ -52,9 +52,35 @@ often stall a merge request:
 
 - the release tag missing from the **remote** (F-Droid builds the published tag)
 - prebuilt binaries tracked in git (`.jar`, `.aar`, `.so`, `.apk`, `.keystore`…)
-- proprietary dependencies (Play Services, Firebase, Crashlytics, billing…)
+- proprietary dependencies (Play Services, Firebase, Crashlytics, billing…),
+  and for Flutter apps the plugins that pull them in (`firebase_*`,
+  `google_mobile_ads`, `in_app_purchase`…)
+- a release build signed with the **debug key** (the Flutter template does
+  this) — F-Droid needs builds without your key to come out unsigned
+- for Flutter apps, a **pre-release Dart SDK** constraint in `pubspec.yaml`,
+  which only a dev/master Flutter can build
 - no fastlane metadata, which means an F-Droid listing with no description —
   it offers to create `fastlane/metadata/android/en-US/` for you
+
+### Flutter apps
+
+A Flutter project anywhere in the repo's top two levels (a `pubspec.yaml` that
+depends on the Flutter SDK, with `android/app/` beside it) is recognised:
+
+- the Gradle module defaults to `<flutter dir>/android/app`
+- versionName and versionCode come from `pubspec.yaml` (`version: 1.2.3+45`),
+  since the Gradle file only holds `flutter.versionName`/`flutter.versionCode`
+- the build entry is the fdroiddata Flutter recipe instead of `gradle: yes`:
+  `subdir` is the Flutter project, Flutter itself is a pinned `srclibs` checkout,
+  `prebuild` runs `flutter pub get`, `build` runs `flutter build apk --release`
+  (with `--flavor` if you pick one), `output` points at the APK, and the pub
+  cache is `scandelete`d
+- the Flutter version is read from `.fvmrc`, `.fvm/fvm_config.json` or
+  `.tool-versions`, else from the local `flutter --version`. A pre-release (a
+  master/beta build) is offered as its commit hash, with a warning — F-Droid
+  maintainers expect a stable tag
+- new apps get `UpdateCheckData` pointing at `pubspec.yaml`, so F-Droid's update
+  checker can read versions from it
 
 ### What you need beforehand
 
@@ -108,7 +134,7 @@ Uploads a release to **Google Play** through the Play Developer API
 | `-y`, `--yes` | take the defaults and commit without asking (CI) |
 | `--key FILE` | service account JSON key (or `$PLAY_SERVICE_ACCOUNT_JSON`) |
 | `--package ID` | application id; detected from gradle otherwise |
-| `--artifact FILE` | the `.aab` or `.apk`; found under `build/outputs/` otherwise |
+| `--artifact FILE` | the `.aab` or `.apk`; found under `build/outputs/` (or Flutter's `build/app/outputs/`) otherwise |
 | `--track NAME` | `internal`, `alpha`, `beta`, `production`, or a closed track |
 | `--rollout F` | staged rollout fraction, `0 < F <= 1` |
 | `--draft` | upload as a draft release instead of releasing it |
@@ -145,7 +171,9 @@ one source of truth:
 fastlane/metadata/android/<locale>/changelogs/<versionCode>.txt
 ```
 
-Every locale with a changelog for that versionCode is sent.
+Every locale with a changelog for that versionCode is sent. In Flutter repos
+that keep `fastlane/` inside the Flutter project instead of the repo root, it is
+found there too.
 
 Authentication is a signed JWT swapped for an access token (`openssl` +
 `curl`), so there is no SDK or `gcloud` to install — only `curl`, `openssl`
