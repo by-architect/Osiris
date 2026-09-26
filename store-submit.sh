@@ -609,6 +609,53 @@ remote_tag_sha() {  # what origin's copy of the tag points at (tag object, as lo
   git -C "$REPO" ls-remote origin "refs/tags/$1" 2>/dev/null | awk 'NR==1 {print $1}'
 }
 
+# --- AutoName
+# fdroidserver reads android:label off the <application> element of the app's
+# manifest and stores it as AutoName (common.py, fetch_real_name). CI runs
+# `checkupdates --auto`, which does exactly that, and then fails the job on the
+# diff it produced — so the field has to be in the file from the start. Working
+# it out here means that gate no longer depends on checkupdates being able to
+# run on this machine at all.
+manifest_label() {  # manifest_label <AndroidManifest.xml> — the application label
+  awk 'BEGIN { RS = ">" }
+       /<application[[:space:]]/ {
+         if (match($0, /android:label[ \t]*=[ \t]*"[^"]*"/)) {
+           s = substr($0, RSTART, RLENGTH)
+           sub(/^android:label[ \t]*=[ \t]*"/, "", s)
+           sub(/"$/, "", s)
+           print s
+           exit
+         }
+       }' "$1" 2>/dev/null
+}
+find_autoname() {
+  local m label name sx
+  for m in ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/android/app/src/main/AndroidManifest.xml"} \
+           "$REPO/$SUBDIR/src/main/AndroidManifest.xml" \
+           "$REPO/app/src/main/AndroidManifest.xml" \
+           "$REPO/src/main/AndroidManifest.xml"; do
+    [ -f "$m" ] || continue
+    label="$(manifest_label "$m")"
+    [ -n "$label" ] || continue
+    case "$label" in
+      @string/*)  # resolve it from res/values/strings.xml, as fdroidserver does
+        name="${label#@string/}"
+        sx="$(dirname "$m")/res/values/strings.xml"
+        [ -f "$sx" ] || return 0
+        sed -n "s@.*<string[^>]*name=\"$name\"[^>]*>\([^<]*\)</string>.*@\\1@p" "$sx" | sed -n 1p
+        return 0 ;;
+      @*) return 0 ;;   # some other resource reference: leave it to the maintainers
+      *) printf '%s' "$label"; return 0 ;;
+    esac
+  done
+}
+AUTONAME="$(find_autoname || true)"
+if [ -n "$AUTONAME" ]; then
+  ok "AutoName: $AUTONAME (android:label, the value CI expects)"
+else
+  note "no android:label found — CI's checkupdates may add an AutoName of its own"
+fi
+
 # --- the release itself
 # F-Droid builds a tag and sees only what that tag holds, so the version bump
 # and the "what's new" text have to be in the commit *before* it is tagged.
@@ -1372,6 +1419,14 @@ if [ "$IS_UPDATE" = 1 ]; then
   else
     printf "\nCurrentVersion: '%s'\nCurrentVersionCode: %s\n" "$VNAME" "$CUR_VCODE" >> "$YML"
   fi
+  # An older entry may predate AutoName; CI's checkupdates would add it and then
+  # fail the job on the diff, so put it in now.
+  if [ -n "$AUTONAME" ] && ! grep -q '^AutoName:' "$YML"; then
+    awk -v n="$AUTONAME" '
+      !ins && /^RepoType:/ { print "AutoName: " n; print ""; ins = 1 }
+      { print }' "$YML" > "$YML.new" && mv "$YML.new" "$YML"
+    grep -q '^AutoName:' "$YML" && note "added the AutoName that CI expects"
+  fi
   ok "added versionCode(s) $VCODES to the existing metadata"
 else
   # ---------- new app: ask for everything the entry needs
@@ -1579,6 +1634,7 @@ else
     [ -n "$ISSUES" ]      && printf 'IssueTracker: %s\n' "$ISSUES"
     [ -n "$CHANGELOG" ]   && printf 'Changelog: %s\n' "$CHANGELOG"
     printf '\n'
+    [ -n "$AUTONAME" ]    && printf 'AutoName: %s\n\n' "$AUTONAME"
     if [ -n "$ANTIFEATURES" ]; then
       printf 'AntiFeatures:\n'
       old_ifs="$IFS"; IFS='|'
