@@ -668,6 +668,21 @@ GL_API="${GITLAB_API_ROOT:-https://gitlab.com/api/v4}"
 FDROIDDATA_UPSTREAM="${FDROIDDATA_UPSTREAM:-https://gitlab.com/fdroid/fdroiddata.git}"
 glab_ready() { have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1; }
 
+# glab works out which project it is acting on partly from the current
+# directory's git remotes, even when -R and -H name the projects. The wizard's
+# own cwd is the app's checkout, whose remote is usually GitHub, and glab then
+# gives up with "None of the git remotes configured for this repository point
+# to a known GitLab host. Configured remotes: github.com". Run it from the
+# fdroiddata clone instead: both of its remotes are gitlab.com, and the branch
+# being proposed actually exists there.
+glab_fd() {
+  if [ -d "${FDROIDDATA:-}/.git" ]; then
+    ( cd "$FDROIDDATA" && glab "$@" )
+  else
+    glab "$@"
+  fi
+}
+
 gitlab_get() {  # gitlab_get <api path> — authenticated GET, JSON on stdout
   if glab_ready; then glab api "$1" 2>/dev/null || true
   elif [ -n "${GITLAB_TOKEN:-}" ]; then
@@ -1375,7 +1390,7 @@ if [ "$RFP_WANTED" = 1 ]; then
       warn "dry run — not opening the issue"
     elif have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1; then
       say "opening it with glab…"
-      RFP_URL="$(glab issue create -R "$RFP_PROJECT" --title "$RFP_NAME" \
+      RFP_URL="$(glab_fd issue create -R "$RFP_PROJECT" --title "$RFP_NAME" \
                    --description "$(cat "$RFP_BODY")" --yes 2>&1 \
                  | grep -Eo 'https://[^ ]+/-/issues/[0-9]+' | tail -1 || true)"
       [ -n "$RFP_URL" ] || warn "glab did not report an issue URL — check $RFP_PROJECT"
@@ -1497,7 +1512,7 @@ ok "pushed $BRANCH ($((SECONDS - PUSH_T0))s)"
 MR_URL=""
 if glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
   mr_description > "$WORK/mr.md"
-  MR_OUT="$(glab mr create -R fdroid/fdroiddata -H "$(fork_path "$FORKURL")" \
+  MR_OUT="$(glab_fd mr create -R fdroid/fdroiddata -H "$(fork_path "$FORKURL")" \
               -s "$BRANCH" -b "$UPBRANCH" -t "$COMMITMSG" \
               -d "$(cat "$WORK/mr.md")" --allow-collaboration -y 2>&1 || true)"
   MR_URL="$(printf '%s\n' "$MR_OUT" | grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' | tail -1 || true)"
@@ -1506,6 +1521,9 @@ if glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
   else
     warn "glab did not open the merge request:"
     printf '%s\n' "$MR_OUT" | tail -5 | sed 's/^/       /'
+    note "to retry by hand: cd $FDROIDDATA && glab mr create -R fdroid/fdroiddata \\"
+    note "     -H $(fork_path "$FORKURL") -s $BRANCH -b $UPBRANCH -t \"$COMMITMSG\""
+    note "the link below does the same thing in a browser"
   fi
 fi
 if [ -z "$MR_URL" ]; then
