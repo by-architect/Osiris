@@ -1245,11 +1245,15 @@ step "3/5  Metadata"
 
 # --- the build entry, needed in both modes -----------------------------------
 # F-Droid builds in a clean container; extra setup goes in 'sudo:' lines.
+# 21, not 17: F-Droid's buildserver is Debian trixie now, and trixie has no
+# openjdk-17 at all — a pinned 17 fails with "Unable to locate package".
 if [ "$ASK_ALL" = 1 ]; then
-  ask_opt JDK "JDK to install in the build container (blank = use the image default)" "${SAVED_JDK:-17}"
+  ask_opt JDK "JDK for the build container (21 on today's Debian trixie; blank = image default)" "${SAVED_JDK:-21}"
 else
-  JDK="${SAVED_JDK:-17}"
+  JDK="${SAVED_JDK:-21}"
 fi
+# An old remembered 17 would still break, and so would a pin that outlives the
+# next buildserver bump, so the install below always has a way out.
 case "$JDK" in ''|*[!0-9]*) JDK="" ;; esac
 [ -n "$JDK" ] && ok "build container JDK: $JDK"
 
@@ -1336,9 +1340,12 @@ emit_entry() {  # emit_entry <versionCode> [<target platform> <abi>] — one Bui
     [ "$SUBDIR" != "." ] && printf '    subdir: %s\n' "$SUBDIR"
   fi
   if [ -n "$JDK" ]; then
+    # Falling back to default-jdk-headless keeps the build alive when the pinned
+    # version is not in that release: F-Droid moved to Debian trixie, which
+    # dropped openjdk-17, and the next move will drop something else.
     printf '    sudo:\n'
     printf '      - apt-get update\n'
-    printf '      - apt-get install -y openjdk-%s-jdk-headless\n' "$JDK"
+    printf '      - apt-get install -y openjdk-%s-jdk-headless || apt-get install -y default-jdk-headless\n' "$JDK"
     printf '      - update-java-alternatives -a\n'
   fi
   if [ -z "$FLUTTER_DIR" ]; then
