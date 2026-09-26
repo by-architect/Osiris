@@ -202,14 +202,11 @@ IS_UPDATE=0
 if confirm "Is this app already published on F-Droid (i.e. a version bump)?" n; then
   IS_UPDATE=1
 else
-  step "Before anything else: the RFP issue"
-  say "F-Droid wants a Request For Packaging issue opened first, so a maintainer"
-  say "knows the app is coming."
-  note "https://gitlab.com/fdroid/rfp/-/issues/new"
-  if ! confirm "Have you opened an RFP issue?" n; then
-    say "Open one first, then re-run this script. It only takes a minute."
-    exit 0
-  fi
+  # F-Droid's quick start guide calls a metadata merge request from the
+  # developer "the best way" in; the RFP queue is the alternative path, mostly
+  # for requesting someone else's app. So it's offered, not required.
+  note "A Request For Packaging issue is optional when you send the metadata"
+  note "yourself; the wizard can open one for you once the metadata is written."
 fi
 
 detect_runner
@@ -830,6 +827,119 @@ else
   fi
 fi
 
+# ================================================== 4b. RFP issue (optional)
+# Filled from F-Droid's own template (gitlab.com/fdroid/rfp, the Default issue
+# template) with the answers above. Opened with glab if it's logged in, else
+# GitLab's API with $GITLAB_TOKEN, else as a pre-filled page in the browser
+# for you to check and submit. `gh` can't help: the RFP tracker is on GitLab.
+RFP_URL=""
+RFP_REF=""
+GITLAB_API_ROOT="${GITLAB_API_ROOT:-https://gitlab.com/api/v4}"
+RFP_PROJECT="fdroid/rfp"
+
+urlencode() {  # percent-encode every byte except RFC 3986 unreserved ones
+  local LC_ALL=C s="$1" out="" c hex i
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      # bytes above 0x7F can come back sign-extended (FFFF…E2); the last
+      # two hex digits are the byte either way
+      *) printf -v hex '%02X' "'$c"; out+="%${hex: -2}" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+fastlane_text() {  # fastlane_text <file> — first match in the usual places
+  local f
+  for f in "$REPO/fastlane/metadata/android/en-US/$1" \
+           ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/fastlane/metadata/android/en-US/$1"}; do
+    [ -f "$f" ] && { cat "$f"; return 0; }
+  done
+  return 1
+}
+
+if [ "$IS_UPDATE" = 0 ]; then
+  step "Request For Packaging issue (optional)"
+  if confirm "Open an RFP issue for this app on gitlab.com/$RFP_PROJECT?" n; then
+    RFP_NAME="$(fastlane_text title.txt 2>/dev/null | sed -n 1p || true)"
+    ask RFP_NAME "App name" "${RFP_NAME:-$(basename "$REPO")}"
+    RFP_SUMMARY="$(fastlane_text short_description.txt 2>/dev/null | sed -n 1p || true)"
+    [ -n "$RFP_SUMMARY" ] || RFP_SUMMARY="${SUMMARY:-}"
+    ask RFP_SUMMARY "Summary (max 80 chars)" "$RFP_SUMMARY"
+    RFP_DESC="$(fastlane_text full_description.txt 2>/dev/null || true)"
+    [ -n "$RFP_DESC" ] || RFP_DESC="${FULLDESC:-$RFP_SUMMARY}"
+    ask RFP_WHY "Why should it be in F-Droid (one line)" \
+      "I'm the developer; the metadata merge request is ready to go."
+
+    RFP_BODY="$WORK/rfp.md"
+    {
+      printf '<!-- filled in by fdroid-submit.sh from the RFP template -->\n\n'
+      printf '```yaml\n'
+      printf 'Categories:\n'
+      old_ifs="$IFS"; IFS='|'
+      for c in $CATEGORIES; do printf ' - %s\n' "$c"; done
+      IFS="$old_ifs"
+      printf 'License: %s\n' "$LICENSE"
+      printf 'AuthorName: %s\n' "${AUTHORNAME:-}"
+      printf 'AuthorEmail: %s\n' "${AUTHOREMAIL:-}"
+      printf 'AuthorWebSite: %s\n' "${AUTHORSITE:-}"
+      printf 'WebSite: %s\n' "${WEBSITE:-}"
+      printf 'SourceCode: %s\n' "$SOURCE"
+      printf 'IssueTracker: %s\n' "${ISSUES:-}"
+      printf 'AutoName: %s\n' "$RFP_NAME"
+      printf 'RepoType: git\n'
+      printf 'Repo: %s\n' "$REPOURL"
+      printf '```\n\n'
+      printf '### Why should it be included?\n\n%s\n\n' "$RFP_WHY"
+      printf '### Summary\n\n%s\n\n' "$RFP_SUMMARY"
+      printf '### Description\n\n%s\n\n' "$RFP_DESC"
+      printf 'Metadata: `metadata/%s.yml` on branch `%s` of %s.\n' "$APPID" "$BRANCH" "$FORKURL"
+    } > "$RFP_BODY"
+
+    say "Title: $RFP_NAME"
+    printf '%s' "$DIM"; sed 's/^/   | /' "$RFP_BODY"; printf '%s' "$R"
+
+    if [ "$DRYRUN" = 1 ]; then
+      warn "dry run — not opening the issue"
+    elif have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1; then
+      say "opening it with glab…"
+      RFP_URL="$(glab issue create -R "$RFP_PROJECT" --title "$RFP_NAME" \
+                   --description "$(cat "$RFP_BODY")" --yes 2>&1 \
+                 | grep -Eo 'https://[^ ]+/-/issues/[0-9]+' | tail -1 || true)"
+      [ -n "$RFP_URL" ] || warn "glab did not report an issue URL — check $RFP_PROJECT"
+    elif [ -n "${GITLAB_TOKEN:-}" ]; then
+      say "opening it through the GitLab API…"
+      RFP_STATUS="$(curl -sS -o "$WORK/rfp.json" -w '%{http_code}' \
+        -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        --data-urlencode "title=$RFP_NAME" \
+        --data-urlencode "description@$RFP_BODY" \
+        "$GITLAB_API_ROOT/projects/$(urlencode "$RFP_PROJECT")/issues" || echo 000)"
+      case "$RFP_STATUS" in
+        2*) RFP_URL="$(grep -Eo 'https://[^"]+/-/issues/[0-9]+' "$WORK/rfp.json" | sed -n 1p)" ;;
+        *)  warn "GitLab answered HTTP $RFP_STATUS — the issue was not created"
+            note "the token needs the 'api' scope" ;;
+      esac
+    else
+      # No CLI or token: GitLab's new-issue page takes the title and text as
+      # query parameters, so you only have to check them and press Create.
+      NEWURL="https://gitlab.com/$RFP_PROJECT/-/issues/new?issue%5Btitle%5D=$(urlencode "$RFP_NAME")&issue%5Bdescription%5D=$(urlencode "$(cat "$RFP_BODY")")"
+      say "No glab login or GITLAB_TOKEN — opening a pre-filled issue in your browser."
+      note "check it and press 'Create issue' (sign in to GitLab first if asked)"
+      if have xdg-open; then xdg-open "$NEWURL" >/dev/null 2>&1 &
+      elif have open; then open "$NEWURL" >/dev/null 2>&1 &
+      else note "open this link:"; printf '   %s\n' "$NEWURL"
+      fi
+      ask_opt RFP_URL "Paste the issue's URL once created (blank to skip)" ""
+    fi
+    if [ -n "$RFP_URL" ]; then
+      ok "RFP issue: $RFP_URL"
+      RFP_REF="$RFP_PROJECT#${RFP_URL##*/}"
+    fi
+  fi
+fi
+
 # ==================================================================== 5. push
 step "5/5  Commit and push"
 git -C "$FDROIDDATA" add "metadata/$APPID.yml"
@@ -855,15 +965,18 @@ elif confirm "Commit and push to $FORKURL ($BRANCH)?" n; then
   git -C "$FDROIDDATA" commit -q -m "$COMMITMSG"
   git -C "$FDROIDDATA" push -u origin "$BRANCH"
   ok "pushed"
+  MRURL="https://gitlab.com/$GLUSER/fdroiddata/-/merge_requests/new?merge_request%5Bsource_branch%5D=$BRANCH&merge_request%5Btarget_branch%5D=$UPBRANCH"
+  # Link the RFP so the maintainers see both together and it closes on merge.
+  [ -n "$RFP_REF" ] && MRURL="$MRURL&merge_request%5Bdescription%5D=$(urlencode "Closes $RFP_REF")"
   cat <<DONE
 
    ${B}Open the merge request:${R}
-   https://gitlab.com/$GLUSER/fdroiddata/-/merge_requests/new?merge_request%5Bsource_branch%5D=$BRANCH&merge_request%5Btarget_branch%5D=$UPBRANCH
+   $MRURL
 
    Target it at fdroid/fdroiddata, branch $UPBRANCH.
-   Expect roughly 24-48 hours from merge until the app appears in the repo.
-
 DONE
+  [ -n "$RFP_REF" ] && printf '   It links the RFP issue (%s).\n' "$RFP_REF"
+  printf '   Expect roughly 24-48 hours from merge until the app appears in the repo.\n\n'
 else
   say "Nothing pushed. The branch and file are ready at:"
   note "$FDROIDDATA (branch $BRANCH)"

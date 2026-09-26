@@ -85,8 +85,25 @@ depends on the Flutter SDK, with `android/app/` beside it) is recognised:
 ### What you need beforehand
 
 - a **GitLab account** with a fork of <https://gitlab.com/fdroid/fdroiddata>
-- an **RFP issue** opened at <https://gitlab.com/fdroid/rfp/-/issues> (new apps only)
 - the release **tag pushed** to your app's repository
+
+### RFP issue (optional)
+
+A Request For Packaging issue isn't required when you send the metadata
+yourself — F-Droid's quick start guide calls that merge request the best way
+in. For new apps the wizard offers to open one anyway, after the metadata is
+written, filled from F-Droid's RFP template with your answers (categories,
+license, URLs) plus the summary and description from your fastlane listing.
+It uses the first of these that works:
+
+1. **`glab`**, if it is logged in to gitlab.com
+2. **GitLab's API**, with a personal access token in `$GITLAB_TOKEN` (`api` scope)
+3. **your browser**: a pre-filled new-issue page opens; check it and press
+   *Create issue*, then paste its URL back
+
+`gh` can't be used here: the RFP tracker is on GitLab, not GitHub. The issue
+is linked from the merge request (`Closes fdroid/rfp#N`) so it closes on merge.
+`--dry-run` shows the issue but never opens it.
 
 ### fdroid CLI
 
