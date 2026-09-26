@@ -4658,7 +4658,8 @@ DISTROS="nix|NixOS / Nix (nixpkgs)|wizard_nix|a package in nixpkgs, through a pu
 aur|Arch Linux (AUR)|wizard_aur|a PKGBUILD in the Arch User Repository
 deb|Debian / Ubuntu||coming later
 fedora|Fedora (COPR)||coming later
-flathub|Flathub (every distro)|wizard_flathub|prepared up to the pull request; you open it"
+flathub|Flathub (every distro)|wizard_flathub|prepared up to the pull request; you open it
+snap|Snap Store (every distro)|wizard_snap|built and uploaded; the store reviews it"
 
 distro_field() {  # distro_field <id> <1=id 2=name 3=wizard 4=description>
   printf '%s\n' "$DISTROS" | awk -F'|' -v id="$1" -v f="$2" '$1 == id { print $f }'
@@ -4784,7 +4785,7 @@ store-submit.sh linux — publish an app to several Linux distributions at once.
 
   -h, --help           show this text
   -d, --distros LIST   distros to publish to, skipping the question:
-                       nix, aur, flathub — comma-separated, or "all"
+                       nix, aur, flathub, snap — comma-separated, or "all"
       --repo PATH      the app's git checkout (default: the repo you run it in)
       --config FILE    the shared answers (default: .store-submit.conf in the repo)
   -y, --yes            passed to each distro's wizard
@@ -4857,6 +4858,7 @@ LINUX_CONF="${CONFIG_ARG:-}"
 [ -n "$LINUX_CONF" ] && case "$LINUX_CONF" in /*) ;; *) LINUX_CONF="$PWD/$LINUX_CONF" ;; esac
 linux_app "2/3  Your app — asked once, for every distro"
 case " $CHOSEN " in *" flathub "*) flathub_questions ;; esac
+case " $CHOSEN " in *" snap "*) snap_questions ;; esac
 [ "$SAVE" = 1 ] && cfg_set distros "$CHOSEN"
 
 # ------------------------------------------------------------- 3. publish
@@ -5678,15 +5680,8 @@ done
 [ -n "${CLAIM:-}" ] && ok "app ID $APP_ID ↔ $CLAIM"
 [ "$SAVE" = 1 ] && cfg_set flathub-id "$APP_ID"
 
-# --- network access (a Flatpak permission): guessed from the dependencies
-NET="$(cfg_get flathub-network)"
-if [ -z "$NET" ]; then
-  NET=no
-  { at "$TAG_REF" "$(pp pubspec.yaml)"; at "$TAG_REF" Cargo.lock; at "$TAG_REF" package.json; } 2>/dev/null \
-    | grep -qiE '(^|[^a-z])(http|dio|web_socket|supabase|firebase|reqwest|hyper|ureq|axios|grpc)([^a-z]|$)' && NET=yes
-  if [ "$ASSUME_YES" = 0 ]; then confirm "Does $PNAME use the internet?" "$( [ "$NET" = yes ] && echo y || echo n)" && NET=yes || NET=no; fi
-  [ "$SAVE" = 1 ] && cfg_set flathub-network "$NET"
-fi
+# --- network access (a Flatpak permission), shared with the Snap Store
+ask_network
 }
 
 # ##########################################################################
@@ -5908,7 +5903,7 @@ if [ -z "$META" ] || [ -z "$DESKTOP" ] || [ -z "$ICON" ]; then
     while :; do
       ask CAT "Main menu category ($CATS)" "${CAT:-Utility}"
       case " $CATS " in *" $CAT "*) break ;; esac
-      warn "one of: $CATS"
+      warn "one of: $CATS"; CAT=""
     done
     [ "$SAVE" = 1 ] && cfg_set categories "$CAT;"
     {
@@ -5938,7 +5933,9 @@ if [ -z "$META" ] || [ -z "$DESKTOP" ] || [ -z "$ICON" ]; then
     # the store page text is yours: the README's first paragraph as a start
     README_P="$(for f in README.md README; do at "$TAG_REF" "$f"; done 2>/dev/null | awk '/^#|^\[!|^!\[|^<|^$/ { if (p) exit; next } { p = p (p ? " " : "") $0 } END { print p }' | cut -c1-400)"
     note "a few sentences for the Flathub page, in your own words (Flathub reviews its wording)"
-    ask ABOUT "What the app does" "$README_P"
+    AB_DEF="$(cfg_get about)"; [ -n "$AB_DEF" ] || AB_DEF="$README_P"
+    ask ABOUT "What the app does" "$AB_DEF"
+    [ "$SAVE" = 1 ] && cfg_set about "$ABOUT"
     # screenshots: required. Images in the repo at this tag, or links you give.
     SHOTS="$(grep -iE '(^|/)(screenshots?|screens|images/screenshots?|docs/images?)/[^/]+\.(png|jpe?g|webp)$' "$WORK/tree.txt" | head -5 || true)"
     URLS=""
@@ -6011,7 +6008,7 @@ WD="$CACHE/flathub/$APP_ID"
 REV="$(git -C "$REPO" rev-list -n1 "$TAG_REF")"
 GITURL="$WEB.git"; [ "$FORGE" = git ] && GITURL="$(printf '%s' "$ORIGIN" | sed -E 's#^[^@/]+@([^:]+):#https://\1/#')"
 case "$TAG" in "v$VERSION") TAGPAT='^v([\d.]+)$' ;; *) TAGPAT='^([\d.]+)$' ;; esac
-NET="$(cfg_get flathub-network)"; NET="${NET:-no}"
+NET="$(cfg_get network)"; NET="${NET:-no}"
 ok "network access: $NET"
 
 # install lines for the metadata, relative to where the module builds
@@ -6413,10 +6410,393 @@ handoff_show "Your turn — Flathub wants a person to open this pull request" "$
 }
 
 # ##########################################################################
+#   Snap Store's questions — the snap name, and network access. Part of
+#   "Your app" whenever the Snap Store is among the distros.
+# ##########################################################################
+snap_name_problems() {  # snap_name_problems <name> — one line per rule it breaks
+  local n="$1"
+  [ "${#n}" -le 40 ] || echo "it is longer than 40 characters"
+  printf '%s' "$n" | grep -qE '^[a-z0-9-]+$' || echo "only lowercase letters, digits and - are allowed"
+  printf '%s' "$n" | grep -qE '[a-z]' || echo "it needs at least one letter"
+  case "$n" in -*|*-) echo "it must not start or end with -" ;; esac
+  case "$n" in *--*) echo "it must not have two - in a row" ;; esac
+}
+snap_questions() {
+  local guess first=1
+  guess="$(cfg_get snap-name)"
+  [ -n "$guess" ] || guess="$(printf '%s' "$PNAME" | tr 'A-Z_' 'a-z-' | tr -cd 'a-z0-9-' | sed -E 's/-+/-/g; s/^-//; s/-$//' | cut -c1-40)"
+  while :; do
+    if [ "$first" = 1 ] && [ -n "$(cfg_get snap-name)" ] && [ "$ASK_ALL" = 0 ]; then
+      SNAP_NAME="$guess"; ok "snap name: $SNAP_NAME"
+    else
+      [ "$first" = 1 ] && note "the snap name is unique across the whole Snap Store and can't change after registering"
+      ask SNAP_NAME "Snap name" "$guess"
+    fi
+    first=0
+    PROBS="$(snap_name_problems "$SNAP_NAME")"
+    [ -z "$PROBS" ] && break
+    printf '%s\n' "$PROBS" | while read -r l; do warn "snap name: $l"; done
+    [ "$ASSUME_YES" = 1 ] && die "fix the snap name and re-run"
+    guess="$SNAP_NAME"
+  done
+  [ "${SAVE:-1}" = 1 ] && cfg_set snap-name "$SNAP_NAME"
+  ask_network
+}
+# ask_network — does the app use the internet? (a permission on Flathub and
+# the Snap Store). Guessed from its dependencies; asked once, kept in the config.
+ask_network() {
+  NET="$(cfg_get network)"
+  [ -n "$NET" ] && { ok "network access: $NET"; return 0; }
+  NET=no
+  { at "$TAG_REF" "$(pp pubspec.yaml)"; at "$TAG_REF" Cargo.lock; at "$TAG_REF" package.json; at "$TAG_REF" go.mod; at "$TAG_REF" pyproject.toml; } 2>/dev/null \
+    | grep -qiE '(^|[^a-z])(http|dio|web_socket|supabase|firebase|reqwest|hyper|ureq|axios|grpc|requests|httpx|net/http)([^a-z]|$)' && NET=yes
+  if [ "$ASSUME_YES" = 0 ]; then confirm "Does $PNAME use the internet?" "$( [ "$NET" = yes ] && echo y || echo n)" && NET=yes || NET=no; fi
+  [ "${SAVE:-1}" = 1 ] && cfg_set network "$NET"
+  ok "network access: $NET"
+}
+
+# ##########################################################################
+#   Snap Store wizard — store-submit.sh snap [options]
+#   (body unindented on purpose: its here-documents start at column 0)
+# ##########################################################################
+wizard_snap() {
+#
+# store-submit.sh snap — publish an app to the Snap Store, or a new version.
+#
+# Follows Snapcraft's documentation:
+#   https://ubuntu.com/docs/snapcraft/stable/how-to/publishing/
+#
+# Snapcraft runs in Canonical's own container image (ghcr.io/canonical/
+# snapcraft), so it works on any distro with podman or docker — nothing to
+# install. It writes snapcraft.yaml (or uses yours), builds the snap, logs you
+# in once (in snapcraft's own prompt), registers the name, and uploads. Every
+# new snap and revision is reviewed by the store before it's public.
+
+set -eu
+
+DRYRUN=0
+SAVE=1
+ASSUME_YES=0
+ASK_ALL=0
+REPO_ARG=""
+CHANNEL_ARG=""
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/snap-submit"
+CONF="$CONF_DIR/last.conf"
+CREDS_FILE="$CONF_DIR/credentials"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/store-submit"
+SNAPIMG="${SNAPCRAFT_IMAGE:-ghcr.io/canonical/snapcraft:8_core24}"
+SNAP_WEB="https://snapcraft.io"
+
+usage() {
+  cat <<'USAGE'
+store-submit.sh snap — publish an app to the Snap Store, or update it there.
+
+  -h, --help          show this text
+  -y, --yes           use everything it detects and don't ask
+      --ask           ask every question, including the ones it can answer
+      --repo PATH     the app's git checkout (default: the repo you run it in)
+      --config FILE   the shared answers (default: .store-submit.conf in the repo)
+      --channel NAME  stable, candidate, beta or edge (default: remembered, else stable)
+  -n, --dry-run       build the snap; don't register or upload anything
+      --no-save       do not remember the answers for next time
+      --forget        delete the remembered answers and the saved login, and exit
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    -n|--dry-run) DRYRUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --ask)        ASK_ALL=1 ;;
+    --repo)       REPO_ARG="${2-}"; shift ;;
+    --config)     LINUX_CONF="${2-}"; shift ;;
+    --channel)    CHANNEL_ARG="${2-}"; shift ;;
+    --no-save)    SAVE=0 ;;
+    --forget)     rm -f "$CONF" "$CREDS_FILE"; printf 'forgot %s and the saved login\n' "$CONF"; exit 0 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+WIZ_NAME=snap-submit
+linux_common
+
+SAVED_REPO=""
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF" || warn "could not read $CONF"
+fi
+save_answers() {
+  [ "$SAVE" = 1 ] || return 0
+  mkdir -p "$CONF_DIR"
+  { printf '# written by store-submit.sh snap — safe to delete (or run --forget)\n'
+    printf 'SAVED_REPO=%q\n' "${REPO:-${SAVED_REPO:-}}"; } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+}
+
+# ------------------------------------------------------------------ helpers
+RUNTIME=""
+for r in podman docker; do
+  have "$r" && "$r" info >/dev/null 2>&1 && { RUNTIME="$r"; break; }
+done
+# sc <project dir> <snapcraft args...> — snapcraft in Canonical's container.
+# The login travels as an environment variable, never on the command line.
+sc() {
+  local wd="$1"; shift
+  ( [ -f "$CREDS_FILE" ] && SNAPCRAFT_STORE_CREDENTIALS="$(cat "$CREDS_FILE")" && export SNAPCRAFT_STORE_CREDENTIALS
+    "$RUNTIME" run --rm -v "$wd:/project" -e SNAPCRAFT_STORE_CREDENTIALS "$SNAPIMG" "$@" )
+}
+# docker runs the container as root: hand the files back to you afterwards
+fix_owner() {
+  [ "$RUNTIME" = docker ] || return 0
+  "$RUNTIME" run --rm -v "$1:/project" --entrypoint chown "$SNAPIMG" -R "$(id -u):$(id -g)" /project >/dev/null 2>&1 || true
+}
+
+# =============================================================== 0. orientation
+cat <<BANNER
+
+  ${B}Snap Store wizard${R}
+
+  Six stages:
+    1. your app       — shared with the other distros, plus the snap name
+    2. tools + login  — snapcraft in Canonical's container; your store login
+    3. snapcraft.yaml — yours, or written for your build system
+    4. build          — the snap, built by snapcraft (it lints as it goes)
+    5. register       — the name reserved in the Snap Store (first time)
+    6. upload         — to your channel; the store reviews it before it's public
+
+BANNER
+[ "$DRYRUN" = 1 ] && warn "dry run: the snap is built; nothing is registered or uploaded"
+for t in git curl python3; do have "$t" || die "$t is missing — install it and re-run"; done
+[ -n "$RUNTIME" ] || die "snapcraft runs in a container here: install podman or docker (NixOS: virtualisation.podman.enable = true;)"
+
+# ============================================================== 1. the app
+linux_app "1/6  Your app"
+snap_questions
+
+# ======================================================== 2. tools + login
+step "2/6  Snapcraft and your store login"
+if ! "$RUNTIME" image inspect "$SNAPIMG" >/dev/null 2>&1; then
+  run_logged "$WORK/pull.log" "fetching snapcraft ($SNAPIMG, first time only)" "$RUNTIME" pull "$SNAPIMG" \
+    || { tail -n 4 "$WORK/pull.log" | sed 's/^/     /'; die "couldn't fetch $SNAPIMG"; }
+fi
+ok "snapcraft: $SNAPIMG (via $RUNTIME)"
+
+whoami_ok() { sc "$WORK" whoami > "$WORK/whoami.log" 2>&1 && grep -q '^username:' "$WORK/whoami.log"; }
+if [ "$DRYRUN" = 1 ] && [ ! -f "$CREDS_FILE" ]; then
+  note "dry run: not logging in"
+else
+  while ! { [ -f "$CREDS_FILE" ] && whoami_ok; }; do
+    [ -f "$CREDS_FILE" ] && { warn "the saved Snap Store login doesn't work any more (expired?)"; rm -f "$CREDS_FILE"; }
+    say "The Snap Store needs your developer login, once. Snapcraft asks for it itself:"
+    note "email, password and 2FA code of your Ubuntu One account (none yet? $SNAP_WEB/account)"
+    [ "$ASSUME_YES" = 1 ] && die "log in once without --yes"
+    mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR"
+    TTY=(); [ -t 0 ] && TTY=(-it)
+    "$RUNTIME" run --rm "${TTY[@]+"${TTY[@]}"}" -v "$CONF_DIR:/creds" "$SNAPIMG" export-login /creds/credentials \
+      || warn "snapcraft couldn't log you in"
+    fix_owner "$CONF_DIR"
+    [ -f "$CREDS_FILE" ] && chmod 600 "$CREDS_FILE"
+    [ -f "$CREDS_FILE" ] || { confirm "Try again?" y || die "the Snap Store needs your login to publish"; }
+  done
+  [ -f "$CREDS_FILE" ] && ok "logged in as $(sed -n 's/^username: *//p' "$WORK/whoami.log") (saved in $CREDS_FILE, readable only by you)"
+fi
+
+# ======================================================== 3. snapcraft.yaml
+step "3/6  snapcraft.yaml"
+WD="$CACHE/snap/$SNAP_NAME"
+rm -rf "$WD"; mkdir -p "$WD"
+OWN="$(grep -E '(^|/)(snap/snapcraft\.yaml|snapcraft\.yaml|\.snapcraft\.yaml)$' "$WORK/tree.txt" | head -1 || true)"
+if [ -n "$OWN" ]; then
+  # yours: build it from the tagged source
+  git -C "$REPO" archive "$TAG_REF" | tar x -C "$WD"
+  YAML="$WD/$OWN"
+  YV="$(sed -nE "s/^version:[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\1/p" "$YAML" | head -1)"
+  YN="$(sed -nE "s/^name:[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\1/p" "$YAML" | head -1)"
+  ok "your $OWN (from $TAG)"
+  [ -n "$YV" ] && [ "$YV" != "$VERSION" ] && warn "it says version $YV, the release is $VERSION"
+  [ -n "$YN" ] && [ "$YN" != "$SNAP_NAME" ] && { warn "it names the snap '$YN'"; SNAP_NAME="$YN"; }
+else
+  GUI=0; EXT=""; BUILD_PKGS=""; STAGE_PKGS=""
+  case "$KIND" in
+    flutter) GUI=1 ;;
+    rust)  at "$TAG_REF" Cargo.lock | grep -qE '^name = "(gtk4|libadwaita|gtk|iced|egui|eframe|slint|winit|tauri|relm4)"' && GUI=1
+           at "$TAG_REF" Cargo.lock | grep -q '^name = "openssl-sys"' && { BUILD_PKGS="libssl-dev pkg-config"; STAGE_PKGS="libssl3t64"; } ;;
+    meson|cmake) { for f in $(grep -E '(^|/)(meson\.build|CMakeLists\.txt)$' "$WORK/tree.txt"); do at "$TAG_REF" "$f"; done; } \
+                   | grep -qiE "gtk|libadwaita|Qt6|Qt5" && GUI=1 ;;
+  esac
+  [ "$GUI" = 1 ] && EXT="gnome"
+  ABOUT="$(cfg_get about)"
+  if [ -z "$ABOUT" ]; then
+    README_P="$(for f in README.md README; do at "$TAG_REF" "$f"; done 2>/dev/null | awk '/^#|^\[!|^!\[|^<|^$/ { if (p) exit; next } { p = p (p ? " " : "") $0 } END { print p }' | cut -c1-400)"
+    note "a few sentences for the store page, in your own words"
+    ask ABOUT "What the app does" "${README_P:-$DESC}"
+    [ "$SAVE" = 1 ] && cfg_set about "$ABOUT"
+  fi
+  SUMMARY="$DESC"
+  if [ "${#SUMMARY}" -gt 78 ]; then
+    warn "the Snap Store's summary is at most 78 characters (yours is ${#SUMMARY})"
+    while [ "${#SUMMARY}" -gt 78 ]; do ask SUMMARY "A shorter summary" "$(printf '%s' "$DESC" | cut -c1-78)"; done
+  fi
+  TITLE="$(cfg_get display-name)"; [ -n "$TITLE" ] || TITLE="$(printf '%s' "$PNAME" | sed -E 's/[-_]/ /g; s/(^| )([a-z])/\1\u\2/g')"
+  # the icon: the one Flathub uses, or the app's own
+  ICON="$(grep -E "(^|/)$(cfg_get flathub-id | sed 's/[.]/\\./g')\\.(svg|png)$" "$WORK/tree.txt" 2>/dev/null | head -1 || true)"
+  [ -n "$ICON" ] || ICON="$(grep -iE '\.(png|svg)$' "$WORK/tree.txt" | grep -iE 'icon|logo|launcher' | head -1 || true)"
+  GITURL_SNAP="$WEB.git"
+  [ "$FORGE" = git ] && GITURL_SNAP="$(printf '%s' "$ORIGIN" | sed -E 's#^[^@/]+@([^:]+):#https://\1/#')"
+  mkdir -p "$WD/snap/gui"
+  [ -n "$ICON" ] && at "$TAG_REF" "$ICON" > "$WD/snap/gui/$SNAP_NAME.${ICON##*.}"
+  python3 - "$WD/snap/snapcraft.yaml" "$SNAP_NAME" "$TITLE" "$VERSION" "$SUMMARY" "$ABOUT" "$SPDX" "$HOMEPAGE" "$WEB" \
+          "$KIND" "$GITURL_SNAP" "$TAG" "$PROOT" "$MAIN_GUESS" "$EXT" "$NET" "$BUILD_PKGS" "$STAGE_PKGS" "${ICON:+snap/gui/$SNAP_NAME.${ICON##*.}}" <<'PY' \
+    || die "couldn't write snapcraft.yaml"
+import json, sys
+(out, name, title, version, summary, about, spdx, homepage, web, kind, giturl, tag, proot, cmd,
+ ext, net, build_pkgs, stage_pkgs, icon) = sys.argv[1:20]
+q = lambda s: json.dumps(s, ensure_ascii=False)          # a YAML-safe string
+part = {"source": giturl, "source-tag": tag}
+if proot != ".":
+    part["source-subdir"] = proot
+command = "bin/" + cmd
+if kind == "flutter":
+    part.update({"plugin": "flutter", "flutter-target": "lib/main.dart"}); command = cmd
+elif kind == "rust":
+    part["plugin"] = "rust"
+elif kind == "go":
+    part.update({"plugin": "go", "build-snaps": ["go/latest/stable"]})
+elif kind == "python":
+    part["plugin"] = "python"
+elif kind == "node":
+    part.update({"plugin": "npm", "npm-include-node": True, "npm-node-version": "22.12.0"})
+elif kind == "meson":
+    part.update({"plugin": "meson", "meson-parameters": ["--prefix=/usr", "--buildtype=release"]}); command = "usr/bin/" + cmd
+elif kind == "cmake":
+    part.update({"plugin": "cmake", "cmake-parameters": ["-DCMAKE_INSTALL_PREFIX=/usr", "-DCMAKE_BUILD_TYPE=Release"]}); command = "usr/bin/" + cmd
+elif kind == "make":
+    part.update({"plugin": "make", "make-parameters": ["PREFIX=/usr"]}); command = "usr/bin/" + cmd
+if build_pkgs: part["build-packages"] = build_pkgs.split()
+if stage_pkgs: part["stage-packages"] = stage_pkgs.split()
+app = {"command": command}
+if ext: app["extensions"] = [ext]
+plugs = (["network"] if net == "yes" else []) + ([] if ext else ["home"])
+if plugs: app["plugs"] = plugs
+L = []
+L.append("name: " + name)
+L.append("title: " + q(title))
+L.append("version: " + q(version))
+L.append("summary: " + q(summary))
+L.append("description: |")
+L += ["  " + l for l in (about or summary).splitlines()]
+L.append("license: " + spdx)
+L.append("website: " + homepage)
+L.append("source-code: " + web)
+if "github.com" in web or "gitlab.com" in web or "codeberg.org" in web:
+    L.append("issues: " + web + "/issues")
+if icon: L.append("icon: " + icon)
+L += ["", "base: core24", "grade: stable", "confinement: strict", "", "apps:", "  %s:" % name]
+L.append("    command: " + app["command"])
+if "extensions" in app: L.append("    extensions: [%s]" % ", ".join(app["extensions"]))
+if "plugs" in app: L.append("    plugs: [%s]" % ", ".join(app["plugs"]))
+L += ["", "parts:", "  %s:" % name]
+for k, v in part.items():
+    if isinstance(v, list):   L.append("    %s: [%s]" % (k, ", ".join(v)))
+    elif isinstance(v, bool): L.append("    %s: %s" % (k, "true" if v else "false"))
+    else:                     L.append("    %s: %s" % (k, q(v) if k in ("source-tag", "npm-node-version") else v))
+open(out, "w").write("\n".join(L) + "\n")
+PY
+  YAML="$WD/snap/snapcraft.yaml"
+  ok "wrote snapcraft.yaml ($KIND, core24${EXT:+, the $EXT extension}, strict confinement)"
+fi
+echo; sed 's/^/     /' "$YAML"; echo
+
+# ================================================================= 4. build
+step "4/6  Build"
+while :; do
+  if run_logged "$WORK/pack.log" "snapcraft pack (a first build takes a while)" sc "$WD" pack; then
+    fix_owner "$WD"
+    SNAPFILE="$(cd "$WD" && ls -t ./*.snap 2>/dev/null | head -1 || true)"
+    [ -n "$SNAPFILE" ] && { ok "built ${SNAPFILE#./} ($(du -h "$WD/$SNAPFILE" | cut -f1))"; break; }
+    bad "snapcraft finished but no .snap file appeared"
+  else
+    fix_owner "$WD"
+    bad "the build failed:"
+  fi
+  grep -vE '^\s*$' "$WORK/pack.log" | tail -n 15 | cut -c1-200 | sed 's/^/     /'
+  grep -qiE "Could not find a required package|Unable to locate package" "$WORK/pack.log" \
+    && note "a build-packages/stage-packages name isn't an Ubuntu 24.04 package — check them at https://packages.ubuntu.com"
+  [ "$ASSUME_YES" = 1 ] && { KEEP_WORK=1; die "the build failed (log: $WORK/pack.log)"; }
+  say "e) edit snapcraft.yaml (in ${EDITOR:-vi}), then build again     l) read the whole log"
+  say "r) build again as it is     q) quit"
+  ask CHOICE "Choice" "e"
+  case "$CHOICE" in
+    e|E) "${EDITOR:-vi}" "$YAML" ;;
+    l|L) "${PAGER:-less}" "$WORK/pack.log" || cat "$WORK/pack.log" ;;
+    q|Q) note "snapcraft.yaml is in $WD"; exit 1 ;;
+  esac
+done
+# snapcraft lints while it packs: pass on what it said
+if grep -qiE '^Lint (warnings|OK)' "$WORK/pack.log"; then
+  if grep -qi '^Lint warnings' "$WORK/pack.log"; then
+    warn "snapcraft's linter says:"; sed -n '/^Lint warnings/,/^[A-Z][a-z]* /p' "$WORK/pack.log" | head -12 | sed 's/^/       /'
+  else ok "snapcraft's linter: no warnings"; fi
+fi
+note "snapd can't run on every distro — try it on Ubuntu (or any snapd system): sudo snap install --dangerous $WD/${SNAPFILE#./}"
+
+save_answers
+if [ "$DRYRUN" = 1 ]; then
+  warn "dry run — built, nothing registered or uploaded; it's in $WD"
+  exit 0
+fi
+
+# ============================================================== 5. register
+step "5/6  The name in the Snap Store"
+if sc "$WORK" names > "$WORK/names.log" 2>&1 && awk 'NR > 1 { print $1 }' "$WORK/names.log" | grep -qxF "$SNAP_NAME"; then
+  ok "'$SNAP_NAME' is registered to you"
+else
+  go "Register the name '$SNAP_NAME' in the Snap Store? (it's yours for good)" || die "a snap needs its name registered before it can be uploaded"
+  if sc "$WORK" register --yes "$SNAP_NAME" > "$WORK/register.log" 2>&1; then
+    ok "registered '$SNAP_NAME'"
+  else
+    tail -n 4 "$WORK/register.log" | sed 's/^/     /'
+    if grep -qiE "already (registered|taken)|reserved|not available" "$WORK/register.log"; then
+      note "pick another name — for an unofficial snap, Snapcraft suggests <name>-<your username>"
+      [ "$SAVE" = 1 ] && cfg_set snap-name ""
+      die "'$SNAP_NAME' isn't available — run again to choose another name"
+    fi
+    die "registering the name failed"
+  fi
+fi
+
+# ================================================================ 6. upload
+step "6/6  Upload"
+CHANNEL="${CHANNEL_ARG:-$(cfg_get snap-channel)}"
+[ -n "$CHANNEL" ] || { note "stable is what people get by default; candidate, beta and edge are for testers"; ask CHANNEL "Release to channel" "stable"; }
+case "$CHANNEL" in stable|candidate|beta|edge|*/*) ;; *) die "channel must be stable, candidate, beta or edge" ;; esac
+[ "$SAVE" = 1 ] && cfg_set snap-channel "$CHANNEL"
+go "Upload ${SNAPFILE#./} and release it to $CHANNEL?" || { note "the snap is in $WD"; exit 0; }
+run_logged "$WORK/upload.log" "uploading to the Snap Store (it scans the snap as it arrives)" sc "$WD" upload --release="$CHANNEL" "/project/${SNAPFILE#./}" \
+  || { tail -n 8 "$WORK/upload.log" | sed 's/^/     /'; die "the upload failed — the snap is in $WD"; }
+REV="$(grep -oE 'Revision [0-9]+' "$WORK/upload.log" | head -1 | grep -oE '[0-9]+' || true)"
+ok "uploaded${REV:+ as revision $REV}"
+if grep -qiE "manual review|pending|held for review" "$WORK/upload.log"; then
+  warn "the store holds it for review before it goes public — you'll get an email; nothing else to do"
+elif grep -qiE "released" "$WORK/upload.log"; then
+  ok "released to $CHANNEL"
+fi
+sc "$WORK" status "$SNAP_NAME" > "$WORK/status.log" 2>&1 && { sed 's/^/     /' "$WORK/status.log" | head -12; }
+
+printf '\n   %sDone.%s %s %s → %s\n   %s/%s\n\n' "$B" "$R" "$SNAP_NAME" "$VERSION" "$CHANNEL" "$SNAP_WEB" "$SNAP_NAME"
+say "  • People install it with: sudo snap install $SNAP_NAME"
+say "  • New snaps and revisions are reviewed by the store first — watch your email."
+say "  • Its page (description, screenshots, categories): $SNAP_WEB/$SNAP_NAME/listing"
+say "  • Next release: run store-submit.sh snap (or linux) again."
+echo
+}
+
+# ##########################################################################
 #   store-submit.sh <store> [options] — that store's wizard, directly
 # ##########################################################################
 case "${1-}" in
-  fdroid|play|linux|nix|aur|flathub) WIZARD="$1"; shift; "wizard_$WIZARD" "$@"; exit ;;
+  fdroid|play|linux|nix|aur|flathub|snap) WIZARD="$1"; shift; "wizard_$WIZARD" "$@"; exit ;;
 esac
 
 # ##########################################################################
@@ -6450,7 +6830,7 @@ store's wizard.
   store-submit.sh [options]             the store picker (options below)
   store-submit.sh fdroid|play|linux ... one store's wizard directly, e.g.
                                           store-submit.sh fdroid --yes
-  store-submit.sh nix|aur|flathub ...   one Linux distro's wizard directly
+  store-submit.sh nix|aur|flathub|snap  one Linux distro's wizard directly
                                         (store-submit.sh <store> --help)
 
   -h, --help          show this text
@@ -6872,6 +7252,14 @@ needs_flathub() {
   note "you open the pull request yourself (Flathub's policy); the wizard ends with the link"
   return 0
 }
+needs_snap() {
+  local n
+  n="$(sed -nE 's/^[[:space:]]*snap-name[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$REPO/.store-submit.conf" 2>/dev/null | tail -1)"
+  [ -n "$n" ] && need_ok "snap name: $n" || note "the snap name is asked once (it's unique store-wide and permanent)"
+  git -C "$REPO" ls-files 2>/dev/null | grep -qE '(^|/)(snap/)?\.?snapcraft\.yaml$' && need_ok "your snapcraft.yaml is used" \
+    || note "no snapcraft.yaml — the wizard writes one for your build system"
+  return 0
+}
 needs_aur() {
   # the AUR's first rule: nothing Arch already ships in its official repos
   local name
@@ -7085,6 +7473,14 @@ tools_flathub() {
   need gh      "your fork of the Flathub repository"
   if have flatpak && flatpak info org.flatpak.Builder >/dev/null 2>&1; then ok "org.flatpak.Builder (Flathub's builder and linter)"
   else note "  org.flatpak.Builder isn't installed — the wizard installs it (for your user)"; fi
+}
+tools_snap() {
+  local r="" k
+  for k in podman docker; do have "$k" && "$k" info >/dev/null 2>&1 && { r="$k"; break; }; done
+  if [ -n "$r" ]; then ok "$r — snapcraft runs in Canonical's container, nothing to install"
+  else bad "podman or docker — needed to run snapcraft (NixOS: virtualisation.podman.enable = true;)"; note "  $(install_hint podman)"; MISSING=$((MISSING + 1)); fi
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/snap-submit/credentials" ] && ok "Snap Store login saved" \
+    || note "  no Snap Store login yet — the wizard has snapcraft ask for it once"
 }
 tools_linux() {
   local d
