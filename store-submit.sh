@@ -1252,8 +1252,13 @@ if [ "$ASK_ALL" = 1 ]; then
 else
   JDK="${SAVED_JDK:-21}"
 fi
-# An old remembered 17 would still break, and so would a pin that outlives the
-# next buildserver bump, so the install below always has a way out.
+# A 17 remembered from an earlier run is a pin that cannot resolve on trixie at
+# all, so move it on rather than emitting an install line that only survives
+# because of its fallback.
+if [ "$JDK" = 17 ]; then
+  JDK=21
+  note "remembered JDK 17, but Debian trixie has none — using 21"
+fi
 case "$JDK" in ''|*[!0-9]*) JDK="" ;; esac
 [ -n "$JDK" ] && ok "build container JDK: $JDK"
 
@@ -2021,7 +2026,9 @@ if [ "$RUNNER" != none ]; then
     warn "checkupdates could not run:"
     tail -5 "$WORK/checkupdates.log" | sed 's/^/     /'
     note "CI runs it too, and fails the job on any diff it would produce"
-    if ! confirm "Push anyway?" n; then
+    note "AutoName is already in the file, so this is only a second opinion —"
+    note "what it would still catch is a newer tag than the one being submitted"
+    if ! go "Push anyway?"; then
       KEEP_WORK=1
       die "the log is in $WORK/checkupdates.log"
     fi
