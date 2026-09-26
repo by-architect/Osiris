@@ -1620,6 +1620,7 @@ PYSCHEMA
   if [ "$YMLSUM" != "$(cksum < "$FDROIDDATA/metadata/$APPID.yml")" ]; then
     note "rewritemeta reformatted the file — that is normal"
   fi
+
   # The full build is the best predictor of acceptance, but slow (Android SDK,
   # the whole toolchain): only with --build, or when asked for with --ask.
   if [ "$RUN_BUILD" = 1 ] || { [ "$ASK_ALL" = 1 ] && confirm "Run 'fdroid build -v -l $APPID' now (slow)?" n; }; then
@@ -1813,6 +1814,8 @@ mr_description() {
 
 if [ "$DRYRUN" = 1 ]; then
   warn "dry run — not committing, pushing or opening a merge request"
+  note "so `fdroid checkupdates --auto` was not run either: it needs the commit,"
+  note "and CI fails the job on any diff it would produce"
   note "$FDROIDDATA (branch $BRANCH)"
   exit 0
 fi
@@ -1828,6 +1831,49 @@ if [ -z "$(git -C "$FDROIDDATA" config user.email 2>/dev/null || true)" ]; then
            -c "user.email=$(git -C "$REPO" config user.email 2>/dev/null || echo "${AUTHOREMAIL:-nobody@example.com}")")
 fi
 git -C "$FDROIDDATA" "${ID_ARGS[@]}" commit -q -m "$COMMITMSG"
+
+# fdroiddata's CI runs `fdroid checkupdates --auto` on the branch and then fails
+# the job on any diff it produced: whatever that command writes — AutoName, read
+# out of the app's AndroidManifest, or a build for a newer tag — has to be in the
+# file already. Nothing else tells you this; lint and the schema are both happy
+# without it. It refuses to run on a metadata repo with uncommitted changes, so
+# it belongs here, just after the commit, and what it writes is folded into that
+# same commit to keep the merge request to one clean change. It clones the app
+# repo, so give it a moment.
+if [ "$RUNNER" != none ]; then
+  # Its idea of "uncommitted" counts untracked files, and it says so only as
+  # "Build metadata git repo has uncommited changes!" — clear that up first.
+  # (build/ repo/ tmp/ are gitignored in fdroiddata, so they do not count.)
+  LEFTOVER="$(git -C "$FDROIDDATA" status --porcelain --untracked-files 2>/dev/null)"
+  if [ -n "$LEFTOVER" ]; then
+    warn "the clone is not clean, and checkupdates refuses to run if it is not:"
+    printf '%s\n' "$LEFTOVER" | head -5 | sed 's/^/       /'
+    if confirm "Remove these (the clone is only a scratch area)?" n; then
+      git -C "$FDROIDDATA" clean -qfd
+      git -C "$FDROIDDATA" checkout -- . 2>/dev/null || true
+    fi
+  fi
+  say "fdroid checkupdates --auto $APPID (the CI check that compares diffs)"
+  if frun checkupdates --auto -v "$APPID" > "$WORK/checkupdates.log" 2>&1; then
+    if git -C "$FDROIDDATA" diff --quiet -- "metadata/$APPID.yml"; then
+      ok "checkupdates has nothing to add"
+    else
+      note "checkupdates filled in what CI expects:"
+      git -C "$FDROIDDATA" --no-pager diff -- "metadata/$APPID.yml" \
+        | sed -n 's/^\([+-][^+-]\)/     \1/p'
+      git -C "$FDROIDDATA" add "metadata/$APPID.yml"
+      git -C "$FDROIDDATA" "${ID_ARGS[@]}" commit -q --amend --no-edit
+      ok "folded into the commit — CI fails on any diff this command produces"
+    fi
+  else
+    warn "checkupdates failed — CI runs it too, and a failure there fails the job:"
+    tail -5 "$WORK/checkupdates.log" | sed 's/^/     /'
+    if ! confirm "Push anyway?" n; then
+      KEEP_WORK=1
+      die "the log is in $WORK/checkupdates.log"
+    fi
+  fi
+fi
 
 # fdroiddata is a very large repo and the first push to a fresh fork can send a
 # lot of history. Dropping -q is the whole trick: git then reports its own
