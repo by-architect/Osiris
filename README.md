@@ -1,13 +1,13 @@
 # store-submit.sh
 
 One script for publishing an app: to F-Droid and Google Play for Android, and
-to Linux — NixOS (nixpkgs), Arch (AUR), Flathub and the Snap Store — from one
-set of answers.
+to Linux — NixOS (nixpkgs), Arch (AUR), Flathub, the Snap Store and Ubuntu
+(Launchpad PPA) — from one set of answers.
 
 - `store-submit.sh` — asks which store(s), checks what each needs from the
   app and what this machine has, then runs that store's wizard
 - `store-submit.sh fdroid|play|linux [options]` — one store's wizard directly
-- `store-submit.sh nix|aur|flathub|snap [options]` — one Linux distro's wizard directly
+- `store-submit.sh nix|aur|flathub|snap|ppa [options]` — one Linux distro's wizard directly
   (each takes `--help`)
 
 Each wizard runs in a process of its own, so running one directly or from the
@@ -15,7 +15,7 @@ picker behaves the same. F-Droid keeps one file per **task** — one store, one
 app, one version — in `~/.config/storepublisher/tasks/`, plus the answers that
 carry across tasks in `~/.config/storepublisher/last.conf`. Remembered answers
 for the others stay in `~/.config/storepublisher/playstore/` for Google Play and
-`~/.config/{store-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit}/`
+`~/.config/{store-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit,ppa-submit}/`
 for the rest;
 what the Linux packages say about the app is in `.store-submit.conf` in the
 app's own repository.
@@ -32,7 +32,7 @@ cd ~/path/to/your-app
 | flag | effect |
 | --- | --- |
 | `-s`, `--store LIST` | `fdroid`, `play`, `linux`, comma-separated, or `all` (`nix` or `aur` = `linux` with that distro) |
-| `-d`, `--distros LIST` | for `linux`: the distros (`nix`, `aur`, `flathub`, `snap`), skipping the checkbox list |
+| `-d`, `--distros LIST` | for `linux`: the distros (`nix`, `aur`, `flathub`, `snap`, `ppa`), skipping the checkbox list |
 | `--repo PATH` | the app's checkout (default: the git repo you run it in) |
 | `-c`, `--check` | run the checks, start no wizard |
 | `-y`, `-n`, `--no-save` | passed on to the wizard(s); `--yes` needs `--store` |
@@ -52,8 +52,8 @@ cd ~/path/to/your-app
   the fdroiddata commit, and a warning when `$FDROIDDATA_UPSTREAM` is set
 
 Picking **Linux** opens a checkbox list of distributions (↑/↓, Space, `a` for
-all, Enter; numbers when there's no terminal). Debian/Ubuntu and Fedora are
-listed as coming later.
+all, Enter; numbers when there's no terminal). Fedora is listed as coming
+later.
 
 Adding a store is a line in `STORES`, a `needs_<id>` and a `tools_<id>`
 function, a `wizard_<id>` function, and its id in the direct-run `case` just
@@ -368,9 +368,10 @@ Publishes one app to several Linux distributions in one go:
    and lists everything left for you to do (like opening Flathub's pull
    request)
 
-With Flathub or the Snap Store among the distros, their questions — the
-Flathub app ID, the snap name, and whether the app uses the internet (asked
-once for both) — are part of step 2 too.
+With Flathub, the Snap Store or the PPA among the distros, their questions —
+the Flathub app ID, the snap name, whether the app uses the internet (asked
+once for both), your Launchpad account, PPA and Ubuntu releases — are part of
+step 2 too.
 
 The answers go into `.store-submit.conf` in the app's repository — a plain
 `key = value` file, read (never executed), yours to edit and commit:
@@ -685,3 +686,63 @@ itself and tells you when a release waits for that review.
 
 - podman or docker (NixOS: `virtualisation.podman.enable = true;`)
 - a free [Snapcraft developer account](https://snapcraft.io/account) (Ubuntu One)
+
+## Ubuntu (Launchpad PPA): `store-submit.sh ppa`
+
+Ubuntu and the distributions built on it — Linux Mint, Pop!_OS, Zorin,
+elementary — are the most used Linux desktops. Their App Center is the Snap
+Store (above); for `apt`, the way a developer publishes directly is a
+[Launchpad PPA](https://launchpad.net/ubuntu/+ppas):
+`sudo add-apt-repository ppa:you/app && sudo apt install app`. (Debian's own
+archive needs a Debian developer to sponsor each upload, so it can't be
+automated.) Launchpad's rules ask only for an open-source license and signed,
+source-only uploads; it builds the binaries itself.
+
+```bash
+~/path/to/store-submit.sh ppa            # new package or a new version
+~/path/to/store-submit.sh ppa --dry-run  # make and test-build; don't sign or upload
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing (the first key registration still needs you) |
+| `--ask` | ask every question again (account, PPA, releases) |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--no-test` | skip the offline test builds |
+| `-n`, `--dry-run` | make and test the packages; don't sign or upload |
+
+- **what it can package:** Meson, CMake, Make, Python (dependencies from
+  Ubuntu), Rust and Go (their dependencies vendored into the source).
+  Launchpad builds **without internet** and Ubuntu has no Flutter SDK, so
+  Flutter and npm apps can't go in a PPA — the picker says so up front; Ubuntu
+  users get those from the Snap Store or Flathub
+- **releases:** the currently supported Ubuntu releases, read from Launchpad
+  each run, in a checkbox list (the LTS releases preselected)
+- **signing:** finds a GPG key of yours that Launchpad knows; otherwise picks
+  (or creates) one, publishes it to keyserver.ubuntu.com, and walks you
+  through the one step only you can do — importing it on Launchpad and
+  opening the link in the encrypted email Launchpad sends — then checks again.
+  No gpg installed? GnuPG comes from nixpkgs
+- **your PPA:** checked through Launchpad's API; if it doesn't exist yet, you
+  create it once on the web (its terms of use are yours to accept) and the
+  wizard checks again
+- **debian/:** yours if the repo has one; otherwise `control`, `rules`,
+  `copyright` and `source/format` written for your build system, with
+  Ubuntu's `-dev` packages for your pkg-config dependencies
+- **versions:** `<version>-1ppa1~ubuntu<release>.1`, one per release; the
+  `ppa` number goes up by itself when that version is in the PPA already
+- **build + check:** in Ubuntu containers (podman or docker): Rust/Go
+  dependencies vendored, the orig tarball and a source package per release,
+  then a **test build per release with the network cut** — like Launchpad's
+  builders — and `lintian`. Too-old Rust or Go on an older release is named,
+  with the fix (Ubuntu's versioned toolchains) or skipping that release
+- **upload:** signed like `debsign` (the `.dsc`, its new checksums in the
+  `.changes`, then the `.changes`), sent to Launchpad in the right order (the
+  first carries the orig tarball), and Launchpad's API checked until it lists
+  the upload
+
+### What you need
+
+- a [Launchpad account](https://launchpad.net/+login) and podman or docker
+- a GPG key (the wizard can make one); its email must be a confirmed address
+  of your Launchpad account
