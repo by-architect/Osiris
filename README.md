@@ -12,7 +12,9 @@ set of answers.
 
 Each wizard runs in a process of its own, so running one directly or from the
 picker behaves the same. Remembered answers stay in
-`~/.config/{store-submit,fdroid-submit,play-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit}/`;
+`~/.config/storepublisher/playstore/` for Google Play and
+`~/.config/{store-submit,fdroid-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit}/`
+for the rest;
 what the Linux packages say about the app is in `.store-submit.conf` in the
 app's own repository.
 
@@ -268,7 +270,7 @@ Uploads a release to **Google Play** through the Play Developer API
 | `--notes FILE` | release notes; fastlane changelogs are used otherwise |
 | `--mapping FILE` | R8/ProGuard `mapping.txt`; auto-detected otherwise |
 | `--no-review` | commit with `changesNotSentForReview=true` |
-| `--no-save`, `--forget` | control `~/.config/play-submit/last.conf` |
+| `--no-save`, `--forget` | control `~/.config/storepublisher/playstore/last.conf` |
 
 One API *edit* per run, committed only at the very end:
 
@@ -282,7 +284,9 @@ and any run that fails part-way deletes its edit instead of leaving it open.
 
 ### What it needs
 
-- a **service account JSON key**, set up once:
+- a **service account JSON key** in `~/.config/storepublisher/playstore/service-account.json`
+  (or passed with `--key`, or in `$PLAY_SERVICE_ACCOUNT_JSON`). A key in that
+  location is picked up without being asked for. Set one up once:
   1. enable the *Google Play Android Developer API* for a Cloud project —
      <https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com>
   2. create a service account, then *Keys → Add key → Create new key → JSON* —
