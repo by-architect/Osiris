@@ -200,6 +200,48 @@ auto_opt() {  # like auto, for optional fields: blank is fine and not asked
   ask_opt "$__var" "$__label" "$__val"
 }
 
+# ask_once VAR "label" "default" — for the fields that end up on f-droid.org:
+# asked the first time this app is submitted, then taken from memory, because
+# quietly publishing whatever `git config user.name` happens to say is not on.
+ask_once() {
+  local __var="$1" __label="$2" __def="${3-}"
+  if [ "$ASK_ALL" = 0 ] && [ -n "$(recall "$__var")" ]; then
+    auto "$__var" "$__label" "$(recall "$__var")"
+  else
+    ask "$__var" "$__label" "$__def"
+  fi
+}
+
+# edit_file <path> — hand the file to your editor and come back
+edit_file() {
+  local ed c
+  ed="${VISUAL:-${EDITOR:-}}"
+  if [ -z "$ed" ]; then
+    for c in nvim vim nano micro helix hx vi; do
+      if have "$c"; then ed="$c"; break; fi
+    done
+  fi
+  if [ -z "$ed" ]; then
+    warn "no editor found — set \$EDITOR, or edit it in another window:"
+    note "$1"
+    return 1
+  fi
+  # /dev/tty, not stdin: answers may be arriving on a pipe, an editor cannot use that
+  if ! { true > /dev/tty; } 2>/dev/null; then
+    warn "no terminal to open $ed in — edit it in another window:"
+    note "$1"
+    return 1
+  fi
+  note "opening $1 in $ed"
+  # unquoted on purpose: $EDITOR may carry arguments, e.g. "code -w"
+  # shellcheck disable=SC2086
+  if ! $ed "$1" < /dev/tty > /dev/tty 2>&1; then
+    warn "$ed exited non-zero — leaving the file as it stands"
+    return 1
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------- scratch space
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/fdroid-submit.XXXXXX")"
 KEEP_WORK=0
@@ -1525,7 +1567,8 @@ else
 
   # --- author
   # fdroiddata requires an AuthorName (any name, it needn't be your real one).
-  auto AUTHORNAME "AuthorName" "${SAVED_AUTHORNAME:-$(git -C "$REPO" config user.name 2>/dev/null || echo "")}"
+  note "AuthorName is shown on f-droid.org — any name will do, it needn't be your real one"
+  ask_once AUTHORNAME "AuthorName" "${SAVED_AUTHORNAME:-$(git -C "$REPO" config user.name 2>/dev/null || echo "")}"
   # The email is published in fdroiddata: always asked, never assumed.
   if [ -n "${SAVED_AUTHOREMAIL:-}" ]; then MAIL_GUESS="$SAVED_AUTHOREMAIL"; MAIL_FROM="your answer last time"
   else MAIL_GUESS="$(git -C "$REPO" config user.email 2>/dev/null || echo "")"; MAIL_FROM="your git identity (git config user.email)"; fi
@@ -1682,19 +1725,25 @@ else
 fi
 
 step "metadata/$APPID.yml"
-if [ "$IS_UPDATE" = 1 ]; then
-  # the file is long by now — only the added lines are interesting
-  git -C "$FDROIDDATA" --no-pager diff --no-index --no-color -- \
-    <(git -C "$FDROIDDATA" show "$EXISTING") "$YML" 2>/dev/null \
-    | tail -n +5 | sed "s/^/   /" || true
-else
-  printf '%s' "$DIM"; sed 's/^/   | /' "$YML"; printf '%s' "$R"
-fi
-if ! confirm "Looks right?" y; then
-  KEEP_WORK=1
-  say "Edit it yourself at: $YML"
-  die "stopped"
-fi
+while :; do
+  if [ "$IS_UPDATE" = 1 ]; then
+    # the file is long by now — only the added lines are interesting
+    git -C "$FDROIDDATA" --no-pager diff --no-index --no-color -- \
+      <(git -C "$FDROIDDATA" show "$EXISTING") "$YML" 2>/dev/null \
+      | tail -n +5 | sed "s/^/   /" || true
+  else
+    printf '%s' "$DIM"; sed 's/^/   | /' "$YML"; printf '%s' "$R"
+  fi
+  [ "$ASSUME_YES" = 1 ] && break
+  printf '   %sy) use it   e) edit it   n) stop%s [y]: ' "$B" "$R" >&2
+  readline PREVIEW_CH
+  case "${PREVIEW_CH:-y}" in
+    y|Y*) break ;;
+    e|E*) edit_file "$YML" || true; echo ;;   # then round again, showing the result
+    n|N*) KEEP_WORK=1; say "the file is at: $YML"; die "stopped" ;;
+    *)    warn "y, e or n" ;;
+  esac
+done
 
 mkdir -p "$FDROIDDATA/metadata"
 cp "$YML" "$FDROIDDATA/metadata/$APPID.yml"
@@ -1708,6 +1757,11 @@ if [ "$RUNNER" = none ]; then
   warn "no fdroidserver — skipping readmeta/rewritemeta/lint"
   warn "the maintainers' CI will run these anyway, so expect to fix what it reports"
 else
+  VALIDATE_AGAIN=1
+  VALID_ROUNDS=0
+  while [ "$VALIDATE_AGAIN" = 1 ]; do
+  VALIDATE_AGAIN=0
+  VALID_ROUNDS=$((VALID_ROUNDS + 1))
   VALID_FAIL=""
   # fdroidserver complains about this on every single command it runs.
   if [ -f "$FDROIDDATA/config.yml" ]; then
@@ -1764,19 +1818,53 @@ PYSCHEMA
     note "rewritemeta reformatted the file — that is normal"
   fi
 
-  # The full build is the best predictor of acceptance, but slow (Android SDK,
-  # the whole toolchain): only with --build, or when asked for with --ask.
-  if [ "$RUN_BUILD" = 1 ] || { [ "$ASK_ALL" = 1 ] && confirm "Run 'fdroid build -v -l $APPID' now (slow)?" n; }; then
-    say "fdroid build -v -l $APPID"
-    frun build -v -l "$APPID" || VALID_FAIL="$VALID_FAIL build"
-  else
-    note "full build skipped (--build to run it; F-Droid's CI builds it anyway)"
-  fi
   if [ -n "$VALID_FAIL" ]; then
     warn "failed:$VALID_FAIL — maintainers' CI would reject this as it is"
-    confirm "Push it anyway?" n || { KEEP_WORK=1; die "fix the metadata at $FDROIDDATA/metadata/$APPID.yml and re-run"; }
+    if [ "$ASSUME_YES" = 1 ]; then
+      KEEP_WORK=1
+      die "fix metadata/$APPID.yml in $FDROIDDATA and re-run"
+    fi
+    # After a few rounds, editing plainly is not fixing it: stop offering, so a
+    # file that cannot pass (or an editor that changes nothing) cannot spin here.
+    if [ "$VALID_ROUNDS" -ge 4 ]; then
+      warn "still failing after $VALID_ROUNDS attempts — no more edit rounds"
+      printf '   %sp) push it anyway   s) stop%s [s]: ' "$B" "$R" >&2
+      readline VALID_CH
+      case "${VALID_CH:-s}" in
+        p|P*) ;;
+        *)    KEEP_WORK=1; die "fix metadata/$APPID.yml in $FDROIDDATA and re-run" ;;
+      esac
+    else
+      printf '   %se) edit and check again   p) push it anyway   s) stop%s [e]: ' "$B" "$R" >&2
+      readline VALID_CH
+      case "${VALID_CH:-e}" in
+        p|P*) ;;
+        s|S*) KEEP_WORK=1; die "fix metadata/$APPID.yml in $FDROIDDATA and re-run" ;;
+        *)    if edit_file "$FDROIDDATA/metadata/$APPID.yml"; then
+                YMLSUM="$(cksum < "$FDROIDDATA/metadata/$APPID.yml")"
+                VALIDATE_AGAIN=1
+              fi ;;
+      esac
+    fi
   else
     ok "metadata validates"
+  fi
+  done
+
+  # The full build is the best predictor of acceptance, but slow (Android SDK,
+  # the whole toolchain): only with --build, or when asked for with --ask. It is
+  # outside the check-and-edit loop above: nobody wants it repeated on every edit.
+  if [ "$RUN_BUILD" = 1 ] || { [ "$ASK_ALL" = 1 ] && confirm "Run 'fdroid build -v -l $APPID' now (slow)?" n; }; then
+    say "fdroid build -v -l $APPID"
+    if ! frun build -v -l "$APPID"; then
+      warn "the build failed — F-Droid's CI would fail the same way"
+      if [ "$ASSUME_YES" = 1 ] || ! go "Carry on and push anyway?"; then
+        KEEP_WORK=1
+        die "fix the app or metadata/$APPID.yml in $FDROIDDATA, then re-run"
+      fi
+    fi
+  else
+    note "full build skipped (--build to run it; F-Droid's CI builds it anyway)"
   fi
 fi
 
