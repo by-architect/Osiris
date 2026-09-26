@@ -599,8 +599,12 @@ FORK_GUESS="git@gitlab.com:$GLUSER/fdroiddata.git"
 # a remembered URL only counts if it belongs to this user
 case "${SAVED_FORKURL:-}" in *[:/]"$GLUSER"/*) FORK_GUESS="$SAVED_FORKURL" ;; esac
 auto FORKURL "Fork" "$FORK_GUESS"
-auto FDROIDDATA "Local clone" "${SAVED_FDROIDDATA:-$HOME/fdroiddata}"
+# Always asked (Enter takes the default): the clone is large, so where it goes
+# is yours to pick. --yes takes the default.
+ask FDROIDDATA "Local clone of fdroiddata" "${SAVED_FDROIDDATA:-$HOME/fdroiddata}"
 FDROIDDATA="${FDROIDDATA/#\~/$HOME}"
+case "$FDROIDDATA" in /*) ;; *) FDROIDDATA="$PWD/$FDROIDDATA" ;; esac
+FDROIDDATA="${FDROIDDATA%/}"
 
 # The usual first-run failure is a fork that doesn't exist yet, which git only
 # reports as "project not found or no permission". Forks of fdroiddata are
@@ -628,6 +632,8 @@ check_fork() {
 # Creating the fork: with glab when it's logged in, else GitLab's API with
 # $GITLAB_TOKEN. GitLab copies the repo in the background, so wait for it.
 GL_API="${GITLAB_API_ROOT:-https://gitlab.com/api/v4}"
+# where upstream fdroiddata is cloned from (overridable for testing)
+FDROIDDATA_UPSTREAM="${FDROIDDATA_UPSTREAM:-https://gitlab.com/fdroid/fdroiddata.git}"
 glab_ready() { have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1; }
 
 gitlab_get() {  # gitlab_get <api path> — authenticated GET, JSON on stdout
@@ -703,17 +709,20 @@ if [ -d "$FDROIDDATA/.git" ]; then
   ok "reusing $FDROIDDATA"
 else
   ensure_fork
-  say "cloning (this is a large repo, give it a minute)…"
-  if ! git clone "$FORKURL" "$FDROIDDATA"; then
-    warn "could not clone $FORKURL"
-    note "is the fork created, under this exact GitLab user, and is your SSH key added?"
-    note "check with: ssh -T git@gitlab.com   (it should greet @$GLUSER)"
-    die "clone failed"
+  # fdroiddata is huge; a full clone of the fork over SSH can be cut off
+  # midway. The wizard only needs upstream to branch from and the fork to push
+  # one branch to: so clone upstream over HTTPS (no login) with history but
+  # no file contents (they load as needed), and add the fork as `origin`.
+  say "cloning fdroiddata from upstream over HTTPS (history only — a minute or two)…"
+  if ! git clone --filter=blob:none -o upstream "$FDROIDDATA_UPSTREAM" "$FDROIDDATA"; then
+    die "could not clone $FDROIDDATA_UPSTREAM — check your connection and re-run"
   fi
+  git -C "$FDROIDDATA" remote add origin "$FORKURL"
+  ok "cloned; your fork is 'origin' (for pushing), fdroid's repo is 'upstream'"
 fi
 
 git -C "$FDROIDDATA" remote get-url upstream >/dev/null 2>&1 || \
-  git -C "$FDROIDDATA" remote add upstream https://gitlab.com/fdroid/fdroiddata.git
+  git -C "$FDROIDDATA" remote add upstream "$FDROIDDATA_UPSTREAM"
 say "fetching upstream…"
 git -C "$FDROIDDATA" fetch --quiet upstream || die "could not fetch upstream fdroiddata"
 
@@ -1377,9 +1386,19 @@ if ! go "Commit and push to $FORKURL ($BRANCH)?"; then
   note "$FDROIDDATA (branch $BRANCH)"
   exit 0
 fi
-git -C "$FDROIDDATA" commit -q -m "$COMMITMSG"
+# A fresh clone may have no identity of its own; use the app repo's.
+ID_ARGS=()
+if [ -z "$(git -C "$FDROIDDATA" config user.email 2>/dev/null || true)" ]; then
+  ID_ARGS=(-c "user.name=$(git -C "$REPO" config user.name 2>/dev/null || echo "${AUTHORNAME:-fdroid-submit}")"
+           -c "user.email=$(git -C "$REPO" config user.email 2>/dev/null || echo "${AUTHOREMAIL:-nobody@example.com}")")
+fi
+git -C "$FDROIDDATA" "${ID_ARGS[@]}" commit -q -m "$COMMITMSG"
 # A re-run for the same app/version replaces the branch it pushed before.
-git -C "$FDROIDDATA" push -q -f -u origin "$BRANCH" || die "push to $FORKURL failed"
+if ! git -C "$FDROIDDATA" push -q -f -u origin "$BRANCH"; then
+  warn "could not push to $FORKURL"
+  note "check with: ssh -T git@gitlab.com   (it should greet @$GLUSER), then re-run"
+  die "push failed"
+fi
 ok "pushed $BRANCH"
 
 MR_URL=""

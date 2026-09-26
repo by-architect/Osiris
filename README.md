@@ -1,6 +1,43 @@
 # scripts
 
-Two release wizards for the same Android app: one for F-Droid, one for Google Play.
+Release wizards for the same Android app: one for F-Droid, one for Google Play,
+and `store-submit.sh` in front of them to pick where the app goes.
+
+## store-submit.sh
+
+The one to start with. It asks which store(s) to publish to, checks what that
+store needs from the app and what this machine has, then runs the store's own
+wizard in the app's checkout.
+
+```bash
+cd ~/path/to/your-app
+~/path/to/store-submit.sh                         # asks where to publish
+~/path/to/store-submit.sh -s fdroid,play --check  # only the checks
+~/path/to/store-submit.sh -s play -- --track beta # args after -- go to the wizard
+```
+
+| flag | effect |
+| --- | --- |
+| `-s`, `--store LIST` | `fdroid`, `play`, `nix`, `aur`, comma-separated, or `all` |
+| `--repo PATH` | the app's checkout (default: the git repo you run it in) |
+| `-c`, `--check` | run the checks, start no wizard |
+| `-y`, `-n`, `--no-save` | passed on to the wizard(s); `--yes` needs `--store` |
+| `--list`, `--forget` | list the stores / forget the remembered choice |
+
+- **the app:** project type (Android, Flutter, Rust, Go, Node, Python…),
+  application ID and version, git remote and tags, license, fastlane metadata;
+  then per store — e.g. a signed release build and service account key for
+  Play, proprietary dependencies for F-Droid, lock files for Nixpkgs
+- **this machine:** OS and package manager, and each tool the store's wizard
+  runs, required (✗ stops the run) or optional (!), with an install command for
+  your package manager
+- **F-Droid's GitLab side:** glab login or `$GITLAB_TOKEN`, git new enough
+  (2.22+) for the blob-less fdroiddata clone, whether a clone is already there
+  to reuse, `ssh` for pushing to a `git@gitlab.com:` fork, a git identity for
+  the fdroiddata commit, and a warning when `$FDROIDDATA_UPSTREAM` is set
+
+Nixpkgs and the AUR only have the checks so far. Adding a store is a line in
+`STORES`, a `needs_<id>` and a `tools_<id>` function, and its wizard script.
 
 ## fdroid-submit.sh
 
@@ -35,7 +72,9 @@ Detected values are shown as `✓` lines instead of questions:
   pushed if only local, and checked to hold exactly this ID and version; a
   stale tag can be moved (asked, never automatic)
 - **new app or update**, from upstream fdroiddata
-- **GitLab:** your username from `glab`, the fork (created if missing), the clone
+- **GitLab:** your username from `glab`, the fork (created if missing); where
+  to put the local fdroiddata clone is always asked, with the last path (or
+  `~/fdroiddata`) as the default
 - **the metadata:** license from `LICENSE`, source/issue/changelog URLs from
   the git remote, AuthorName/Email from git config, the Flutter version from
   `.fvmrc`, no anti-features unless the pitfall check found proprietary bits
@@ -125,6 +164,10 @@ depends on the Flutter SDK, with `android/app/` beside it) is recognised:
   `glab auth login` first) or GitLab's API with `$GITLAB_TOKEN`, then waits for
   GitLab to finish copying; without either it links the fork page. It won't
   fork into an account other than the one in the fork URL.
+  The local copy is cloned from **upstream over HTTPS** with history only
+  (`--filter=blob:none`; files load as needed), with your fork added as the
+  `origin` it pushes to — a full SSH clone of a repo this size tends to be cut
+  off midway.
 - the release **tag pushed** to your app's repository
 
 ### RFP issue (optional)
