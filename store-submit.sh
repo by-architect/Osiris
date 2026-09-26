@@ -468,6 +468,97 @@ tag_on_remote() {
   [ -n "$ORIGIN" ] && git -C "$REPO" ls-remote --tags --exit-code origin "refs/tags/$1" >/dev/null 2>&1
 }
 
+# --- the release itself
+# F-Droid builds a tag and sees only what that tag holds, so the version bump
+# and the "what's new" text have to be in the commit *before* it is tagged.
+# Offered when the source version is already tagged and work has moved on: the
+# commits since then cannot reach anyone without a new version.
+log_notes() {  # log_notes <since-ref> — "- subject" lines, newest last
+  if [ -n "$1" ]; then
+    git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' "$1..HEAD"
+  else
+    git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' -20
+  fi
+  printf '\n'
+}
+
+# where the version lives, and what the next one would be
+VER_FILE=""; VER_KIND=""
+if [ -n "$PUB_REL" ] && [ -f "$REPO/$PUB_REL" ]; then VER_FILE="$REPO/$PUB_REL"; VER_KIND=pubspec
+elif [ -n "$GRADLE_FILE" ] && [ -n "$(gval versionName)" ]; then VER_FILE="$GRADLE_FILE"; VER_KIND=gradle
+fi
+next_vname() {  # bump the last component: 0.1.0 -> 0.1.1
+  printf '%s' "$1" | awk -F. -v OFS=. '{ $NF = $NF + 1; print }'
+}
+
+CUR_TAGGED=0
+for t in "v$VNAME" "$VNAME"; do
+  git -C "$REPO" rev-parse -q --verify "refs/tags/$t" >/dev/null 2>&1 && { CUR_TAGGED=1; break; }
+done
+LASTTAG="$(git -C "$REPO" describe --tags --abbrev=0 2>/dev/null || true)"
+AHEAD=0
+[ -n "$LASTTAG" ] && AHEAD="$(git -C "$REPO" rev-list --count "$LASTTAG..HEAD" 2>/dev/null || echo 0)"
+
+if [ "$CUR_TAGGED" = 1 ] && [ "$AHEAD" -gt 0 ] && [ -n "$VER_FILE" ] && [ "$DRYRUN" = 0 ]; then
+  warn "$AHEAD commit(s) since $LASTTAG, but ${VER_FILE#"$REPO"/} still says $VNAME+$VCODE"
+  note "that version is already tagged, so those commits cannot be released as it"
+  if go "Bump the version and make the release commit?"; then
+    ask NEW_VNAME "New versionName" "$(next_vname "$VNAME")"
+    ask NEW_VCODE "New versionCode" "$((VCODE + 1))"
+
+    # --- what's new: F-Droid shows changelogs/<versionCode>.txt from the repo
+    FL_BASE="$REPO/fastlane/metadata/android/en-US"
+    [ -n "$FLUTTER_DIR" ] && [ "$FLUTTER_DIR" != "." ] \
+      && [ -d "$REPO/$FLUTTER_DIR/fastlane" ] && FL_BASE="$REPO/$FLUTTER_DIR/fastlane/metadata/android/en-US"
+    NOTES="$WORK/release-notes.txt"
+    log_notes "$LASTTAG" > "$NOTES"
+    say "Release notes, from the $AHEAD commit(s) since $LASTTAG:"
+    printf '%s' "$DIM"; sed 's/^/   | /' "$NOTES"; printf '%s' "$R"
+    if [ "$ASSUME_YES" = 0 ] && confirm "Edit them before committing?" n; then
+      "${EDITOR:-${VISUAL:-vi}}" "$NOTES" || warn "editor exited non-zero — using the text as it stands"
+    fi
+    mkdir -p "$FL_BASE/changelogs"
+    # With an ABI split, F-Droid publishes 1000/2000/4000 + versionCode, and
+    # looks for a changelog named after the code it actually publishes. Which
+    # split is used is settled later, so write every name it might look for —
+    # the ones that never exist are simply ignored.
+    CL_CODES="$NEW_VCODE"
+    [ -n "$FLUTTER_DIR" ] && CL_CODES="$NEW_VCODE $((1000 + NEW_VCODE)) $((2000 + NEW_VCODE)) $((4000 + NEW_VCODE))"
+    for c in $CL_CODES; do cp "$NOTES" "$FL_BASE/changelogs/$c.txt"; done
+    ok "wrote ${FL_BASE#"$REPO"/}/changelogs/{$(echo "$CL_CODES" | tr ' ' ',')}.txt"
+
+    # --- the bump itself
+    case "$VER_KIND" in
+      pubspec)
+        awk -v v="$NEW_VNAME+$NEW_VCODE" 'BEGIN{done=0}
+          !done && /^version:[[:space:]]/ { print "version: " v; done=1; next } { print }' \
+          "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
+      gradle)
+        awk -v n="$NEW_VNAME" -v c="$NEW_VCODE" 'BEGIN{dn=0;dc=0}
+          !dn && sub(/versionName[[:space:]]*=?[[:space:]]*"[^"]*"/, "versionName = \"" n "\"") { dn=1 }
+          !dc && sub(/versionCode[[:space:]]*=?[[:space:]]*[0-9]+/, "versionCode = " c) { dc=1 }
+          { print }' "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
+    esac
+    git -C "$REPO" --no-pager diff --stat -- "${VER_FILE#"$REPO"/}" | sed 's/^/     /'
+    git -C "$REPO" --no-pager diff -- "${VER_FILE#"$REPO"/}" | grep -E '^[-+]version|^[-+].*version(Name|Code)' | sed 's/^/     /'
+
+    auto RELMSG "Commit message" "Release $NEW_VNAME+$NEW_VCODE"
+    if go "Commit the bump and the changelog?"; then
+      git -C "$REPO" add -- "${VER_FILE#"$REPO"/}" "${FL_BASE#"$REPO"/}/changelogs"
+      git -C "$REPO" commit -q -m "$RELMSG" || die "the release commit failed"
+      HEAD_SHORT="$(git -C "$REPO" rev-parse --short HEAD)"
+      ok "committed $RELMSG ($HEAD_SHORT)"
+      VNAME="$NEW_VNAME"; VCODE="$NEW_VCODE"
+      if go "Push the commit to origin?"; then
+        git -C "$REPO" push origin HEAD || warn "could not push — the tag push below will fail too"
+      fi
+    else
+      git -C "$REPO" checkout -- "${VER_FILE#"$REPO"/}" 2>/dev/null || true
+      warn "reverted the version bump; the changelog files are left in place"
+    fi
+  fi
+fi
+
 # Prefer an existing v<version> or <version> tag; else the usual v<version>.
 TAG_GUESS="v$VNAME"
 for t in "v$VNAME" "$VNAME"; do
@@ -520,6 +611,63 @@ fi
 # fdroiddata wants the full commit hash in `commit:`, not the tag name.
 COMMIT="$(git -C "$REPO" rev-list -n1 "$TAG" 2>/dev/null || true)"
 [ -n "$COMMIT" ] || COMMIT="$TAG"
+
+# --- a published release on the forge
+# The metadata's Changelog: field points at the releases page, and a tag alone
+# does not put anything there. Offered once the tag is pushed, because that is
+# what a release is made from.
+FORGE=""; FORGE_CLI=""
+case "$ORIGIN" in
+  *github.com[:/]*) FORGE=github; have gh   && gh auth status   >/dev/null 2>&1 && FORGE_CLI=gh ;;
+  *gitlab.com[:/]*) FORGE=gitlab; have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1 && FORGE_CLI=glab ;;
+esac
+release_exists() {
+  case "$FORGE_CLI" in
+    gh)   ( cd "$REPO" && gh release view "$TAG" >/dev/null 2>&1 ) ;;
+    glab) ( cd "$REPO" && glab release view "$TAG" >/dev/null 2>&1 ) ;;
+    *)    return 1 ;;
+  esac
+}
+if [ "$DRYRUN" = 0 ] && [ -n "$FORGE_CLI" ]; then
+  if release_exists; then
+    ok "$FORGE already has a release for $TAG"
+  else
+    warn "$TAG is a tag, but $FORGE has no release for it"
+    note "your Changelog: URL points at the releases page, which is empty until one exists"
+    if go "Publish a release for $TAG on $FORGE?"; then
+      RELNOTES="$WORK/forge-notes.txt"
+      # prefer the changelog F-Droid will show, so both say the same thing
+      if [ -n "${FL_BASE:-}" ] && [ -f "$FL_BASE/changelogs/$VCODE.txt" ]; then
+        cp "$FL_BASE/changelogs/$VCODE.txt" "$RELNOTES"
+      else
+        PREVTAG="$(git -C "$REPO" describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
+        if [ -n "$PREVTAG" ]; then
+          git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' "$PREVTAG..$TAG" > "$RELNOTES"
+        else
+          git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' -20 "$TAG" > "$RELNOTES"
+        fi
+        printf '\n' >> "$RELNOTES"
+      fi
+      printf '%s' "$DIM"; sed 's/^/   | /' "$RELNOTES"; printf '%s' "$R"
+      REL_OUT=""
+      case "$FORGE_CLI" in
+        gh)   REL_OUT="$( cd "$REPO" && gh release create "$TAG" --title "$TAG" \
+                            --notes-file "$RELNOTES" 2>&1 || true )" ;;
+        glab) REL_OUT="$( cd "$REPO" && glab release create "$TAG" --name "$TAG" \
+                            --notes "$(cat "$RELNOTES")" 2>&1 || true )" ;;
+      esac
+      if release_exists; then
+        ok "release published: ${WEB_GUESS:+$WEB_GUESS/releases/tag/$TAG}"
+      else
+        warn "$FORGE_CLI did not publish the release:"
+        printf '%s\n' "$REL_OUT" | tail -5 | sed 's/^/       /'
+        [ -n "$WEB_GUESS" ] && note "do it by hand: $WEB_GUESS/releases/new?tag=$TAG"
+      fi
+    fi
+  fi
+elif [ -n "$FORGE" ] && [ "$DRYRUN" = 0 ]; then
+  note "no $FORGE CLI logged in — a release for $TAG would have to be published by hand"
+fi
 
 # --- URLs from the git remote
 WEB_GUESS=""
@@ -614,6 +762,25 @@ else
     warn "sees what is in the tagged revision"
     BLOCKERS=$((BLOCKERS+1))
   fi
+fi
+
+# Screenshots and icon: optional, but a listing without them looks abandoned.
+# Same fastlane tree, same rule — F-Droid only sees what the build tag holds.
+IMGDIR=""
+for d in "$FASTLANE/images" \
+         ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/fastlane/metadata/android/en-US/images"}; do
+  [ -d "$d" ] && { IMGDIR="$d"; break; }
+done
+SHOTS=0
+[ -n "$IMGDIR" ] && SHOTS="$(find "$IMGDIR" -type f \
+  \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) -path '*creenshots/*' 2>/dev/null | wc -l)"
+if [ "${SHOTS:-0}" -gt 0 ]; then
+  ok "$SHOTS screenshot(s) in ${IMGDIR#"$REPO"/}"
+  [ -f "$IMGDIR/icon.png" ] || note "no images/icon.png — F-Droid falls back to the app's launcher icon"
+else
+  warn "no screenshots — your F-Droid listing will show none"
+  note "PNGs go in fastlane/metadata/android/en-US/images/phoneScreenshots/,"
+  note "alongside icon.png and featureGraphic.png; commit them under the build tag"
 fi
 
 [ "$BLOCKERS" = 0 ] || { echo; confirm "Carry on despite the above?" y || exit 1; }
@@ -1163,18 +1330,26 @@ else
   fi
   fi
 
-  # --- auto-update: derived from how the tag relates to the versionName
+  # --- auto-update
+  # fdroiddata's schema allows only None, Version, or "Version +suffix"
+  # (schemas/metadata.json: ^(None|Version( \+.+)?)$). The old tag-pattern form
+  # "Version v%v" is gone: with UpdateCheckMode Tags, fdroidserver reuses the
+  # tag it actually found, whatever that tag is called.
+  AUM_RE='^(None|Version( \+.+)?)$'
+  AUM="Version"
   case "$TAG" in
-    "$VNAME")   AUM="Version" ;;
-    "v$VNAME")  AUM="Version v%v" ;;
-    *)          AUM="" ;;
+    "$VNAME"|"v$VNAME") ;;
+    *)
+      warn "tag '$TAG' is neither '$VNAME' nor 'v$VNAME'"
+      note "UpdateCheckMode: Tags takes the newest tag whatever it is called, so"
+      note "'Version' still works; answer None to update the metadata by hand"
+      while :; do
+        ask_opt AUM "AutoUpdateMode (Version, None, or 'Version +suffix')" "Version"
+        AUM="${AUM:-None}"
+        printf '%s' "$AUM" | grep -qE "$AUM_RE" && break
+        warn "fdroiddata's schema only accepts None, Version, or 'Version +suffix'"
+      done ;;
   esac
-  if [ -z "$AUM" ]; then
-    warn "tag '$TAG' does not look like '$VNAME' or 'v$VNAME'"
-    note "AutoUpdateMode needs the tag pattern, e.g. 'Version release-%v'"
-    ask_opt AUM "AutoUpdateMode (blank = None, metadata updated by hand)" "None"
-    AUM="${AUM:-None}"
-  fi
 
   # --- assemble yaml
   # NOTE: versionName/CurrentVersion/gradle are quoted on purpose. Unquoted, YAML reads
@@ -1281,6 +1456,32 @@ else
   fi
   say "fdroid rewritemeta $APPID"; frun rewritemeta "$APPID" || VALID_FAIL="$VALID_FAIL rewritemeta"
   say "fdroid lint $APPID";        frun lint "$APPID"        || VALID_FAIL="$VALID_FAIL lint"
+
+  # fdroiddata's CI validates every changed file against schemas/metadata.json
+  # before anything else. lint does not do this, so a file that passes lint can
+  # still be rejected minutes later; run the same check here.
+  SCHEMA="$FDROIDDATA/schemas/metadata.json"
+  if [ ! -f "$SCHEMA" ]; then
+    note "no schemas/metadata.json in the clone — skipping the schema check"
+  elif have check-jsonschema; then
+    say "check-jsonschema metadata/$APPID.yml"
+    ( cd "$FDROIDDATA" && check-jsonschema --schemafile schemas/metadata.json \
+        "metadata/$APPID.yml" ) || VALID_FAIL="$VALID_FAIL schema"
+  elif python3 -c 'import jsonschema, yaml' 2>/dev/null; then
+    say "validating against schemas/metadata.json (python jsonschema)"
+    python3 - "$SCHEMA" "$FDROIDDATA/metadata/$APPID.yml" <<'PYSCHEMA' || VALID_FAIL="$VALID_FAIL schema"
+import json, sys, jsonschema, yaml
+schema = json.load(open(sys.argv[1]))
+doc = yaml.safe_load(open(sys.argv[2]))
+errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(doc), key=lambda e: list(e.path))
+for e in errors:
+    print("   $." + ".".join(str(p) for p in e.path) + ": " + e.message)
+sys.exit(1 if errors else 0)
+PYSCHEMA
+  else
+    note "no check-jsonschema — CI validates against schemas/metadata.json, you cannot"
+    note "install it with: pipx install check-jsonschema   (or nix profile install nixpkgs#check-jsonschema)"
+  fi
   if [ "$YMLSUM" != "$(cksum < "$FDROIDDATA/metadata/$APPID.yml")" ]; then
     note "rewritemeta reformatted the file — that is normal"
   fi
