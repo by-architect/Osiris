@@ -488,7 +488,7 @@ if ! git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
     warn "dry run — would tag HEAD ($HEAD_SHORT) as $TAG and push it"
   elif go "Tag HEAD ($HEAD_SHORT) as $TAG and push it to origin?"; then
     git -C "$REPO" tag "$TAG" HEAD
-    git -C "$REPO" push -q origin "refs/tags/$TAG" || die "could not push tag $TAG"
+    git -C "$REPO" push origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "tagged and pushed $TAG"
   else
     die "F-Droid needs the release tag — create and push $TAG, then re-run"
@@ -499,7 +499,7 @@ elif ! ref_matches "$TAG"; then
   if ref_matches HEAD && [ "$DRYRUN" = 0 ] \
      && confirm "Move $TAG to HEAD ($HEAD_SHORT) and force-push it? (only if it isn't published yet)" n; then
     git -C "$REPO" tag -f "$TAG" HEAD >/dev/null
-    git -C "$REPO" push -q -f origin "refs/tags/$TAG" || die "could not push tag $TAG"
+    git -C "$REPO" push -f origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "moved $TAG to $HEAD_SHORT"
   else
     die "tag $TAG doesn't hold this release — move it or bump the version"
@@ -509,7 +509,7 @@ elif ! tag_on_remote "$TAG"; then
   if [ "$DRYRUN" = 1 ]; then
     warn "dry run — would push tag $TAG"
   elif go "Push tag $TAG to origin?"; then
-    git -C "$REPO" push -q origin "refs/tags/$TAG" || die "could not push tag $TAG"
+    git -C "$REPO" push origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "pushed $TAG"
   else
     die "push the tag first: git push origin $TAG"
@@ -746,17 +746,20 @@ else
   # one branch to: so clone upstream over HTTPS (no login) with history but
   # no file contents (they load as needed), and add the fork as `origin`.
   say "cloning fdroiddata from upstream over HTTPS (history only — a minute or two)…"
+  CLONE_T0=$SECONDS
   if ! git clone --filter=blob:none -o upstream "$FDROIDDATA_UPSTREAM" "$FDROIDDATA"; then
     die "could not clone $FDROIDDATA_UPSTREAM — check your connection and re-run"
   fi
   git -C "$FDROIDDATA" remote add origin "$FORKURL"
-  ok "cloned; your fork is 'origin' (for pushing), fdroid's repo is 'upstream'"
+  ok "cloned in $((SECONDS - CLONE_T0))s; your fork is 'origin' (for pushing), fdroid's repo is 'upstream'"
 fi
 
 git -C "$FDROIDDATA" remote get-url upstream >/dev/null 2>&1 || \
   git -C "$FDROIDDATA" remote add upstream "$FDROIDDATA_UPSTREAM"
-say "fetching upstream…"
-git -C "$FDROIDDATA" fetch --quiet upstream || die "could not fetch upstream fdroiddata"
+say "fetching upstream (git prints its own progress below)…"
+FETCH_T0=$SECONDS
+git -C "$FDROIDDATA" fetch upstream || die "could not fetch upstream fdroiddata"
+ok "fetched upstream ($((SECONDS - FETCH_T0))s)"
 
 UPBRANCH=master
 git -C "$FDROIDDATA" rev-parse -q --verify "refs/remotes/upstream/$UPBRANCH" >/dev/null 2>&1 || UPBRANCH=main
@@ -1474,13 +1477,22 @@ if [ -z "$(git -C "$FDROIDDATA" config user.email 2>/dev/null || true)" ]; then
            -c "user.email=$(git -C "$REPO" config user.email 2>/dev/null || echo "${AUTHOREMAIL:-nobody@example.com}")")
 fi
 git -C "$FDROIDDATA" "${ID_ARGS[@]}" commit -q -m "$COMMITMSG"
+
+# fdroiddata is a very large repo and the first push to a fresh fork can send a
+# lot of history. Dropping -q is the whole trick: git then reports its own
+# progress on a terminal. Foreground on purpose, so an SSH key passphrase or a
+# host-key prompt can still reach you.
+say "pushing $BRANCH to your fork — the slowest step here."
+note "fdroiddata is huge; the first push to a new fork can take a few minutes."
+note "git's own progress follows; leave it be until it finishes."
+PUSH_T0=$SECONDS
 # A re-run for the same app/version replaces the branch it pushed before.
-if ! git -C "$FDROIDDATA" push -q -f -u origin "$BRANCH"; then
+if ! git -C "$FDROIDDATA" push -f -u origin "$BRANCH"; then
   warn "could not push to $FORKURL"
   note "check with: ssh -T git@gitlab.com   (it should greet @$GLUSER), then re-run"
   die "push failed"
 fi
-ok "pushed $BRANCH"
+ok "pushed $BRANCH ($((SECONDS - PUSH_T0))s)"
 
 MR_URL=""
 if glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
@@ -2516,7 +2528,7 @@ if ! git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
     TAG_REF=HEAD; DRY_NO_TAG=1
   elif go "Tag HEAD ($HEAD_SHORT) as $TAG and push it to origin?"; then
     git -C "$REPO" tag "$TAG" HEAD
-    git -C "$REPO" push -q origin "refs/tags/$TAG" || die "could not push tag $TAG"
+    git -C "$REPO" push origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "tagged and pushed $TAG"
   else
     die "the packages need the release tag — create and push $TAG, then re-run"
@@ -2529,7 +2541,7 @@ elif ! tag_on_remote "$TAG"; then
   if [ "$DRYRUN" = 1 ]; then
     warn "dry run — would push tag $TAG"
   elif go "Push tag $TAG to origin?"; then
-    git -C "$REPO" push -q origin "refs/tags/$TAG" || die "could not push tag $TAG"
+    git -C "$REPO" push origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "pushed $TAG"
   else
     die "push the tag first: git push origin $TAG"
