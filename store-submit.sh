@@ -2575,33 +2575,343 @@ if [ -z "$PKG" ]; then
 fi
 ok "package: $PKG"
 
-# --- artifact: prefer the App Bundle, that is what Play wants
-if [ -z "$ARTIFACT" ]; then
+# ------------------------------------------------ build a signed release bundle
+# Play has required an App Bundle for every app created since August 2021; an
+# APK is only still accepted for an app that was already published before then.
+# So when there is nothing to upload, build the bundle here — and set up an
+# upload key first if the project has none, because Play rejects a debug
+# signature with a message that does not say so.
+
+# gradle's root project: the directory with settings.gradle(.kts) above the module
+GRADLE_ROOT=""
+gr="$REPO/$SUBDIR"
+while [ -n "$gr" ] && [ "$gr" != "/" ] && [ "$gr" != "." ]; do
+  if [ -f "$gr/settings.gradle.kts" ] || [ -f "$gr/settings.gradle" ]; then GRADLE_ROOT="$gr"; break; fi
+  gr="$(dirname "$gr")"
+done
+[ -n "$GRADLE_ROOT" ] || GRADLE_ROOT="$REPO${FLUTTER_DIR:+/$FLUTTER_DIR}/android"
+KEYPROPS="$GRADLE_ROOT/key.properties"
+KS=""; KS_PASS=""; KS_ALIAS=""
+
+ask_secret() {  # ask_secret VAR "question" — reads without echoing
+  local __var="$1" __q="$2" __in=""
+  printf '   %s%s%s: ' "$B" "$__q" "$R" >&2
+  IFS= read -rs __in || { printf '\n' >&2; die "end of input"; }
+  printf '\n' >&2
+  printf -v "$__var" '%s' "$__in"
+}
+
+# LC_ALL=C: keytool translates its output, and these are parsed
+cert_owner() {  # cert_owner <aab|apk> — the signing certificate's Owner
+  LC_ALL=C keytool -printcert -jarfile "$1" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*Owner:[[:space:]]*//p' | sed -n 1p
+}
+cert_sha256() {
+  LC_ALL=C keytool -printcert -jarfile "$1" 2>/dev/null | awk '/SHA256:/ {print $2; exit}'
+}
+
+signing_configured() {  # does the release build already sign with a real key?
+  [ -n "$GRADLE_FILE" ] || return 1
+  local g; g="$(sed -e 's,//.*,,' "$GRADLE_FILE")"
+  # the key.properties convention: configured only if the file is actually there
+  if printf '%s\n' "$g" | grep -qE 'key(store)?\.properties'; then
+    [ -f "$KEYPROPS" ] && return 0
+    return 1
+  fi
+  printf '%s\n' "$g" | grep -qE 'signingConfigs' || return 1
+  printf '%s\n' "$g" | grep -qE 'create\("release"\)|^[[:space:]]*release[[:space:]]*\{' || return 1
+  # Flutter's template points release builds at the debug key until you fix it
+  if printf '%s\n' "$g" | sed -n '/buildTypes/,$p' \
+     | grep -qE 'signingConfig[[:space:]]*=?[[:space:]]*signingConfigs\.(getByName\("debug"\)|debug)'; then
+    return 1
+  fi
+  return 0
+}
+
+signing_snippet() {  # the block appended to the module's gradle file
+  case "$GRADLE_FILE" in
+    *.kts) cat <<'KTS'
+
+// --- added by store-submit.sh play: sign release builds with the upload key ---
+// Reads key.properties (storeFile/storePassword/keyAlias/keyPassword) from the
+// root of the Gradle build. Remove this block to undo.
+android {
+    val uploadProps = java.util.Properties()
+    val uploadPropsFile = rootProject.file("key.properties")
+    if (uploadPropsFile.exists()) {
+        uploadPropsFile.inputStream().use { uploadProps.load(it) }
+        signingConfigs {
+            create("release") {
+                storeFile = file(uploadProps.getProperty("storeFile"))
+                storePassword = uploadProps.getProperty("storePassword")
+                keyAlias = uploadProps.getProperty("keyAlias")
+                keyPassword = uploadProps.getProperty("keyPassword")
+            }
+        }
+        buildTypes {
+            getByName("release") {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
+    }
+}
+KTS
+    ;;
+    *) cat <<'GROOVY'
+
+// --- added by store-submit.sh play: sign release builds with the upload key ---
+// Reads key.properties (storeFile/storePassword/keyAlias/keyPassword) from the
+// root of the Gradle build. Remove this block to undo.
+android {
+    def uploadProps = new Properties()
+    def uploadPropsFile = rootProject.file('key.properties')
+    if (uploadPropsFile.exists()) {
+        uploadPropsFile.withInputStream { uploadProps.load(it) }
+        signingConfigs {
+            release {
+                storeFile file(uploadProps.getProperty('storeFile'))
+                storePassword uploadProps.getProperty('storePassword')
+                keyAlias uploadProps.getProperty('keyAlias')
+                keyPassword uploadProps.getProperty('keyPassword')
+            }
+        }
+        buildTypes {
+            release {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+}
+GROOVY
+    ;;
+  esac
+}
+
+print_fingerprints() {  # what Play App Signing, Firebase and Maps all ask for
+  [ -n "$KS" ] && [ -f "$KS" ] || return 0
+  say "Upload certificate fingerprints:"
+  LC_ALL=C keytool -list -v -keystore "$KS" -storepass "$KS_PASS" -alias "$KS_ALIAS" 2>/dev/null \
+    | grep -E 'SHA1:|SHA256:|Valid from' | sed 's/^[[:space:]]*/     /'
+  note "Play App Signing shows the same SHA-256 under Setup → App integrity"
+}
+
+keystore_setup() {  # create or adopt an upload key, then make gradle use it
+  have keytool || { warn "keytool (from any JDK) is needed to make an upload key"; return 1; }
+  step "Upload key"
+  say "Play needs the bundle signed with your upload key, and this project has"
+  say "none configured. One key signs every future release of $PKG."
+  ask KS "Keystore file" "$CONF_DIR/$PKG-upload.jks"
+  KS="${KS/#\~/$HOME}"
+  mkdir -p "$(dirname "$KS")"
+
+  if [ -f "$KS" ]; then
+    ok "keystore already exists: $KS"
+    if [ "$ASSUME_YES" = 1 ]; then
+      warn "--yes cannot ask for the keystore password"
+      note "configure signing in gradle, or run without --yes once to write key.properties"
+      return 1
+    fi
+    ask_secret KS_PASS "Its password"
+    if ! LC_ALL=C keytool -list -keystore "$KS" -storepass "$KS_PASS" >"$WORK/ks.log" 2>&1; then
+      warn "that password does not open $KS"
+      return 1
+    fi
+    KS_ALIAS="$(awk -F, '/PrivateKeyEntry/ {print $1; exit}' "$WORK/ks.log")"
+    [ -n "$KS_ALIAS" ] || ask KS_ALIAS "Key alias in that keystore" "upload"
+    ok "alias: $KS_ALIAS"
+  else
+    # generated, not asked for: a password you never type is one you cannot leak
+    KS_PASS="$(openssl rand -base64 33 | tr -d '/+=\n' | cut -c1-32)"
+    KS_ALIAS=upload
+    say "generating a 2048-bit RSA key valid for 10000 days (Play wants 2033+)"
+    if ! LC_ALL=C keytool -genkeypair -noprompt \
+         -keystore "$KS" -storetype PKCS12 -storepass "$KS_PASS" \
+         -alias "$KS_ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+         -dname "CN=$PKG, OU=Upload key" > "$WORK/keytool.log" 2>&1; then
+      warn "keytool failed:"; sed 's/^/     /' "$WORK/keytool.log"
+      return 1
+    fi
+    chmod 600 "$KS"
+    ok "created $KS"
+  fi
+
+  # key.properties holds the password, so it is written private and kept out of git
+  local om; om="$(umask)"; umask 077
+  {
+    printf '# written by store-submit.sh play — keep this out of git\n'
+    printf 'storeFile=%s\n'     "$KS"
+    printf 'storePassword=%s\n' "$KS_PASS"
+    printf 'keyAlias=%s\n'      "$KS_ALIAS"
+    printf 'keyPassword=%s\n'   "$KS_PASS"
+  } > "$KEYPROPS"
+  umask "$om"
+  chmod 600 "$KEYPROPS"
+  ok "wrote ${KEYPROPS#"$REPO"/} (mode 600)"
+
+  local gi="$REPO/.gitignore" pat
+  [ -f "$gi" ] && [ -n "$(tail -c1 "$gi" 2>/dev/null)" ] && printf '\n' >> "$gi"
+  for pat in 'key.properties' '*.jks' '*.keystore' '*.store-submit.orig'; do
+    grep -qxF "$pat" "$gi" 2>/dev/null || { printf '%s\n' "$pat" >> "$gi"; note ".gitignore += $pat"; }
+  done
+
+  echo
+  warn "back up $KS and $KEYPROPS somewhere safe"
+  note "lose them and only Google can reset your upload key"
+  echo
+  print_fingerprints
+
+  if grep -qE 'key(store)?\.properties' "$GRADLE_FILE"; then
+    ok "$(basename "$GRADLE_FILE") already reads key.properties"
+    return 0
+  fi
+  echo
+  say "$(basename "$GRADLE_FILE") does not read key.properties yet."
+  note "this appends a second android { } block at the end of the file — purely"
+  note "additive, and the original is kept, so the build below proves it works"
+  if ! confirm "Add the release signing block?" y; then
+    warn "then add this to $GRADLE_FILE yourself:"
+    signing_snippet | sed 's/^/     /'
+    return 1
+  fi
+  # beside the file, not in $WORK: that is deleted when the script exits
+  GRADLE_BACKUP="$GRADLE_FILE.store-submit.orig"
+  cp "$GRADLE_FILE" "$GRADLE_BACKUP"
+  signing_snippet >> "$GRADLE_FILE"
+  ok "appended the release signing block to ${GRADLE_FILE#"$REPO"/}"
+  return 0
+}
+
+find_artifact() {  # newest release artifact into ART_GUESS, bundles before APKs
   ART_GUESS=""
-  FL_OUT=""
+  local FL_OUT="" pat best=""
   [ -n "$FLUTTER_DIR" ] && FL_OUT="$REPO/$FLUTTER_DIR/build/app/outputs"
   for pat in "$REPO/$SUBDIR/build/outputs/bundle/release"/*.aab \
-             "$REPO/$SUBDIR/build/outputs/apk/release"/*.apk \
              "$REPO/build/outputs/bundle/release"/*.aab \
-             ${FL_OUT:+"$FL_OUT/bundle/release"/*.aab} \
-             ${FL_OUT:+"$FL_OUT/flutter-apk/app-release.apk"}; do
+             ${FL_OUT:+"$FL_OUT/bundle/release"/*.aab}; do
     [ -f "$pat" ] || continue
-    if [ -z "$ART_GUESS" ] || [ "$pat" -nt "$ART_GUESS" ]; then ART_GUESS="$pat"; fi
+    if [ -z "$best" ] || [ "$pat" -nt "$best" ]; then best="$pat"; fi
   done
-  [ -n "$ART_GUESS" ] && note "found $(basename "$ART_GUESS") ($(date -r "$ART_GUESS" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 'unknown date'))"
+  if [ -z "$best" ]; then
+    for pat in "$REPO/$SUBDIR/build/outputs/apk/release"/*.apk \
+               ${FL_OUT:+"$FL_OUT/flutter-apk/app-release.apk"}; do
+      [ -f "$pat" ] || continue
+      if [ -z "$best" ] || [ "$pat" -nt "$best" ]; then best="$pat"; fi
+    done
+  fi
+  ART_GUESS="$best"
+}
+
+unverified_edit() {  # our gradle edit is in place but nothing has compiled it
+  [ -n "${GRADLE_BACKUP:-}" ] && [ -f "${GRADLE_BACKUP:-/nonexistent}" ] || return 0
+  note "the signing block is in ${GRADLE_FILE#"$REPO"/} but nothing has built with"
+  note "it yet; the file as it was is kept at $GRADLE_BACKUP"
+}
+
+build_bundle() {  # build a release .aab; 0 and one exists, or 1 and we said why
+  local log="$WORK/build.log" rc=0
+  if [ -n "$FLUTTER_DIR" ]; then
+    have flutter || { warn "flutter is not on PATH — build the bundle yourself"
+                      unverified_edit; return 1; }
+    say "flutter build appbundle --release   (in ${FLUTTER_DIR}/, takes a while)"
+    ( cd "$REPO/$FLUTTER_DIR" && flutter build appbundle --release ) 2>&1 \
+      | tee "$log" | sed 's/^/     /'
+    rc=${PIPESTATUS[0]}
+  else
+    local gw="$GRADLE_ROOT/gradlew" task mod
+    mod="$REPO/$SUBDIR"; mod="${mod#"$GRADLE_ROOT"}"; mod="${mod#/}"
+    task=":bundleRelease"; [ -n "$mod" ] && task=":${mod//\//:}:bundleRelease"
+    if [ -x "$gw" ]; then set -- "$gw" "$task"
+    elif have gradle; then set -- gradle "$task"
+    else
+      warn "no executable gradlew in $GRADLE_ROOT and no gradle on PATH"
+      unverified_edit
+      return 1
+    fi
+    say "$(basename "$1") $task   (takes a while)"
+    ( cd "$GRADLE_ROOT" && "$@" ) 2>&1 | tee "$log" | sed 's/^/     /'
+    rc=${PIPESTATUS[0]}
+  fi
+  if [ "$rc" != 0 ]; then
+    warn "the build failed:"
+    tail -25 "$log" | sed 's/^/     /'
+    # our own edit is the likeliest new cause, so put the file back
+    if [ -n "${GRADLE_BACKUP:-}" ] && [ -f "$GRADLE_BACKUP" ]; then
+      cp "$GRADLE_BACKUP" "$GRADLE_FILE"
+      warn "restored ${GRADLE_FILE#"$REPO"/} — add the signing block by hand:"
+      signing_snippet | sed 's/^/     /'
+      GRADLE_BACKUP=""
+    fi
+    return 1
+  fi
+  if [ -n "${GRADLE_BACKUP:-}" ] && [ -f "$GRADLE_BACKUP" ]; then
+    rm -f "$GRADLE_BACKUP"        # the build compiled our edit, so it is proven
+    GRADLE_BACKUP=""
+    note "the signing block built cleanly; ${GRADLE_FILE#"$REPO"/} is yours to commit"
+  fi
+  find_artifact
+  [ -n "$ART_GUESS" ] || { warn "the build worked but no .aab turned up"; return 1; }
+  return 0
+}
+
+# --- artifact: an App Bundle, built here if the project has not built one
+if [ -z "$ARTIFACT" ]; then
+  find_artifact
+  NEED_BUILD=0
+  if [ -z "$ART_GUESS" ]; then
+    say "No release bundle has been built yet."
+    NEED_BUILD=1
+  else
+    note "found $(basename "$ART_GUESS") ($(date -r "$ART_GUESS" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 'unknown date'))"
+    case "$ART_GUESS" in
+      *.apk) warn "that is an APK: Play has required an App Bundle for every app"
+             warn "created since August 2021 — an APK only still works for an app"
+             warn "that was already published before then"
+             NEED_BUILD=1 ;;
+    esac
+  fi
+  if [ "$NEED_BUILD" = 1 ] && confirm "Build a signed release bundle now?" y; then
+    if signing_configured; then
+      ok "release signing is already configured"
+    else
+      keystore_setup || warn "no upload key set up — the build may be unsigned"
+    fi
+    if build_bundle; then
+      ok "built $(basename "$ART_GUESS")"
+    else
+      warn "no bundle was built — give a path by hand, or fix the build and re-run"
+    fi
+  fi
   ask ARTIFACT "Path to the .aab or .apk to upload" "$ART_GUESS"
 fi
 ARTIFACT="${ARTIFACT/#\~/$HOME}"
 [ -f "$ARTIFACT" ] || die "no such file: $ARTIFACT"
 case "$ARTIFACT" in
   *.aab) KIND=bundles ;;
-  *.apk) KIND=apks ;;
+  *.apk) KIND=apks
+         warn "uploading an APK — Play only accepts this for an app first published"
+         warn "before August 2021; anything newer needs the .aab"
+         confirm "Carry on with the APK?" n || exit 1 ;;
   *) die "expected a .aab or .apk, got $(basename "$ARTIFACT")" ;;
 esac
 ok "artifact: $(basename "$ARTIFACT") ($(du -h "$ARTIFACT" | cut -f1))"
 
-# An unsigned artifact is rejected by the API with a confusing message.
-if have unzip; then
+# Play rejects a debug signature outright and an unsigned upload with a message
+# that does not mention signing, so read the certificate before uploading.
+if have keytool; then
+  OWNER="$(cert_owner "$ARTIFACT")"
+  case "$OWNER" in
+    '')
+      warn "no signature found — Play only accepts an artifact signed with your upload key"
+      confirm "Upload it anyway?" n || exit 1 ;;
+    *'CN=Android Debug'*)
+      warn "signed with the Android debug key — Play will reject it"
+      note "set up an upload key (this wizard can) and build again"
+      confirm "Upload it anyway?" n || exit 1 ;;
+    *)
+      ok "signed by $OWNER"
+      note "certificate SHA-256: $(cert_sha256 "$ARTIFACT")" ;;
+  esac
+elif have unzip; then
   if ! unzip -l "$ARTIFACT" 2>/dev/null | grep -qE 'META-INF/.*\.(RSA|DSA|EC|SF)$'; then
     warn "no signature block found — Play only accepts artifacts signed with your upload key"
     confirm "Upload it anyway?" n || exit 1
@@ -7213,8 +7523,8 @@ needs_play() {
       else need_warn "no signature block in it — Play only takes builds signed with your upload key"; fi
     fi
   else
-    if [ -n "$FLUTTER_DIR" ]; then need_warn "no release build yet — run: flutter build appbundle"
-    else need_warn "no release build yet — run: ./gradlew :${SUBDIR}:bundleRelease"; fi
+    if [ -n "$FLUTTER_DIR" ]; then need_warn "no release bundle yet — the wizard can build and sign one (flutter build appbundle)"
+    else need_warn "no release bundle yet — the wizard can build and sign one (./gradlew :${SUBDIR}:bundleRelease)"; fi
   fi
   # the service account key: $PLAY_SERVICE_ACCOUNT_JSON, the one the Play wizard
   # remembered, or its default location
