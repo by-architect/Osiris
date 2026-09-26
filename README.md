@@ -107,15 +107,22 @@ is linked from the merge request (`Closes fdroid/rfp#N`) so it closes on merge.
 
 ### fdroid CLI
 
-The script runs `readmeta`, `rewritemeta`, `lint` and optionally `build`. It looks
-for the CLI in this order:
+The script runs `readmeta`, `rewritemeta`, `lint` and optionally `build`. It
+**never installs fdroidserver itself** — it uses the one you have:
 
-1. `fdroid` on `$PATH`
-2. `nix-shell -p fdroidserver` — works out of the box on this machine
-3. the `registry.gitlab.com/fdroid/fdroidserver` image, via podman or docker
-   (run as your own uid, so nothing comes back root-owned)
+1. `fdroid` on `$PATH` (a distro or nix package)
+2. a source checkout of fdroidserver: `$FDROIDSERVER`, the path remembered from
+   last time, or `~/Opt/fdroidserver`, `~/fdroidserver`, `~/src/fdroidserver`,
+   `~/Projects/fdroidserver`. It runs it the way fdroiddata's CI runs master —
+   `PATH` and `PYTHONPATH` pointed at the checkout — so its Python dependencies
+   have to be installed.
 
-If none are present it still writes the metadata and skips validation.
+If neither is there, it says how to install one and waits: check again, give a
+checkout's path, skip validation (the maintainers' CI still runs it), or quit.
+
+fdroiddata's CI lints with fdroidserver **master**, so a checkout of master
+(`git clone https://gitlab.com/fdroid/fdroidserver.git`) matches it most
+closely; distro packages can be a release or two behind.
 
 ### Publishing modes
 

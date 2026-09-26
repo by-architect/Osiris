@@ -123,6 +123,7 @@ trap cleanup EXIT
 SAVED_REPO=""; SAVED_SUBDIR=""; SAVED_LICENSE=""; SAVED_CATSEL=""
 SAVED_AUTHORNAME=""; SAVED_AUTHOREMAIL=""; SAVED_AUTHORSITE=""; SAVED_WEBSITE=""
 SAVED_GLUSER=""; SAVED_FORKURL=""; SAVED_FDROIDDATA=""; SAVED_JDK=""
+SAVED_FDROIDSERVER=""
 if [ -f "$CONF" ]; then
   # shellcheck disable=SC1090
   . "$CONF" || warn "could not read $CONF"
@@ -145,41 +146,80 @@ save_answers() {
     printf 'SAVED_FORKURL=%q\n'     "${FORKURL:-}"
     printf 'SAVED_FDROIDDATA=%q\n'  "${FDROIDDATA:-}"
     printf 'SAVED_JDK=%q\n'         "${JDK:-}"
+    printf 'SAVED_FDROIDSERVER=%q\n' "${FDROIDSERVER_DIR:-}"
   } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
   chmod 600 "$CONF" 2>/dev/null || true
 }
 
 # ------------------------------------------------------------------- fdroid CLI
+# The wizard never installs fdroidserver itself. It uses the one you have:
+# `fdroid` on PATH, or a source checkout of fdroidserver (run the way
+# fdroiddata's CI runs master: PATH and PYTHONPATH pointed at the checkout).
+# If there is neither, it says how to install one and waits for you.
 RUNNER=""
-detect_runner() {
-  if have fdroid; then
-    RUNNER=local; ok "using fdroid from PATH ($(command -v fdroid))"
-  elif have nix-shell; then
-    RUNNER=nix;   ok "using nix-shell -p fdroidserver"
-    note "first invocation downloads fdroidserver; later ones are cached"
-  elif have podman; then
-    RUNNER=podman; ok "using the fdroidserver container image (podman)"
-  elif have docker; then
-    RUNNER=docker; ok "using the fdroidserver container image (docker)"
-  else
-    RUNNER=none
-    warn "no fdroid, nix-shell, podman or docker found — validation will be skipped"
-    note "install one of: nix-shell -p fdroidserver | apt install fdroidserver | docker"
-  fi
+FDROIDSERVER_DIR=""
+
+fdroid_checkout_runs() {  # fdroid_checkout_runs <dir>
+  PATH="$1:$PATH" PYTHONPATH="$1${PYTHONPATH:+:$PYTHONPATH}" \
+    "$1/fdroid" --version >/dev/null 2>&1
 }
 
-FDROID_IMAGE="registry.gitlab.com/fdroid/fdroidserver:latest"
+find_fdroid() {  # sets RUNNER; false if nothing usable was found
+  local d ver
+  if have fdroid; then
+    ver="$(fdroid --version 2>/dev/null | tail -1)"
+    RUNNER=path; ok "fdroid ${ver:+$ver }on PATH ($(command -v fdroid))"
+    return 0
+  fi
+  for d in "${FDROIDSERVER:-}" "${SAVED_FDROIDSERVER:-}" \
+           "$HOME/Opt/fdroidserver" "$HOME/opt/fdroidserver" "$HOME/fdroidserver" \
+           "$HOME/src/fdroidserver" "$HOME/Projects/fdroidserver"; do
+    [ -n "$d" ] || continue
+    d="${d/#\~/$HOME}"
+    [ -f "$d/fdroid" ] || continue
+    if fdroid_checkout_runs "$d"; then
+      RUNNER=checkout; FDROIDSERVER_DIR="$d"
+      ver="$(PATH="$d:$PATH" PYTHONPATH="$d" "$d/fdroid" --version 2>/dev/null | tail -1)"
+      ok "fdroidserver checkout ${ver:+$ver }at $d"
+      return 0
+    fi
+    warn "found $d, but it doesn't run — are its Python dependencies installed?"
+  done
+  return 1
+}
+
+detect_runner() {
+  find_fdroid && return 0
+  warn "fdroidserver is not installed (or not in the places this wizard looks)"
+  say "It validates the metadata before you open the merge request. Install it"
+  say "yourself, whichever way suits you — for example:"
+  note "  nix:            nix profile install nixpkgs#fdroidserver   (or add it to your config)"
+  note "  Debian/Ubuntu:  sudo apt install fdroidserver"
+  note "  like F-Droid CI: git clone https://gitlab.com/fdroid/fdroidserver.git ~/Opt/fdroidserver"
+  note "                  (runs from the checkout; its Python dependencies must be installed)"
+  while :; do
+    say "r) check again   p) give the path to a checkout   s) skip validation   q) quit"
+    ask FDCHOICE "Choice" "r"
+    case "$FDCHOICE" in
+      r|R) find_fdroid && return 0; warn "still not found" ;;
+      p|P) ask FDROIDSERVER "Path to the fdroidserver checkout" "$HOME/Opt/fdroidserver"
+           find_fdroid && return 0 ;;
+      s|S) RUNNER=none; warn "validation will be skipped — the maintainers' CI will still run it"
+           return 0 ;;
+      q|Q) exit 0 ;;
+      *)   warn "r, p, s or q" ;;
+    esac
+  done
+}
 
 frun() {  # frun <fdroid args...>   — run inside $FDROIDDATA
   case "$RUNNER" in
-    local)  ( cd "$FDROIDDATA" && fdroid "$@" ) ;;
-    # %q-quote so arguments containing spaces survive the --run string
-    nix)    ( cd "$FDROIDDATA" && nix-shell -p fdroidserver --run "$(printf '%q ' fdroid "$@")" ) ;;
-    # --user keeps rewritemeta from leaving root-owned files in your clone
-    podman|docker)
-            "$RUNNER" run --rm --user "$(id -u):$(id -g)" \
-              -v "$FDROIDDATA:/repo" -w /repo "$FDROID_IMAGE" fdroid "$@" ;;
-    none)   warn "skipped: fdroid $*"; return 0 ;;
+    path)     ( cd "$FDROIDDATA" && fdroid "$@" ) ;;
+    checkout) ( cd "$FDROIDDATA" && \
+                PATH="$FDROIDSERVER_DIR:$PATH" \
+                PYTHONPATH="$FDROIDSERVER_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+                "$FDROIDSERVER_DIR/fdroid" "$@" ) ;;
+    none)     warn "skipped: fdroid $*"; return 0 ;;
   esac
 }
 
@@ -810,7 +850,7 @@ save_answers
 # ================================================================ 4. validate
 step "4/5  Validation"
 if [ "$RUNNER" = none ]; then
-  warn "no fdroid CLI available — skipping readmeta/rewritemeta/lint"
+  warn "no fdroidserver — skipping readmeta/rewritemeta/lint"
   warn "the maintainers' CI will run these anyway, so expect to fix what it reports"
 else
   say "fdroid readmeta";             frun readmeta              || warn "readmeta reported problems"
