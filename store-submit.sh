@@ -4656,7 +4656,7 @@ echo
 # id|name|wizard (blank = not written yet)|what publishing there means
 DISTROS="nix|NixOS / Nix (nixpkgs)|wizard_nix|a package in nixpkgs, through a pull request
 aur|Arch Linux (AUR)|wizard_aur|a PKGBUILD in the Arch User Repository
-deb|Debian / Ubuntu||coming later
+ppa|Ubuntu (Launchpad PPA)|wizard_ppa|apt for Ubuntu, Mint, Pop!_OS…; Launchpad builds it
 fedora|Fedora (COPR)||coming later
 flathub|Flathub (every distro)|wizard_flathub|prepared up to the pull request; you open it
 snap|Snap Store (every distro)|wizard_snap|built and uploaded; the store reviews it"
@@ -4785,7 +4785,7 @@ store-submit.sh linux — publish an app to several Linux distributions at once.
 
   -h, --help           show this text
   -d, --distros LIST   distros to publish to, skipping the question:
-                       nix, aur, flathub, snap — comma-separated, or "all"
+                       nix, aur, flathub, snap, ppa — comma-separated, or "all"
       --repo PATH      the app's git checkout (default: the repo you run it in)
       --config FILE    the shared answers (default: .store-submit.conf in the repo)
   -y, --yes            passed to each distro's wizard
@@ -4859,6 +4859,7 @@ LINUX_CONF="${CONFIG_ARG:-}"
 linux_app "2/3  Your app — asked once, for every distro"
 case " $CHOSEN " in *" flathub "*) flathub_questions ;; esac
 case " $CHOSEN " in *" snap "*) snap_questions ;; esac
+case " $CHOSEN " in *" ppa "*) ppa_questions ;; esac
 [ "$SAVE" = 1 ] && cfg_set distros "$CHOSEN"
 
 # ------------------------------------------------------------- 3. publish
@@ -6793,10 +6794,568 @@ echo
 }
 
 # ##########################################################################
+#   Launchpad PPA — questions shared with a Linux run, and helpers
+# ##########################################################################
+LP_API="${LP_API_ROOT:-https://api.launchpad.net/devel}"
+LP_WEB="https://launchpad.net"
+lp_get() { curl -sf --max-time 25 "$LP_API/$1"; }   # lp_get <path> — anonymous API read
+# lp_versions — the versions of $PNAME published in the PPA, one per line
+lp_versions() {
+  lp_get "~$LP_USER/+archive/ubuntu/$PPA_NAME?ws.op=getPublishedSources&source_name=$PNAME&exact_match=true" 2>/dev/null \
+    | python3 -c 'import json,sys; [print(e["source_package_version"]) for e in json.load(sys.stdin).get("entries", [])]' 2>/dev/null || true
+}
+
+# ppa_questions — the Launchpad account, the PPA and the Ubuntu releases
+ppa_questions() {
+  local first=1 guess
+  case "$KIND" in
+    flutter) die "Launchpad builds without internet, and Ubuntu has no Flutter SDK — a Flutter app can't be built in a PPA. Ubuntu users get it from the Snap Store (Ubuntu's App Center) or Flathub" ;;
+    node)    die "Launchpad builds without internet, so npm can't fetch packages there — this wizard can't package an npm app for a PPA; the Snap Store and Flathub can" ;;
+  esac
+  guess="$(cfg_get launchpad-user)"
+  while :; do
+    if [ "$first" = 1 ] && [ -n "$guess" ] && [ "$ASK_ALL" = 0 ]; then LP_USER="$guess"
+    else
+      [ "$first" = 1 ] && note "your Launchpad username — the part after ~ in https://launchpad.net/~you (no account yet? $LP_WEB/+login)"
+      ask LP_USER "Launchpad username" "$guess"
+    fi
+    first=0
+    LP_USER="${LP_USER#\~}"
+    lp_get "~$LP_USER" > "$WORK/lp-user.json" 2>/dev/null && break
+    warn "there's no Launchpad account '$LP_USER' ($LP_WEB/~$LP_USER)"
+    [ "$ASSUME_YES" = 1 ] && die "check the Launchpad username in the config"
+    guess=""
+  done
+  ok "Launchpad: $LP_WEB/~$LP_USER"
+  [ "${SAVE:-1}" = 1 ] && cfg_set launchpad-user "$LP_USER"
+
+  PPA_NAME="$(cfg_get ppa-name)"
+  if [ -z "$PPA_NAME" ] || [ "$ASK_ALL" = 1 ]; then
+    note "the PPA people add: ppa:$LP_USER/<name> — one per app is usual"
+    while :; do
+      ask PPA_NAME "PPA name" "${PPA_NAME:-$(printf '%s' "$PNAME" | tr 'A-Z_' 'a-z-')}"
+      printf '%s' "$PPA_NAME" | grep -qE '^[a-z0-9][a-z0-9+.-]*$' && break
+      warn "lowercase letters, digits, and + . - only"
+    done
+    [ "${SAVE:-1}" = 1 ] && cfg_set ppa-name "$PPA_NAME"
+  fi
+  ok "PPA: ppa:$LP_USER/$PPA_NAME"
+
+  # the Ubuntu releases to build for: the supported ones, read from Launchpad
+  lp_get "ubuntu/series" > "$WORK/series.json" || die "couldn't ask Launchpad for Ubuntu's releases"
+  python3 - "$WORK/series.json" > "$WORK/series.txt" <<'PY'
+import json, sys
+for e in json.load(open(sys.argv[1]))["entries"]:
+    if e.get("active") and e["status"] in ("Supported", "Current Stable Release"):
+        print("%s|%s|%s" % (e["name"], e["version"], e["status"]))
+PY
+  [ -s "$WORK/series.txt" ] || die "Launchpad lists no supported Ubuntu releases right now"
+  PPA_SERIES="$(cfg_get ppa-series)"
+  # drop releases that aren't supported any more
+  local keep="" s
+  for s in $PPA_SERIES; do grep -q "^$s|" "$WORK/series.txt" && keep="$keep${keep:+ }$s"; done
+  if [ -z "$keep" ] || [ "$ASK_ALL" = 1 ]; then
+    local items="" pre=""
+    while IFS='|' read -r n v st; do
+      items="$items$n|Ubuntu $v ($n)|1|$st"$'\n'
+      case "$v" in *.04) [ $(( ${v%%.*} % 2 )) = 0 ] && pre="$pre $n" ;; esac   # LTS releases preselected
+    done < "$WORK/series.txt"
+    if [ "$ASSUME_YES" = 1 ]; then keep="$(printf '%s' "$pre" | xargs)"
+    else say "Which Ubuntu releases? (Linux Mint, Pop!_OS, Zorin… follow the matching LTS)"; multi_select keep "$items" "$pre"; fi
+  fi
+  PPA_SERIES="$keep"
+  [ "${SAVE:-1}" = 1 ] && cfg_set ppa-series "$PPA_SERIES"
+  ok "Ubuntu releases: $PPA_SERIES"
+}
+
+# ##########################################################################
+#   Launchpad PPA wizard — store-submit.sh ppa [options]
+#   (body unindented on purpose: its here-documents start at column 0)
+# ##########################################################################
+wizard_ppa() {
+#
+# store-submit.sh ppa — publish an app to Ubuntu (and Mint, Pop!_OS, Zorin…)
+# through a Launchpad PPA, or a new version of it.
+#
+# Follows Launchpad's documentation:
+#   https://ubuntu.com/docs/launchpad/user/how-to/packaging/ppa-package-upload/
+#   https://ubuntu.com/docs/launchpad/user/reference/packaging/ppas/building-a-source-package/
+#
+# Writes the debian/ packaging (or uses yours), makes a source package per
+# Ubuntu release, test-builds it offline in an Ubuntu container like
+# Launchpad's builders (with lintian), signs it with your GPG key and uploads
+# it. Launchpad then builds and publishes it.
+
+set -eu
+
+DRYRUN=0
+SAVE=1
+ASSUME_YES=0
+ASK_ALL=0
+NO_TEST=0
+REPO_ARG=""
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ppa-submit"
+CONF="$CONF_DIR/last.conf"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/store-submit"
+LP_FTP="${LP_FTP_ROOT:-ftp://ppa.launchpad.net}"
+
+usage() {
+  cat <<'USAGE'
+store-submit.sh ppa — publish an app to Ubuntu through a Launchpad PPA.
+
+  -h, --help          show this text
+  -y, --yes           use everything it detects and don't ask
+      --ask           ask every question, including the ones it can answer
+      --repo PATH     the app's git checkout (default: the repo you run it in)
+      --config FILE   the shared answers (default: .store-submit.conf in the repo)
+      --no-test       skip the offline test build in Ubuntu containers
+  -n, --dry-run       make and test the packages; don't sign or upload
+      --no-save       do not remember the answers for next time
+      --forget        delete the remembered answers and exit
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    -n|--dry-run) DRYRUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --ask)        ASK_ALL=1 ;;
+    --repo)       REPO_ARG="${2-}"; shift ;;
+    --config)     LINUX_CONF="${2-}"; shift ;;
+    --no-test)    NO_TEST=1 ;;
+    --no-save)    SAVE=0 ;;
+    --forget)     rm -f "$CONF"; printf 'forgot %s\n' "$CONF"; exit 0 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+WIZ_NAME=ppa-submit
+linux_common
+
+SAVED_REPO=""
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF" || warn "could not read $CONF"
+fi
+save_answers() {
+  [ "$SAVE" = 1 ] || return 0
+  mkdir -p "$CONF_DIR"
+  { printf '# written by store-submit.sh ppa — safe to delete (or run --forget)\n'
+    printf 'SAVED_REPO=%q\n' "${REPO:-${SAVED_REPO:-}}"; } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+}
+
+RUNTIME=""
+for r in podman docker; do have "$r" && "$r" info >/dev/null 2>&1 && { RUNTIME="$r"; break; }; done
+# gpg: yours, or GnuPG from nixpkgs when it isn't installed
+gpgx() { tool gnupg gpg "$@"; }
+TTYARGS=(); [ -t 0 ] && TTYARGS=(--pinentry-mode loopback)
+
+# =============================================================== 0. orientation
+cat <<BANNER
+
+  ${B}Launchpad PPA wizard${R}  (Ubuntu, Linux Mint, Pop!_OS, Zorin, elementary…)
+
+  Five stages:
+    1. your app       — shared with the other distros, plus Launchpad and releases
+    2. signing        — your GPG key, known to Launchpad; your PPA
+    3. debian/        — the packaging, written for your build system (or yours)
+    4. build + check  — source packages, then an offline test build like
+                        Launchpad's, in Ubuntu containers, with lintian
+    5. upload         — signed, sent to your PPA; Launchpad builds and publishes
+
+BANNER
+[ "$DRYRUN" = 1 ] && warn "dry run: packages are made and tested; nothing is signed or uploaded"
+for t in git curl python3; do have "$t" || die "$t is missing — install it and re-run"; done
+[ -n "$RUNTIME" ] || die "the packages are made in Ubuntu containers: install podman or docker (NixOS: virtualisation.podman.enable = true;)"
+
+# ============================================================== 1. the app
+linux_app "1/5  Your app"
+ppa_questions
+
+# ================================================================ 2. signing
+step "2/5  Signing and your PPA"
+# Launchpad only takes uploads signed with a key registered to your account.
+LP_FPRS="$(lp_get "~$LP_USER/gpg_keys" | python3 -c 'import json,sys; [print(e["fingerprint"]) for e in json.load(sys.stdin)["entries"]]' 2>/dev/null || true)"
+local_fprs() { gpgx --list-secret-keys --with-colons 2>/dev/null | awk -F: '$1 == "fpr" { print $10 }'; }
+KEY="$(cfg_get gpg-key)"
+pick_key() {  # KEY = the first local key Launchpad knows ("" if none)
+  KEY=""
+  for f in $(local_fprs); do printf '%s\n' "$LP_FPRS" | grep -qx "$f" && { KEY="$f"; break; }; done
+  return 0
+}
+[ -n "$KEY" ] && printf '%s\n' "$LP_FPRS" | grep -qx "$KEY" && local_fprs | grep -qx "$KEY" || pick_key
+while [ -z "$KEY" ]; do
+  [ "$DRYRUN" = 1 ] && { note "dry run: no signing key needed yet"; break; }
+  warn "none of your GPG keys is registered on Launchpad yet"
+  [ "$ASSUME_YES" = 1 ] && die "set up your signing key once without --yes"
+  CAND="$(gpgx --list-secret-keys --with-colons 2>/dev/null | awk -F: -v e="${MAINT_EMAIL:-@}" '$1 == "fpr" { f = $10 } $1 == "uid" && index($10, e) { print f; exit }')"
+  [ -n "$CAND" ] || CAND="$(local_fprs | head -1)"
+  if [ -z "$CAND" ]; then
+    say "You have no GPG key. The wizard can make one for $MAINT_NAME <${MAINT_EMAIL:-?}>."
+    [ -n "${MAINT_EMAIL:-}" ] || die "a signing key needs an email — set maintainer-email in the config (it must be an address of your Launchpad account)"
+    confirm "Create it now? (gpg asks for a passphrase)" y || die "Launchpad needs a signed upload"
+    gpgx "${TTYARGS[@]+"${TTYARGS[@]}"}" --quick-generate-key "$MAINT_NAME <$MAINT_EMAIL>" ed25519 sign 3y || die "gpg couldn't create the key"
+    CAND="$(local_fprs | tail -1)"
+  fi
+  ok "key: $CAND"
+  if confirm "Publish it to keyserver.ubuntu.com, where Launchpad looks it up?" y; then
+    gpgx --keyserver hkps://keyserver.ubuntu.com --send-keys "$CAND" >/dev/null 2>&1 && ok "sent to keyserver.ubuntu.com" || warn "couldn't send it — Launchpad also accepts it pasted on the page below"
+  fi
+  say "Register it on Launchpad (once):"
+  note "1. open $LP_WEB/~$LP_USER/+editpgpkeys and import the fingerprint $CAND"
+  note "2. Launchpad emails you an encrypted message — decrypt it (your mail app, or: gpg -d)"
+  note "3. open the link inside it. The key's email must be a confirmed address of your account"
+  confirm "Done? Check again" y || die "Launchpad needs your key registered to accept uploads"
+  LP_FPRS="$(lp_get "~$LP_USER/gpg_keys" | python3 -c 'import json,sys; [print(e["fingerprint"]) for e in json.load(sys.stdin)["entries"]]' 2>/dev/null || true)"
+  pick_key
+done
+if [ -n "$KEY" ]; then
+  ok "signing key $KEY is registered on Launchpad"
+  [ "$SAVE" = 1 ] && cfg_set gpg-key "$KEY"
+  KEYMAIL="$(gpgx --list-keys --with-colons "$KEY" 2>/dev/null | awk -F: '$1 == "uid" { print $10 }' | grep -oE '<[^>]+>' | tr -d '<>' | head -1)"
+  [ -n "${MAINT_EMAIL:-}" ] && [ -n "$KEYMAIL" ] && [ "$KEYMAIL" != "$MAINT_EMAIL" ] && \
+    warn "the key is for $KEYMAIL, the packages say $MAINT_EMAIL — Launchpad matches them to your account, both should be yours"
+fi
+# the PPA itself: made once on the web (its terms are yours to accept)
+while ! lp_get "~$LP_USER/+archive/ubuntu/$PPA_NAME" >/dev/null 2>&1; do
+  [ "$DRYRUN" = 1 ] && { note "dry run: the PPA ppa:$LP_USER/$PPA_NAME doesn't exist yet"; break; }
+  warn "the PPA ppa:$LP_USER/$PPA_NAME doesn't exist yet"
+  note "create it at $LP_WEB/~$LP_USER/+activate-ppa — URL name: $PPA_NAME; accept the PPA terms of use"
+  [ "$ASSUME_YES" = 1 ] && die "create the PPA once, then re-run"
+  confirm "Done? Check again" y || die "uploads need the PPA"
+done
+lp_get "~$LP_USER/+archive/ubuntu/$PPA_NAME" >/dev/null 2>&1 && ok "PPA: $LP_WEB/~$LP_USER/+archive/ubuntu/$PPA_NAME"
+
+# ================================================================ 3. debian/
+step "3/5  debian/ packaging"
+WD="$CACHE/ppa/$PNAME"
+rm -rf "$WD"; mkdir -p "$WD/out"
+SRC="$WD/$PNAME-$VERSION"
+mkdir -p "$SRC"
+git -C "$REPO" archive "$TAG_REF" | tar x -C "$SRC"
+if [ -d "$SRC/debian" ]; then
+  ok "your debian/ (from $TAG)"
+  OWN_DEBIAN=1
+else
+  OWN_DEBIAN=0
+  pc_ubuntu() {  # a pkg-config module → its Ubuntu -dev package
+    case "$1" in
+      gtk4) echo libgtk-4-dev ;; gtk+-3.0) echo libgtk-3-dev ;; libadwaita-1) echo libadwaita-1-dev ;;
+      glib-2.0|gio-2.0|gobject-2.0|gio-unix-2.0) echo libglib2.0-dev ;; json-glib-1.0) echo libjson-glib-dev ;;
+      libsoup-3.0) echo libsoup-3.0-dev ;; sqlite3) echo libsqlite3-dev ;; openssl|libssl|libcrypto) echo libssl-dev ;;
+      libcurl) echo libcurl4-openssl-dev ;; zlib) echo zlib1g-dev ;; x11) echo libx11-dev ;;
+      wayland-client|wayland-cursor) echo libwayland-dev ;; xkbcommon) echo libxkbcommon-dev ;; dbus-1) echo libdbus-1-dev ;;
+      libpulse|libpulse-simple) echo libpulse-dev ;; alsa) echo libasound2-dev ;; libxml-2.0) echo libxml2-dev ;;
+      cairo) echo libcairo2-dev ;; pango|pangocairo) echo libpango1.0-dev ;; gdk-pixbuf-2.0) echo libgdk-pixbuf-2.0-dev ;;
+      fontconfig) echo libfontconfig-dev ;; freetype2) echo libfreetype-dev ;; libpng) echo libpng-dev ;;
+      libsecret-1) echo libsecret-1-dev ;; libnotify) echo libnotify-dev ;; gstreamer-1.0) echo libgstreamer1.0-dev ;;
+      libsystemd|libudev) echo libsystemd-dev ;; epoxy) echo libepoxy-dev ;; libarchive) echo libarchive-dev ;;
+      libzstd) echo libzstd-dev ;; liblzma) echo liblzma-dev ;; sdl2) echo libsdl2-dev ;; vulkan) echo libvulkan-dev ;;
+      *) echo "" ;;
+    esac
+  }
+  BDEPS="debhelper-compat (= 13)"; ARCH=any; XDEPS=""; RULES_EXTRA=""
+  case "$KIND" in
+    meson|cmake)
+      if [ "$KIND" = meson ]; then BDEPS="$BDEPS, meson, ninja-build, pkgconf"
+        PCS="$(for f in $(grep -E '(^|/)meson\.build$' "$WORK/tree.txt"); do at "$TAG_REF" "$f"; done | grep -oE "dependency\([[:space:]]*'[^']+'" | sed -E "s/.*'([^']+)'/\\1/" | sort -u)"
+      else BDEPS="$BDEPS, cmake"
+        PCS="$(at "$TAG_REF" CMakeLists.txt | tr '\n' ' ' | grep -oE 'pkg_check_modules\([^)]*\)' | sed -E 's/^pkg_check_modules\(//; s/\)$//' \
+               | awk '{ for (i = 2; i <= NF; i++) if ($i !~ /^(REQUIRED|QUIET|IMPORTED_TARGET|GLOBAL)$/) { m = $i; sub(/[<>=].*/, "", m); if (m != "") print m } }' | sort -u)"
+        [ -n "$PCS" ] && BDEPS="$BDEPS, pkgconf"
+        RULES_EXTRA='
+override_dh_auto_configure:
+	dh_auto_configure -- -DCMAKE_BUILD_TYPE=Release'
+      fi
+      for pc in $PCS; do
+        case "$pc" in threads|m|dl|rt|dependency) continue ;; esac
+        d="$(pc_ubuntu "$pc")"
+        if [ -n "$d" ]; then BDEPS="$BDEPS, $d"; else warn "no Ubuntu package known for '$pc' — the test build will tell if it's needed"; fi
+      done
+      case " $PCS " in *gtk4*|*libadwaita*) BDEPS="$BDEPS, desktop-file-utils, appstream, libglib2.0-bin" ;; esac ;;
+    make)
+      RULES_EXTRA='
+override_dh_auto_install:
+	dh_auto_install -- PREFIX=/usr' ;;
+    python)
+      ARCH=all; BDEPS="$BDEPS, dh-sequence-python3, pybuild-plugin-pyproject, python3-all"
+      at "$TAG_REF" pyproject.toml > "$WORK/pyproject.toml"
+      for b in $(python3 -c 'import re,sys,tomllib; d=tomllib.load(open(sys.argv[1],"rb")); [print(re.match(r"[A-Za-z0-9._-]+", r).group(0).lower().replace("_","-")) for r in d.get("build-system",{}).get("requires",[])]' "$WORK/pyproject.toml" 2>/dev/null); do
+        BDEPS="$BDEPS, python3-$b"
+      done
+      XDEPS=', ${python3:Depends}'
+      RULES_EXTRA="export PYBUILD_NAME=$PNAME"
+      RULES_DH='dh $@ --buildsystem=pybuild' ;;
+    rust)
+      BDEPS="$BDEPS, cargo, rustc"
+      at "$TAG_REF" Cargo.lock | grep -q '^name = "openssl-sys"' && BDEPS="$BDEPS, libssl-dev, pkgconf"
+      RULES_EXTRA="export CARGO_HOME = \$(CURDIR)/debian/cargo-home
+
+override_dh_auto_build:
+	cargo build --release --offline --frozen
+
+override_dh_auto_test:
+ifeq (,\$(filter nocheck,\$(DEB_BUILD_OPTIONS)))
+	cargo test --release --offline --frozen
+endif
+
+override_dh_auto_install:
+	find target/release -maxdepth 1 -type f -executable -exec install -Dm755 -t debian/$PNAME/usr/bin {} +
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home" ;;
+    go)
+      GOV="$(at "$TAG_REF" go.mod | sed -nE 's/^go[[:space:]]+([0-9]+\.[0-9]+).*/\1/p' | head -1)"
+      BDEPS="$BDEPS, golang-go"
+      GOTARGET=.; grep -qE '^cmd/[^/]+/main\.go$' "$WORK/tree.txt" && GOTARGET='./cmd/...'
+      RULES_EXTRA="export GOCACHE = \$(CURDIR)/debian/gocache
+export GOFLAGS = -mod=vendor -trimpath -buildvcs=false
+export GOTOOLCHAIN = local
+
+override_dh_auto_build:
+	mkdir -p build && go build -o build/ $GOTARGET
+
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -Dm755 -t debian/$PNAME/usr/bin build/*
+
+override_dh_auto_clean:
+	rm -rf build debian/gocache" ;;
+    *) die "the PPA wizard packages Meson, CMake, Make, Python, Rust and Go apps" ;;
+  esac
+  mkdir -p "$SRC/debian/source"
+  echo "3.0 (quilt)" > "$SRC/debian/source/format"
+  # Debian's rules for the synopsis match nixpkgs': one short line, no article, no period
+  {
+    printf 'Source: %s\nSection: misc\nPriority: optional\n' "$PNAME"
+    printf 'Maintainer: %s <%s>\n' "$MAINT_NAME" "${MAINT_EMAIL:-$(git -C "$REPO" config user.email)}"
+    printf 'Build-Depends: %s\nStandards-Version: 4.7.0\n' "$BDEPS"
+    printf 'Homepage: %s\nVcs-Browser: %s\nRules-Requires-Root: no\n\n' "$HOMEPAGE" "$WEB"
+    printf 'Package: %s\nArchitecture: %s\n' "$PNAME" "$ARCH"
+    printf 'Depends: ${shlibs:Depends}, ${misc:Depends}%s\n' "$XDEPS"
+    printf 'Description: %s\n' "$DESC"
+    ABOUT="$(cfg_get about)"; [ -n "$ABOUT" ] || ABOUT="$DESC."
+    printf '%s\n' "$ABOUT" | fold -s -w 78 | sed -e 's/[[:space:]]*$//' -e 's/^$/./' -e 's/^/ /'
+  } > "$SRC/debian/control"
+  {
+    printf '#!/usr/bin/make -f\n\n'
+    printf '%%:\n\t%s\n' "${RULES_DH:-dh \$@}"
+    [ -n "$RULES_EXTRA" ] && printf '%s\n' "$RULES_EXTRA"
+  } > "$SRC/debian/rules"
+  chmod 755 "$SRC/debian/rules"
+  {
+    printf 'Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/\n'
+    printf 'Upstream-Name: %s\nSource: %s\n\n' "$PNAME" "$WEB"
+    printf 'Files: *\nCopyright: %s %s\nLicense: %s\n' "$(date +%Y)" "$MAINT_NAME" "$SPDX"
+    printf ' The full license text is in the LICENSE file of the source.\n'
+  } > "$SRC/debian/copyright"
+  ok "wrote debian/ (control, rules, copyright, source/format) for $KIND"
+fi
+echo; sed 's/^/     /' "$SRC/debian/control"; echo
+
+# versions: <upstream>-1ppa<n>~ubuntu<release>.1, one per Ubuntu release — n
+# goes up when this upstream version is in the PPA already
+PPA_N=1
+PUB="$(lp_versions)"
+while printf '%s\n' "$PUB" | grep -q "^$VERSION-1ppa$PPA_N~"; do PPA_N=$((PPA_N + 1)); done
+[ "$PPA_N" -gt 1 ] && note "$VERSION is in the PPA already: this is ppa$PPA_N"
+series_version() { grep "^$1|" "$WORK/series.txt" | cut -d'|' -f2; }
+
+# ========================================================= 4. build + check
+step "4/5  Build and check"
+IMG_TOOLS="ubuntu:$(series_version "$(printf '%s' "$PPA_SERIES" | awk '{ print $NF }')")"
+# one container: vendor the Rust/Go dependencies (Launchpad builds offline),
+# the orig tarball, and a source package per Ubuntu release
+CHLOG=""
+for s in $PPA_SERIES; do
+  v="$VERSION-1ppa$PPA_N~ubuntu$(series_version "$s").1"
+  CHLOG="$CHLOG$s $v"$'\n'
+done
+DATE="$(date -R)"
+MAINT="$MAINT_NAME <${MAINT_EMAIL:-$(git -C "$REPO" config user.email)}>"
+src_packages() {
+  "$RUNTIME" run --rm -v "$WD:/work" -e PNAME="$PNAME" -e VERSION="$VERSION" -e KIND="$KIND" -e OWN="$OWN_DEBIAN" \
+    -e CHLOG="$CHLOG" -e DATE="$DATE" -e MAINT="$MAINT" -e OWNER="$(id -u):$(id -g)" "$IMG_TOOLS" bash -c '
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    extra=""; [ "$KIND" = rust ] && extra="cargo"; [ "$KIND" = go ] && extra="golang-go"
+    apt-get install -y -qq --no-install-recommends dpkg-dev devscripts debhelper fakeroot xz-utils ca-certificates git $extra >/dev/null
+    cd /work/$PNAME-$VERSION
+    if [ "$KIND" = rust ] && [ ! -d vendor ]; then
+      echo "==> cargo vendor"; mkdir -p .cargo; cargo vendor --locked vendor > .cargo/config.toml
+    fi
+    if [ "$KIND" = go ] && [ ! -d vendor ]; then echo "==> go mod vendor"; GOTOOLCHAIN=local go mod vendor || GOTOOLCHAIN=auto go mod vendor; fi
+    cd /work
+    tar --exclude="$PNAME-$VERSION/debian" -cJf "${PNAME}_${VERSION}.orig.tar.xz" "$PNAME-$VERSION"
+    first=1
+    printf "%s" "$CHLOG" | while read -r series version; do
+      [ -n "$series" ] || continue
+      note="  * Release $VERSION."
+      printf "%s (%s) %s; urgency=medium\n\n%s\n\n -- %s  %s\n\n" "$PNAME" "$version" "$series" "$note" "$MAINT" "$DATE" > "$PNAME-$VERSION/debian/changelog"
+      opt=-sd; [ "$first" = 1 ] && opt=-sa
+      echo "==> source package $version ($series)"
+      (cd "$PNAME-$VERSION" && dpkg-buildpackage -S $opt -us -uc -d) || { echo "STORE-SUBMIT: source package failed for $series"; exit 3; }
+      first=0
+    done
+    mv /work/*.dsc /work/*.debian.tar.* /work/*_source.changes /work/*.orig.tar.xz /work/out/ 2>/dev/null || true
+    rm -f /work/*_source.buildinfo
+    chown -R "$OWNER" /work
+    echo "STORE-SUBMIT: OK"'
+}
+run_logged "$WORK/src.log" "source packages for: $PPA_SERIES${KIND:+ (vendoring $KIND dependencies)}" src_packages \
+  && grep -q "STORE-SUBMIT: OK" "$WORK/src.log" \
+  || { grep -vE '^\s*$' "$WORK/src.log" | tail -n 15 | sed 's/^/     /'; KEEP_WORK=1; die "couldn't make the source packages (log: $WORK/src.log)"; }
+ls "$WD/out"/*.dsc >/dev/null 2>&1 || die "no .dsc came out — log: $WORK/src.log"
+ok "source packages: $(cd "$WD/out" && ls ./*.dsc | sed 's#^\./##' | tr '\n' ' ')"
+
+# the offline test build, per Ubuntu release: build dependencies installed
+# with the network on, then the network cut, then the build — like Launchpad
+test_build() {  # test_build <series>
+  local s="$1" v img
+  v="$(printf '%s' "$CHLOG" | awk -v s="$s" '$1 == s { print $2 }')"
+  img="ubuntu:$(series_version "$s")"
+  "$RUNTIME" run --rm --cap-add NET_ADMIN -v "$WD/out:/src:ro" -e DSC="${PNAME}_${v#*:}.dsc" -e PNAME="$PNAME" "$img" bash -c '
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends dpkg-dev devscripts equivs lintian iproute2 fakeroot >/dev/null
+    mkdir /b && cd /b && dpkg-source -x "/src/$DSC" pkg >/dev/null
+    cd pkg && mk-build-deps -ir -t "apt-get -y -qq --no-install-recommends" debian/control >/dev/null 2>&1 \
+      || { echo "STORE-SUBMIT: build dependencies not installable"; apt-get build-dep -s . 2>&1 | tail -5; exit 4; }
+    for i in $(ls /sys/class/net | grep -v "^lo$"); do ip link set "$i" down; done
+    echo "==> building offline"
+    dpkg-buildpackage -b -us -uc || { echo "STORE-SUBMIT: build failed"; exit 5; }
+    echo "==> lintian"
+    lintian --no-tag-display-limit ../*.deb 2>&1 | sed "s/^/LINTIAN: /" || true
+    ls ../*.deb | sed "s/^/DEB: /"
+    echo "STORE-SUBMIT: OK"'
+}
+TESTED=""
+if [ "$NO_TEST" = 1 ]; then
+  warn "--no-test: not test-built"
+else
+  for s in $PPA_SERIES; do
+    while :; do
+      if run_logged "$WORK/test-$s.log" "offline test build for Ubuntu $(series_version "$s") ($s)" test_build "$s" \
+         && grep -q "STORE-SUBMIT: OK" "$WORK/test-$s.log"; then
+        ok "builds offline on Ubuntu $(series_version "$s"): $(grep '^DEB: ' "$WORK/test-$s.log" | sed 's#^DEB: \.\./##' | tr '\n' ' ')"
+        if grep -q '^LINTIAN: [EW]:' "$WORK/test-$s.log"; then
+          warn "lintian (Debian's package checker) says:"
+          grep '^LINTIAN: [EW]:' "$WORK/test-$s.log" | sed 's/^LINTIAN: /       /' | head -10
+        else ok "lintian: no errors or warnings"; fi
+        TESTED="$TESTED $s"; break
+      fi
+      L="$WORK/test-$s.log"
+      if grep -q "build dependencies not installable" "$L"; then
+        bad "a build dependency isn't available on Ubuntu $(series_version "$s"):"; grep -E "Unable to locate|has no installation candidate|but it is not" "$L" | head -3 | sed 's/^/       /'
+      elif grep -qiE "requires rustc|rustc [0-9.]+ is not supported|package .* cannot be built because it requires rustc" "$L"; then
+        bad "the code needs a newer Rust than Ubuntu $(series_version "$s") has"
+        note "use Ubuntu's versioned toolchain: Build-Depends cargo-1.XX, rustc-1.XX, and PATH=/usr/lib/rust-1.XX/bin in debian/rules — or leave $s out"
+      elif grep -qiE "go.mod requires go >=|requires go[0-9.]+ or later" "$L"; then
+        bad "the code needs a newer Go than Ubuntu $(series_version "$s") has"
+        note "use golang-1.XX-go and PATH=/usr/lib/go-1.XX/bin in debian/rules — or leave $s out"
+      elif grep -qiE "Could not resolve|Temporary failure in name resolution|failed to download" "$L"; then
+        bad "the build tried to download something — Launchpad builds have no network; it must be vendored or packaged"
+      else
+        bad "the test build failed on Ubuntu $(series_version "$s"):"
+      fi
+      grep -vE '^\s*$' "$L" | grep -v '^LINTIAN' | tail -n 12 | cut -c1-200 | sed 's/^/     /'
+      [ "$ASSUME_YES" = 1 ] && { KEEP_WORK=1; die "the test build failed (log: $L)"; }
+      say "l) read the whole log     r) build again     s) skip $s     q) quit"
+      ask CHOICE "Choice" "l"
+      case "$CHOICE" in
+        l|L) "${PAGER:-less}" "$L" || cat "$L" ;;
+        s|S) warn "not test-built for $s"; break ;;
+        q|Q) note "the packaging is in $WD"; exit 1 ;;
+      esac
+    done
+  done
+fi
+
+save_answers
+if [ "$DRYRUN" = 1 ]; then
+  warn "dry run — made and tested; nothing signed or uploaded. It's all in $WD"
+  exit 0
+fi
+
+# ================================================================ 5. upload
+step "5/5  Sign and upload"
+# sign like debsign: clearsign the .dsc, put its new checksums in the
+# .changes, clearsign the .changes
+sign_changes() {  # sign_changes <file_source.changes>
+  local ch="$1" dsc
+  dsc="$(dirname "$ch")/$(awk '/^Files:/ { f = 1; next } f && /\.dsc$/ { print $NF; exit }' "$ch")"
+  gpgx "${TTYARGS[@]+"${TTYARGS[@]}"}" --batch --yes --local-user "$KEY" --clearsign -o "$dsc.asc" "$dsc" && mv "$dsc.asc" "$dsc"
+  python3 - "$ch" "$dsc" <<'PY'
+import hashlib, os, sys
+ch, dsc = sys.argv[1], sys.argv[2]
+data = open(dsc, "rb").read(); name = os.path.basename(dsc); size = str(len(data))
+sums = {"Checksums-Sha1:": hashlib.sha1(data).hexdigest(), "Checksums-Sha256:": hashlib.sha256(data).hexdigest(), "Files:": hashlib.md5(data).hexdigest()}
+out, sec = [], None
+for line in open(ch).read().splitlines():
+    if line and not line.startswith(" "):
+        sec = line.split()[0] if line.split() else None
+    elif sec in sums and line.split()[-1] == name:
+        f = line.split()
+        f[0], f[1] = sums[sec], size
+        line = " " + " ".join(f)
+    out.append(line)
+open(ch, "w").write("\n".join(out) + "\n")
+PY
+  gpgx "${TTYARGS[@]+"${TTYARGS[@]}"}" --batch --yes --local-user "$KEY" --clearsign -o "$ch.asc" "$ch" && mv "$ch.asc" "$ch"
+}
+note "gpg may ask for your key's passphrase"
+for ch in "$WD/out"/*_source.changes; do
+  sign_changes "$ch" || die "signing $(basename "$ch") failed"
+  gpgx --verify "$ch" >/dev/null 2>&1 || die "the signature on $(basename "$ch") doesn't verify"
+done
+ok "signed with $KEY"
+
+go "Upload to ppa:$LP_USER/$PPA_NAME for $PPA_SERIES?" || { note "signed packages are in $WD/out"; exit 0; }
+DEST="$LP_FTP/~$LP_USER/ubuntu/$PPA_NAME/"
+# in build order: the first release's upload carries the orig tarball (-sa),
+# the others refer to it (-sd) — so it has to arrive first
+UPLOADS="$(printf '%s' "$CHLOG" | while read -r s v; do [ -n "$v" ] && printf '%s\n' "$WD/out/${PNAME}_${v}_source.changes"; done)"
+for ch in $UPLOADS; do
+  FILES="$(awk '/^Files:/ { f = 1; next } /^[^ ]/ { f = 0 } f && NF { print $NF }' "$ch")"
+  for f in $FILES "$(basename "$ch")"; do
+    run_logged "$WORK/ftp.log" "uploading $f" curl -sS --retry 3 -T "$WD/out/$f" "$DEST" \
+      || { tail -n 3 "$WORK/ftp.log" | sed 's/^/     /'; die "uploading $f failed"; }
+  done
+  ok "uploaded $(basename "$ch")"
+done
+
+# Launchpad answers by email, and on the PPA page within a few minutes
+say "Launchpad checks the upload (it emails you if it's rejected)…"
+for _ in $(seq 1 24); do
+  PUB="$(lp_versions)"
+  SEEN=0
+  while read -r s v; do [ -n "$s" ] && printf '%s\n' "$PUB" | grep -qxF "$v" && SEEN=$((SEEN + 1)); done <<EOF
+$CHLOG
+EOF
+  [ "$SEEN" -ge "$(printf '%s' "$CHLOG" | grep -c .)" ] && break
+  sleep 5
+done
+if [ "$SEEN" -ge "$(printf '%s' "$CHLOG" | grep -c .)" ]; then ok "accepted: Launchpad is building it now"
+else warn "not listed yet — if the email says rejected, the usual causes: the key isn't registered, or the changelog email isn't one of your Launchpad addresses"; fi
+
+printf '\n   %sDone.%s %s %s → ppa:%s/%s\n   %s/~%s/+archive/ubuntu/%s/+packages\n\n' "$B" "$R" "$PNAME" "$VERSION" "$LP_USER" "$PPA_NAME" "$LP_WEB" "$LP_USER" "$PPA_NAME"
+say "  • People install it with:"
+say "      sudo add-apt-repository ppa:$LP_USER/$PPA_NAME && sudo apt install $PNAME"
+say "  • Launchpad builds it for each release (usually minutes); build failures are emailed."
+say "  • Next release: run store-submit.sh ppa (or linux) again."
+echo
+}
+
+# ##########################################################################
 #   store-submit.sh <store> [options] — that store's wizard, directly
 # ##########################################################################
 case "${1-}" in
-  fdroid|play|linux|nix|aur|flathub|snap) WIZARD="$1"; shift; "wizard_$WIZARD" "$@"; exit ;;
+  fdroid|play|linux|nix|aur|flathub|snap|ppa) WIZARD="$1"; shift; "wizard_$WIZARD" "$@"; exit ;;
 esac
 
 # ##########################################################################
@@ -6830,7 +7389,7 @@ store's wizard.
   store-submit.sh [options]             the store picker (options below)
   store-submit.sh fdroid|play|linux ... one store's wizard directly, e.g.
                                           store-submit.sh fdroid --yes
-  store-submit.sh nix|aur|flathub|snap  one Linux distro's wizard directly
+  store-submit.sh nix|aur|flathub|snap|ppa   one Linux distro's wizard directly
                                         (store-submit.sh <store> --help)
 
   -h, --help          show this text
@@ -7260,6 +7819,19 @@ needs_snap() {
     || note "no snapcraft.yaml — the wizard writes one for your build system"
   return 0
 }
+needs_ppa() {
+  # Launchpad builds offline, from Ubuntu's own packages
+  if [ -n "$FLUTTER_ANY" ]; then
+    need_fail "a Flutter app can't be built in a PPA (no internet on Launchpad, no Flutter SDK in Ubuntu) — Ubuntu users get it from the Snap Store or Flathub"
+  elif has_kind "Node.js"; then
+    need_fail "an npm app can't be built in a PPA (no internet on Launchpad for npm) — the Snap Store and Flathub can take it"
+  else
+    note "Rust and Go dependencies are vendored into the source; other libraries come from Ubuntu"
+  fi
+  local u; u="$(sed -nE 's/^[[:space:]]*launchpad-user[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$REPO/.store-submit.conf" 2>/dev/null | tail -1)"
+  [ -n "$u" ] && need_ok "Launchpad: ~$u" || note "your Launchpad username is asked once"
+  return 0
+}
 needs_aur() {
   # the AUR's first rule: nothing Arch already ships in its official repos
   local name
@@ -7481,6 +8053,15 @@ tools_snap() {
   else bad "podman or docker — needed to run snapcraft (NixOS: virtualisation.podman.enable = true;)"; note "  $(install_hint podman)"; MISSING=$((MISSING + 1)); fi
   [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/snap-submit/credentials" ] && ok "Snap Store login saved" \
     || note "  no Snap Store login yet — the wizard has snapcraft ask for it once"
+}
+tools_ppa() {
+  local r="" k
+  for k in podman docker; do have "$k" && "$k" info >/dev/null 2>&1 && { r="$k"; break; }; done
+  if [ -n "$r" ]; then ok "$r — Ubuntu containers make the packages and test-build them offline"
+  else bad "podman or docker — needed for the Ubuntu containers (NixOS: virtualisation.podman.enable = true;)"; note "  $(install_hint podman)"; MISSING=$((MISSING + 1)); fi
+  if have gpg; then ok "gpg ($(command -v gpg)) — signs the uploads"
+  else note "  gpg isn't installed — the wizard uses GnuPG from nixpkgs (or: $(install_hint gnupg))"; fi
+  need curl "Launchpad's API and the upload"
 }
 tools_linux() {
   local d
