@@ -8,7 +8,8 @@
 #
 #   F-Droid      → fdroid-submit.sh
 #   Google Play  → play-submit.sh
-#   Nixpkgs, AUR → checks only for now; their wizards are still to be written
+#   Nixpkgs      → nixpkgs-submit.sh
+#   AUR          → checks only for now; its wizard is still to be written
 #
 # Adding a store: one line in STORES below, a needs_<id> and a tools_<id>
 # function, and its wizard script next to this one.
@@ -30,7 +31,7 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 # id|name|wizard script (blank = not written yet)|one-line description
 STORES="fdroid|F-Droid|fdroid-submit.sh|free and open source Android apps, built from source by F-Droid
 play|Google Play|play-submit.sh|Android releases through the Play Developer API
-nix|Nixpkgs (Nix store)||packages for Nix and NixOS — checks only, no wizard yet
+nix|Nixpkgs (Nix store)|nixpkgs-submit.sh|packages for Nix and NixOS, built from source by nixpkgs
 aur|AUR (Arch User Repository)||PKGBUILDs for Arch Linux — checks only, no wizard yet"
 
 usage() {
@@ -225,6 +226,13 @@ for p in "$REPO/pubspec.yaml" "$REPO"/*/pubspec.yaml "$REPO"/*/*/pubspec.yaml; d
   FLUTTER_DIR="${d#"$REPO"}"; FLUTTER_DIR="${FLUTTER_DIR#/}"; FLUTTER_DIR="${FLUTTER_DIR:-.}"
   break
 done
+# Any Flutter project, Android target or not (nixpkgs builds the Linux one).
+FLUTTER_ANY=""
+for p in "$REPO/pubspec.yaml" "$REPO"/*/pubspec.yaml "$REPO"/*/*/pubspec.yaml; do
+  [ -f "$p" ] && grep -qE '^[[:space:]]+sdk:[[:space:]]*flutter' "$p" || continue
+  FLUTTER_ANY="$(dirname "$p")"; FLUTTER_ANY="${FLUTTER_ANY#"$REPO"}"; FLUTTER_ANY="${FLUTTER_ANY#/}"; FLUTTER_ANY="${FLUTTER_ANY:-.}"
+  break
+done
 FLUTTER_ANDROID=""
 [ -n "$FLUTTER_DIR" ] && { FLUTTER_ANDROID="$FLUTTER_DIR/android/app"; FLUTTER_ANDROID="${FLUTTER_ANDROID#./}"; }
 
@@ -379,14 +387,25 @@ needs_play() {
 
 needs_nix() {
   common_git
-  is_android && need_warn "nixpkgs doesn't package Android apps — this looks like one"
-  [ -n "$LAST_TAG" ] || need_warn "no tags — nixpkgs pins a released version, so tag one"
-  [ -n "$LICENSE_FILE" ] || need_warn "nixpkgs needs a license for meta.license"
-  has_kind "Rust"    && { [ -f "$REPO/Cargo.lock" ] && need_ok "Cargo.lock" || need_fail "no Cargo.lock — buildRustPackage needs it"; }
-  has_kind "Go"      && { [ -f "$REPO/go.sum" ] && need_ok "go.sum" || need_warn "no go.sum"; }
-  has_kind "Node.js" && { ls "$REPO"/package-lock.json "$REPO"/yarn.lock "$REPO"/pnpm-lock.yaml >/dev/null 2>&1 \
-                          && need_ok "JS lock file" || need_fail "no lock file — nixpkgs' npm/yarn/pnpm fetchers need one"; }
-  [ -f "$REPO/flake.nix" ] && need_ok "flake.nix (a head start on the derivation)"
+  [ -n "$ORIGIN" ] || need_fail "no 'origin' remote — nixpkgs builds from a public repository"
+  # nixpkgs packages Linux (and macOS) software: a Flutter app goes in as its
+  # Linux desktop build; a plain Android app can't go in at all.
+  if [ -n "$FLUTTER_ANY" ]; then
+    local where="in ${FLUTTER_ANY}/"; [ "$FLUTTER_ANY" = . ] && where="in the project root"
+    if [ -f "$REPO/$FLUTTER_ANY/linux/CMakeLists.txt" ]; then need_ok "Flutter Linux desktop target (what nixpkgs builds)"
+    else need_fail "no Linux desktop target — run 'flutter create --platforms=linux .' $where and commit it"; fi
+    [ -f "$REPO/$FLUTTER_ANY/pubspec.lock" ] && need_ok "pubspec.lock" || need_fail "no pubspec.lock — nixpkgs pins the Dart packages from it"
+  elif is_android; then
+    need_fail "this is an Android app — nixpkgs packages software for Linux and macOS"
+  fi
+  [ -n "$LAST_TAG" ] || note "no tags yet — the wizard creates and pushes v<version>"
+  [ -n "$LICENSE_FILE" ] || need_warn "no LICENSE — nixpkgs treats software without one as unfree"
+  has_kind "Rust"    && { [ -f "$REPO/Cargo.lock" ] && need_ok "Cargo.lock" || need_fail "no Cargo.lock — buildRustPackage needs it committed"; }
+  has_kind "Go"      && { [ -f "$REPO/go.sum" ] && need_ok "go.sum" || note "no go.sum — fine if it has no dependencies"; }
+  has_kind "Node.js" && { [ -f "$REPO/package-lock.json" ] && need_ok "package-lock.json" \
+                          || need_fail "no package-lock.json — the wizard packages npm projects from it"; }
+  has_kind "Python"  && { [ -f "$REPO/pyproject.toml" ] && need_ok "pyproject.toml" \
+                          || need_fail "no pyproject.toml — nixpkgs builds Python apps with pyproject = true"; }
   return 0
 }
 
@@ -445,7 +464,9 @@ install_hint() {
     *:apksigner)     printf "Android SDK build-tools (sdkmanager 'build-tools;35.0.0')"; return ;;
     pacman:python3|brew:python3) pkg=python ;;
     nix*:nixpkgs-review|nix*:gh) pkg="$t" ;;
-    *:nix|*:nix-prefetch-url) printf 'https://nixos.org/download'; return ;;
+    *:nix|*:nix-build|*:nix-prefetch-url) printf 'Nix: https://nixos.org/download'; return ;;
+    nix*:nix-locate) pkg=nix-index ;;
+    *:nix-locate)    printf 'nix profile install nixpkgs#nix-index, then run nix-index once'; return ;;
     *:nixpkgs-review) printf 'nix profile install nixpkgs#nixpkgs-review'; return ;;
     pacman:makepkg)  pkg=base-devel ;;
     *:makepkg|*:namcap) printf 'Arch Linux only (makepkg/namcap come with pacman, base-devel, namcap)'; return ;;
@@ -560,10 +581,17 @@ tools_play() {
   want unzip   "checking the build is signed before uploading"
 }
 tools_nix() {
-  need nix              "building and testing the derivation"
-  want nixpkgs-review   "building everything the change touches, as reviewers will"
-  want gh               "forking nixpkgs and opening the pull request"
-  want git              "working on your nixpkgs fork"
+  need nix-build "building the package (Nix)"
+  need git       "the nixpkgs checkout and your branch"
+  need gh        "your nixpkgs fork and the pull request"
+  if gh auth status --hostname github.com >/dev/null 2>&1; then ok "gh is logged in to GitHub"
+  else note "  not logged in to GitHub — the wizard offers 'gh auth login'"; fi
+  want nix-locate "finding which package provides a missing library (nix-index)"
+  note "  nix-update, nixpkgs-review, jq and yq are fetched from nixpkgs when needed"
+  local np; np="$(sed -n 's/^SAVED_NIXPKGS=//p' "${XDG_CONFIG_HOME:-$HOME/.config}/nixpkgs-submit/last.conf" 2>/dev/null | tr -d "'\"")"
+  np="${np:-$HOME/nixpkgs}"
+  if [ -f "$np/.version" ]; then ok "nixpkgs checkout: $np (reused)"
+  else note "  no nixpkgs checkout yet — the wizard asks where to put one (default $np; ~200 MB)"; fi
 }
 tools_aur() {
   need makepkg "building the package and generating .SRCINFO"
@@ -621,9 +649,9 @@ for id in "${TODO[@]}"; do
   n=$((n+1))
   name="$(store_field "$id" 2)"; script="$(store_field "$id" 3)"
   ARGS=("${FWD[@]+"${FWD[@]}"}")
-  # fdroid-submit.sh takes the checkout as --repo; play-submit.sh asks,
+  # fdroid- and nixpkgs-submit.sh take the checkout as --repo; play-submit.sh asks,
   # offering the directory it runs in.
-  [ "$id" = fdroid ] && ARGS+=(--repo "$REPO")
+  case "$id" in fdroid|nix) ARGS+=(--repo "$REPO") ;; esac
   ARGS+=("${PASS[@]+"${PASS[@]}"}")
   printf '\n%s━━ %s (%d/%d): %s %s%s\n' "$B$CYN" "$name" "$n" "${#TODO[@]}" "$script" "${ARGS[*]-}" "$R"
   if ( cd "$REPO" && bash "$HERE/$script" "${ARGS[@]+"${ARGS[@]}"}" ); then

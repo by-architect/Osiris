@@ -1,7 +1,8 @@
 # scripts
 
-Release wizards for the same Android app: one for F-Droid, one for Google Play,
-and `store-submit.sh` in front of them to pick where the app goes.
+Release wizards for publishing an app: F-Droid and Google Play for Android,
+nixpkgs for Nix and NixOS, and `store-submit.sh` in front of them to pick where
+the app goes.
 
 ## store-submit.sh
 
@@ -36,7 +37,7 @@ cd ~/path/to/your-app
   to reuse, `ssh` for pushing to a `git@gitlab.com:` fork, a git identity for
   the fdroiddata commit, and a warning when `$FDROIDDATA_UPSTREAM` is set
 
-Nixpkgs and the AUR only have the checks so far. Adding a store is a line in
+The AUR only has the checks so far. Adding a store is a line in
 `STORES`, a `needs_<id>` and a `tools_<id>` function, and its wizard script.
 
 ## fdroid-submit.sh
@@ -291,3 +292,105 @@ and `python3`.
 - <https://developers.google.com/android-publisher/edits>
 - <https://developers.google.com/android-publisher/api-ref/rest>
 
+## nixpkgs-submit.sh
+
+Gets an app into [nixpkgs](https://github.com/NixOS/nixpkgs) — what Nix and
+NixOS install from — or ships a new version of one that's already there:
+writes `pkgs/by-name/<xx>/<name>/package.nix`, builds it, checks it the way
+nixpkgs reviewers do, and opens the pull request.
+
+```bash
+cd ~/path/to/your-app
+~/path/to/nixpkgs-submit.sh             # new package or update: it works out which
+~/path/to/nixpkgs-submit.sh --dry-run   # everything up to the commits, nothing pushed
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | use everything detected, ask nothing; a new package becomes a **draft** PR |
+| `--ask` | ask every question, including the ones it can answer itself |
+| `--repo PATH` | the app's checkout (default: the git repo you run it in) |
+| `--nixpkgs PATH` | your nixpkgs checkout (default: asked, `~/nixpkgs`) |
+| `--review` | also run `nixpkgs-review` (slow; offered for updates) |
+| `--draft` | open the pull request as a draft |
+| `-n`, `--dry-run` | build, check and commit locally; push nothing |
+| `--no-save`, `--forget` | control `~/.config/nixpkgs-submit/last.conf` |
+
+### What it supports
+
+| project | builder it writes |
+| --- | --- |
+| Flutter (Linux desktop target) | `flutterXYY.buildFlutterApplication`, from the project's `.fvmrc`; `pubspec.lock.json`, `gitHashes`, a desktop entry and icon |
+| Rust | `rustPlatform.buildRustPackage`; `-sys` crates' system libraries added up front |
+| Go | `buildGoModule`; `-X main.version` when `main` has a version variable |
+| Node (npm) | `buildNpmPackage` |
+| Python (`pyproject.toml`) | `python3Packages.buildPythonApplication`; build system and dependencies mapped to nixpkgs |
+| Meson / CMake / Make | `stdenv.mkDerivation`; pkg-config dependencies mapped to nixpkgs |
+
+All in nixpkgs' current style (`finalAttrs`, `tag =`, `passthru.updateScript`
+so nixpkgs' update bot keeps it current).
+
+### What it works out by itself
+
+- **the app:** build system, version, name, release tag, license (the forge's,
+  the manifest's, or recognised from `LICENSE`; GPL "only / or later" is
+  asked), description (cleaned up to nixpkgs' rules and checked against them),
+  homepage, changelog, the main program
+- **the release tag:** created and pushed if missing, and checked to hold this
+  version — nixpkgs downloads exactly that tag
+- **GitHub:** your login (offers `gh auth login`), your nixpkgs fork (made if
+  missing), open PRs for the same package (warned about), a "Package request"
+  issue (closed by the PR)
+- **the checkout:** asked where, shallow-cloned (~200 MB), retried if the
+  connection drops; your own checkout is reused, and if it has uncommitted
+  work the wizard builds in a separate worktree instead
+- **new or update:** from nixpkgs itself. A name taken by different software
+  is caught and a new one asked for. Updates use `nix-update`
+- **you as maintainer:** added to `maintainer-list.nix` (sorted, GitHub id
+  filled in) in its own `maintainers: add <you>` commit, the first time
+
+### Build, check, fix
+
+Each hash starts as its own placeholder; the build fails with the real value
+and the wizard fills it in, so every hash is the one Nix computed. Common
+failures are fixed automatically and said so — a missing pkg-config library or
+build tool (from a table, or `nix-locate` if installed), Python dependencies,
+Go without dependencies, a Flutter too old for the project's Dart SDK. Failing
+tests are named, with the option to skip them and write the reason in a
+comment (reviewers ask for it). Anything else: the relevant log lines, then
+edit / read the log / rebuild / quit.
+
+After it builds: `meta.mainProgram` is matched to what's in `bin/`, a CLI that
+prints its version gets `versionCheckHook` (so every future build checks it),
+a GUI app is started for you to try, and the files are formatted with
+nixpkgs' own `treefmt` — the one CI checks with. Then the reviewers' checklist
+from `pkgs/README.md`: description rules, license, maintainers, mainProgram,
+by-name path, name, version, platform, fetcher, formatting.
+
+### Review, and nixpkgs' automation policy
+
+nixpkgs requires a person to review generated code and the use of automation
+to be disclosed ([CONTRIBUTING.md, "Automation/AI policy"](https://github.com/NixOS/nixpkgs/blob/master/CONTRIBUTING.md#automationai-policy)).
+So for a new package the wizard shows the whole change and asks whether you
+have read it and stand behind it; the PR says the package was generated with
+this script and whether you reviewed it. With `--yes`, or if you say no, the
+PR is opened as a draft for you to review first. Updates made with
+`nix-update` are exempt (it's standard community automation).
+
+The PR uses nixpkgs' own template, ticking only what the run verified: built
+on your platform, binaries tested, nixpkgs-review run, fits CONTRIBUTING.md,
+follows the automation policy.
+
+### What you need
+
+- Nix, `git` and `gh`; `nix-update`, `nixpkgs-review`, `jq` and `yq` come from
+  nixpkgs automatically when not installed
+- the app on GitHub, GitLab, Codeberg or another public git host
+- after your first package is merged, GitHub emails an invite to
+  NixOS/nixpkgs-maintainers — **accept it within a week**, it expires
+
+### References
+
+- <https://github.com/NixOS/nixpkgs/blob/master/pkgs/README.md>
+- <https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/README.md>
+- <https://github.com/NixOS/nixpkgs/blob/master/maintainers/README.md>
