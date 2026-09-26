@@ -1,14 +1,18 @@
-# scripts
+# store-submit.sh
 
-Release wizards for publishing an app: F-Droid and Google Play for Android,
-nixpkgs for Nix and NixOS, and `store-submit.sh` in front of them to pick where
-the app goes.
+One script for publishing an app: to F-Droid and Google Play for Android, and
+to nixpkgs for Nix and NixOS.
 
-## store-submit.sh
+- `store-submit.sh` — asks which store(s), checks what each needs from the
+  app and what this machine has, then runs that store's wizard
+- `store-submit.sh fdroid|play|nix [options]` — one store's wizard directly;
+  each takes `--help`
 
-The one to start with. It asks which store(s) to publish to, checks what that
-store needs from the app and what this machine has, then runs the store's own
-wizard in the app's checkout.
+Each wizard runs in a process of its own, so running one directly or from the
+picker behaves the same. Remembered answers stay in
+`~/.config/{store-submit,fdroid-submit,play-submit,nixpkgs-submit}/last.conf`.
+
+## The store picker: `store-submit.sh`
 
 ```bash
 cd ~/path/to/your-app
@@ -37,10 +41,11 @@ cd ~/path/to/your-app
   to reuse, `ssh` for pushing to a `git@gitlab.com:` fork, a git identity for
   the fdroiddata commit, and a warning when `$FDROIDDATA_UPSTREAM` is set
 
-The AUR only has the checks so far. Adding a store is a line in
-`STORES`, a `needs_<id>` and a `tools_<id>` function, and its wizard script.
+The AUR only has the checks so far. Adding a store is a line in `STORES`, a
+`needs_<id>` and a `tools_<id>` function, a `wizard_<id>` function, and its id
+in the direct-run `case` just above the picker.
 
-## fdroid-submit.sh
+## F-Droid: `store-submit.sh fdroid`
 
 Gets an Android app into F-Droid, or a new version of it: writes the
 `metadata/<applicationId>.yml` entry, validates it, pushes a branch to your
@@ -48,8 +53,8 @@ Gets an Android app into F-Droid, or a new version of it: writes the
 
 ```bash
 cd ~/path/to/your-app
-~/path/to/fdroid-submit.sh            # first time: a few questions
-~/path/to/fdroid-submit.sh --yes      # every release after: one command
+~/path/to/store-submit.sh fdroid        # first time: a few questions
+~/path/to/store-submit.sh fdroid --yes  # every release after: one command
 ```
 
 | flag | effect |
@@ -76,9 +81,9 @@ Detected values are shown as `✓` lines instead of questions:
 - **GitLab:** your username from `glab`, the fork (created if missing); where
   to put the local fdroiddata clone is always asked, with the last path (or
   `~/fdroiddata`) as the default
-- **the metadata:** license from `LICENSE`, source/issue/changelog URLs from
-  the git remote, AuthorName/Email from git config, the Flutter version from
-  `.fvmrc`, no anti-features unless the pitfall check found proprietary bits
+- **the metadata:** source/issue/changelog URLs from the git remote,
+  AuthorName from git config, the Flutter version from `.fvmrc`, no
+  anti-features unless the pitfall check found proprietary bits
 - **validation:** `readmeta`, `rewritemeta` and `lint` run on their own; a
   failure stops the run before anything is pushed
 - **the merge request:** title in fdroiddata's format (`New app: <name>`,
@@ -86,7 +91,11 @@ Detected values are shown as `✓` lines instead of questions:
   with the checklist items it verified ticked, opened with `glab`
 
 What it asks: the **categories** (the first time for each app — remembered
-after), "Looks right?" for the metadata, and before each action that leaves
+after); the **license** and the **AuthorEmail**, each with what it found as
+the default and where it came from (the license from `LICENSE`, with GPL's
+"only" or "or later" read from the notices in your source files; the email
+from `git config user.email` — Enter keeps it, `-` leaves it out, since it
+becomes public); "Looks right?" for the metadata, and before each action that leaves
 your machine (tag push, branch push, merge request). `--yes` answers those;
 it never force-pushes and stops where only a person can decide (categories
 for a new app, a missing store listing, failing validation).
@@ -224,16 +233,16 @@ The wizard asks which you want:
 - <https://f-droid.org/docs/Submitting_to_F-Droid_Quick_Start_Guide/>
 - <https://f-droid.org/docs/Build_Metadata_Reference/>
 
-## play-submit.sh
+## Google Play: `store-submit.sh play`
 
 Uploads a release to **Google Play** through the Play Developer API
 (androidpublisher v3) — the same endpoints Play Console itself uses.
 
 ```bash
-./play-submit.sh                      # the wizard
-./play-submit.sh --dry-run            # upload + validate, then throw the edit away
-./play-submit.sh --yes --track internal --rollout 0.1 --key ~/sa.json   # CI
-./play-submit.sh --help
+./store-submit.sh play                # the wizard
+./store-submit.sh play --dry-run      # upload + validate, then throw the edit away
+./store-submit.sh play --yes --track internal --rollout 0.1 --key ~/sa.json   # CI
+./store-submit.sh play --help
 ```
 
 | flag | effect |
@@ -292,7 +301,7 @@ and `python3`.
 - <https://developers.google.com/android-publisher/edits>
 - <https://developers.google.com/android-publisher/api-ref/rest>
 
-## nixpkgs-submit.sh
+## nixpkgs: `store-submit.sh nix`
 
 Gets an app into [nixpkgs](https://github.com/NixOS/nixpkgs) — what Nix and
 NixOS install from — or ships a new version of one that's already there:
@@ -301,8 +310,8 @@ nixpkgs reviewers do, and opens the pull request.
 
 ```bash
 cd ~/path/to/your-app
-~/path/to/nixpkgs-submit.sh             # new package or update: it works out which
-~/path/to/nixpkgs-submit.sh --dry-run   # everything up to the commits, nothing pushed
+~/path/to/store-submit.sh nix             # new package or update: it works out which
+~/path/to/store-submit.sh nix --dry-run   # everything up to the commits, nothing pushed
 ```
 
 | flag | effect |
