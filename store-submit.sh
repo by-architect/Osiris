@@ -1841,20 +1841,34 @@ git -C "$FDROIDDATA" "${ID_ARGS[@]}" commit -q -m "$COMMITMSG"
 # same commit to keep the merge request to one clean change. It clones the app
 # repo, so give it a moment.
 if [ "$RUNNER" != none ]; then
-  # Its idea of "uncommitted" counts untracked files, and it says so only as
-  # "Build metadata git repo has uncommited changes!" — clear that up first.
-  # (build/ repo/ tmp/ are gitignored in fdroiddata, so they do not count.)
-  LEFTOVER="$(git -C "$FDROIDDATA" status --porcelain --untracked-files 2>/dev/null)"
-  if [ -n "$LEFTOVER" ]; then
-    warn "the clone is not clean, and checkupdates refuses to run if it is not:"
-    printf '%s\n' "$LEFTOVER" | head -5 | sed 's/^/       /'
-    if confirm "Remove these (the clone is only a scratch area)?" n; then
-      git -C "$FDROIDDATA" clean -qfd
-      git -C "$FDROIDDATA" checkout -- . 2>/dev/null || true
-    fi
-  fi
+  #  * without --allow-dirty it refuses to run at all when the clone has any
+  #    change or untracked file, and says only "Build metadata git repo has
+  #    uncommited changes!". We pass it, so leftovers no longer block the check.
+  # Three traps here, none of them yours:
+  #  * fdroiddata's committed config.yml is F-Droid's own production config, with
+  #    serverwebroot and the signing keys as {env: …} placeholders. Their CI sets
+  #    those; your clone cannot, so checkupdates logs an ERROR about the blank
+  #    serverwebroot while doing its actual work perfectly well. Give it a
+  #    throwaway sink and it runs without complaining.
+  #  * with -v it exits non-zero if any ERROR was logged, which turns that
+  #    harmless complaint into a failed run. CI passes -v because there the
+  #    variables are set and nothing is logged. We drop it and read the log.
+  #  * without --allow-dirty it refuses to run at all if the clone holds any
+  #    change or untracked file, saying only "Build metadata git repo has
+  #    uncommited changes!". We pass it.
   say "fdroid checkupdates --auto $APPID (the CI check that compares diffs)"
-  if frun checkupdates --auto -v "$APPID" > "$WORK/checkupdates.log" 2>&1; then
+  # rsync will not create nested directories, and it deploys into repo/status/:
+  # make the whole path or it fails and logs an error for every status file.
+  mkdir -p "$WORK/deploy-sink/repo/status"
+  if serverwebroot="$WORK/deploy-sink" \
+     frun checkupdates --auto --allow-dirty "$APPID" > "$WORK/checkupdates.log" 2>&1; then
+    CU_ERRORS="$(grep -c 'ERROR' "$WORK/checkupdates.log" || true)"
+    if [ "${CU_ERRORS:-0}" -gt 0 ]; then
+      warn "checkupdates logged $CU_ERRORS error(s) — usually fdroiddata's config.yml"
+      warn "wanting F-Droid's own deploy environment, which only their CI has:"
+      grep 'ERROR' "$WORK/checkupdates.log" | head -3 | sed 's/^/       /'
+      note "harmless here, but it means this check may not have been complete"
+    fi
     if git -C "$FDROIDDATA" diff --quiet -- "metadata/$APPID.yml"; then
       ok "checkupdates has nothing to add"
     else
@@ -1866,8 +1880,9 @@ if [ "$RUNNER" != none ]; then
       ok "folded into the commit — CI fails on any diff this command produces"
     fi
   else
-    warn "checkupdates failed — CI runs it too, and a failure there fails the job:"
+    warn "checkupdates could not run:"
     tail -5 "$WORK/checkupdates.log" | sed 's/^/     /'
+    note "CI runs it too, and fails the job on any diff it would produce"
     if ! confirm "Push anyway?" n; then
       KEEP_WORK=1
       die "the log is in $WORK/checkupdates.log"
