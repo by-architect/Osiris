@@ -12,7 +12,9 @@ to Linux — NixOS (nixpkgs), Arch (AUR), Flathub, the Snap Store and Ubuntu
 
 Each wizard runs in a process of its own, so running one directly or from the
 picker behaves the same. Remembered answers stay in
-`~/.config/{store-submit,fdroid-submit,play-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit,ppa-submit}/`;
+`~/.config/storepublisher/playstore/` for Google Play and
+`~/.config/{store-submit,fdroid-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit,ppa-submit}/`
+for the rest;
 what the Linux packages say about the app is in `.store-submit.conf` in the
 app's own repository.
 
@@ -268,7 +270,7 @@ Uploads a release to **Google Play** through the Play Developer API
 | `--notes FILE` | release notes; fastlane changelogs are used otherwise |
 | `--mapping FILE` | R8/ProGuard `mapping.txt`; auto-detected otherwise |
 | `--no-review` | commit with `changesNotSentForReview=true` |
-| `--no-save`, `--forget` | control `~/.config/play-submit/last.conf` |
+| `--no-save`, `--forget` | control `~/.config/storepublisher/playstore/last.conf` |
 
 One API *edit* per run, committed only at the very end:
 
@@ -282,10 +284,19 @@ and any run that fails part-way deletes its edit instead of leaving it open.
 
 ### What it needs
 
-- a **service account JSON key**: enable the *Google Play Android Developer API*
-  in Google Cloud, create a service account, download a JSON key, then invite
-  that account's email in Play Console under *Users and permissions* and grant
-  it release access to the app
+- a **service account JSON key** in `~/.config/storepublisher/playstore/service-account.json`
+  (or passed with `--key`, or in `$PLAY_SERVICE_ACCOUNT_JSON`). A key in that
+  location is picked up without being asked for. Set one up once:
+  1. enable the *Google Play Android Developer API* for a Cloud project —
+     <https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com>
+  2. create a service account, then *Keys → Add key → Create new key → JSON* —
+     <https://console.cloud.google.com/iam-admin/serviceaccounts>
+  3. invite that account's email in Play Console under *Users and permissions*
+     and grant it release access to the app —
+     <https://play.google.com/console/users-and-permissions>
+     (it then appears under <https://play.google.com/console/api-access>)
+
+  Google's walkthrough: <https://developers.google.com/android-publisher/getting_started>
 - the app **already created in Play Console**, with its store listing filled in.
   The API cannot create an app or its listing — do the first release by hand,
   everything after that with this script

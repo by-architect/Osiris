@@ -2219,8 +2219,12 @@ ARTIFACT=""
 NOTESFILE=""
 MAPPING=""
 NOREVIEW=0
-CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/play-submit"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/storepublisher/playstore"
 CONF="$CONF_DIR/last.conf"
+KEY_DEFAULT="$CONF_DIR/service-account.json"
+# Where this wizard kept things before the storepublisher layout. Still read, so
+# an existing key and saved answers keep working; anything new is written above.
+OLD_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/play-submit"
 # Override for testing against a mock; leave unset to talk to Google.
 API_ROOT="${PLAY_API_ROOT:-https://androidpublisher.googleapis.com}"
 
@@ -2262,7 +2266,9 @@ while [ $# -gt 0 ]; do
     --mapping)    MAPPING="${2-}"; shift ;;
     --no-review)  NOREVIEW=1 ;;
     --no-save)    SAVE=0 ;;
-    --forget)     rm -f "$CONF"; printf 'forgot %s\n' "$CONF"; exit 0 ;;
+    # both locations, or the old one would be read back and look remembered
+    --forget)     rm -f "$CONF" "$OLD_CONF_DIR/last.conf"
+                  printf 'forgot %s\n' "$CONF"; exit 0 ;;
     *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
@@ -2341,9 +2347,11 @@ trap cleanup EXIT
 
 # ------------------------------------------------------- remembered answers
 SAVED_REPO=""; SAVED_SUBDIR=""; SAVED_PKG=""; SAVED_KEYFILE=""; SAVED_TRACK=""
-if [ -f "$CONF" ]; then
+CONF_READ="$CONF"
+[ -f "$CONF_READ" ] || [ ! -f "$OLD_CONF_DIR/last.conf" ] || CONF_READ="$OLD_CONF_DIR/last.conf"
+if [ -f "$CONF_READ" ]; then
   # shellcheck disable=SC1090
-  . "$CONF" || warn "could not read $CONF"
+  . "$CONF_READ" || warn "could not read $CONF_READ"
 fi
 save_answers() {
   [ "$SAVE" = 1 ] || return 0
@@ -2410,9 +2418,11 @@ api_fail() {  # api_fail "what was being done"
     sed 's/^/       /' "$API_BODY" >&2 | head -20
   fi
   case "$API_STATUS" in
-    401|403) note "the service account needs to be invited in Play Console under" >&2
-             note "Users and permissions, with release access to this app" >&2 ;;
-    404)     note "check the package name — the app must already exist in Play Console" >&2 ;;
+    401|403) note "the service account needs release access to this app, granted under" >&2
+             note "Play Console → Users and permissions → the account → App permissions" >&2
+             note "https://play.google.com/console/users-and-permissions" >&2 ;;
+    404)     note "check the package name — the app must already exist in Play Console" >&2
+             note "https://play.google.com/console/developers" >&2 ;;
   esac
   exit 1
 }
@@ -2439,14 +2449,29 @@ done
 # ============================================================= 1. credentials
 step "1/5  Credentials"
 if [ -z "$KEYFILE" ] && [ -f "${SAVED_KEYFILE:-/nonexistent}" ]; then KEYFILE="$SAVED_KEYFILE"; fi
+# a key sitting in the default location needs no asking about
+if [ -z "$KEYFILE" ] && [ -f "$KEY_DEFAULT" ]; then KEYFILE="$KEY_DEFAULT"; fi
+if [ -z "$KEYFILE" ] && [ -f "$OLD_CONF_DIR/service-account.json" ]; then
+  KEYFILE="$OLD_CONF_DIR/service-account.json"
+  note "using the key from $OLD_CONF_DIR"
+  note "move it to $KEY_DEFAULT when convenient"
+fi
 if [ -z "$KEYFILE" ]; then
-  say "A service account JSON key is needed. Once, in the console:"
-  note "1. Google Cloud: enable the 'Google Play Android Developer API'"
-  note "2. create a service account there and download a JSON key"
-  note "3. Play Console → Users and permissions → Invite user → the service"
-  note "   account's email → grant release access to this app"
-  note "4. give it a few minutes to propagate"
-  ask KEYFILE "Path to the service account JSON key" "$CONF_DIR/service-account.json"
+  say "A service account JSON key is needed. Four one-time steps:"
+  echo
+  say "1. enable the Google Play Android Developer API for a Cloud project"
+  note "     https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com"
+  say "2. create a service account, then Keys → Add key → Create new key → JSON"
+  note "     https://console.cloud.google.com/iam-admin/serviceaccounts"
+  say "3. Play Console → Users and permissions → Invite new users: paste the"
+  say "   service account's email and grant it release access to this app"
+  note "     https://play.google.com/console/users-and-permissions"
+  say "4. give the grant a few minutes to propagate"
+  echo
+  note "the account then shows up under https://play.google.com/console/api-access"
+  note "Google's own walkthrough: https://developers.google.com/android-publisher/getting_started"
+  echo
+  ask KEYFILE "Path to the service account JSON key" "$KEY_DEFAULT"
 fi
 KEYFILE="${KEYFILE/#\~/$HOME}"
 [ -f "$KEYFILE" ] || die "no such file: $KEYFILE"
@@ -7752,10 +7777,13 @@ needs_play() {
   fi
   # the service account key: $PLAY_SERVICE_ACCOUNT_JSON, the one the Play wizard
   # remembered, or its default location
-  local conf="${XDG_CONFIG_HOME:-$HOME/.config}/play-submit" k
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}" k
+  local conf="$cfg/storepublisher/playstore" old="$cfg/play-submit"
   for k in "${PLAY_SERVICE_ACCOUNT_JSON:-}" \
            "$(sed -n "s/^SAVED_KEYFILE=//p" "$conf/last.conf" 2>/dev/null | tr -d "'\"")" \
-           "$conf/service-account.json"; do
+           "$(sed -n "s/^SAVED_KEYFILE=//p" "$old/last.conf" 2>/dev/null | tr -d "'\"")" \
+           "$conf/service-account.json" \
+           "$old/service-account.json"; do
     [ -n "$k" ] && [ -f "$k" ] && { PLAY_KEY="$k"; break; }
   done
   if [ -n "$PLAY_KEY" ]; then need_ok "service account key: $PLAY_KEY"
