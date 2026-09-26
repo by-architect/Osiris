@@ -1,16 +1,20 @@
 # store-submit.sh
 
 One script for publishing an app: to F-Droid and Google Play for Android, and
-to nixpkgs for Nix and NixOS.
+to Linux distributions — NixOS (nixpkgs), Arch (AUR) and Flathub — from one
+set of answers.
 
 - `store-submit.sh` — asks which store(s), checks what each needs from the
   app and what this machine has, then runs that store's wizard
-- `store-submit.sh fdroid|play|nix [options]` — one store's wizard directly;
-  each takes `--help`
+- `store-submit.sh fdroid|play|linux [options]` — one store's wizard directly
+- `store-submit.sh nix|aur|flathub [options]` — one Linux distro's wizard directly
+  (each takes `--help`)
 
 Each wizard runs in a process of its own, so running one directly or from the
 picker behaves the same. Remembered answers stay in
-`~/.config/{store-submit,fdroid-submit,play-submit,nixpkgs-submit}/last.conf`.
+`~/.config/{store-submit,fdroid-submit,play-submit,nixpkgs-submit,aur-submit}/last.conf`;
+what the Linux packages say about the app is in `.store-submit.conf` in the
+app's own repository.
 
 ## The store picker: `store-submit.sh`
 
@@ -23,7 +27,8 @@ cd ~/path/to/your-app
 
 | flag | effect |
 | --- | --- |
-| `-s`, `--store LIST` | `fdroid`, `play`, `nix`, `aur`, comma-separated, or `all` |
+| `-s`, `--store LIST` | `fdroid`, `play`, `linux`, comma-separated, or `all` (`nix` or `aur` = `linux` with that distro) |
+| `-d`, `--distros LIST` | for `linux`: the distros (`nix`, `aur`, `flathub`), skipping the checkbox list |
 | `--repo PATH` | the app's checkout (default: the git repo you run it in) |
 | `-c`, `--check` | run the checks, start no wizard |
 | `-y`, `-n`, `--no-save` | passed on to the wizard(s); `--yes` needs `--store` |
@@ -32,7 +37,8 @@ cd ~/path/to/your-app
 - **the app:** project type (Android, Flutter, Rust, Go, Node, Python…),
   application ID and version, git remote and tags, license, fastlane metadata;
   then per store — e.g. a signed release build and service account key for
-  Play, proprietary dependencies for F-Droid, lock files for Nixpkgs
+  Play, proprietary dependencies for F-Droid, a Linux target and lock files
+  for the Linux distros, a name Arch doesn't ship already for the AUR
 - **this machine:** OS and package manager, and each tool the store's wizard
   runs, required (✗ stops the run) or optional (!), with an install command for
   your package manager
@@ -41,9 +47,13 @@ cd ~/path/to/your-app
   to reuse, `ssh` for pushing to a `git@gitlab.com:` fork, a git identity for
   the fdroiddata commit, and a warning when `$FDROIDDATA_UPSTREAM` is set
 
-The AUR only has the checks so far. Adding a store is a line in `STORES`, a
-`needs_<id>` and a `tools_<id>` function, a `wizard_<id>` function, and its id
-in the direct-run `case` just above the picker.
+Picking **Linux** opens a checkbox list of distributions (↑/↓, Space, `a` for
+all, Enter; numbers when there's no terminal). Debian/Ubuntu and Fedora are
+listed as coming later.
+
+Adding a store is a line in `STORES`, a `needs_<id>` and a `tools_<id>`
+function, a `wizard_<id>` function, and its id in the direct-run `case` just
+above the picker. Adding a Linux distro is the same with a line in `DISTROS`.
 
 ## F-Droid: `store-submit.sh fdroid`
 
@@ -301,6 +311,48 @@ and `python3`.
 - <https://developers.google.com/android-publisher/edits>
 - <https://developers.google.com/android-publisher/api-ref/rest>
 
+## Linux: `store-submit.sh linux`
+
+Publishes one app to several Linux distributions in one go:
+
+1. **distros** — a checkbox list (or `--distros nix,aur`)
+2. **your app** — the questions every distro needs are asked **once**: name,
+   build system, description (checked against the distros' rules), license
+   (GPL "only / or later" settled from your source notices), homepage, main
+   program, and you as maintainer. The release tag is created and pushed if
+   needed.
+3. **publish** — each distro's wizard runs in turn with those answers; a
+   failure in one doesn't stop the others, and the summary says what to re-run
+   and lists everything left for you to do (like opening Flathub's pull
+   request)
+
+With Flathub among the distros, its two questions — the app ID and whether
+the app uses the internet — are part of step 2 too.
+
+The answers go into `.store-submit.conf` in the app's repository — a plain
+`key = value` file, read (never executed), yours to edit and commit:
+
+```
+name = linkstow
+build-system = flutter
+description = Bookmark manager for Karakeep
+license = GPL-3.0-only
+homepage = https://github.com/by-architect/KarakeepMobile
+main-program = linkstow
+maintainer-name = neo
+maintainer-email = you@example.org
+distros = nix aur
+```
+
+With it in place, every run — `linux`, `nix` or `aur` — asks nothing about the
+app; only the version and tag come from each release. `--ask` goes through the
+questions again.
+
+```bash
+~/path/to/store-submit.sh linux                        # pick distros, answer once, publish
+~/path/to/store-submit.sh linux --distros nix,aur -n   # a dry run of both
+```
+
 ## nixpkgs: `store-submit.sh nix`
 
 Gets an app into [nixpkgs](https://github.com/NixOS/nixpkgs) — what Nix and
@@ -403,3 +455,141 @@ follows the automation policy.
 - <https://github.com/NixOS/nixpkgs/blob/master/pkgs/README.md>
 - <https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/README.md>
 - <https://github.com/NixOS/nixpkgs/blob/master/maintainers/README.md>
+
+## Arch (AUR): `store-submit.sh aur`
+
+Publishes an app to the [AUR](https://aur.archlinux.org), or ships a new
+version of one already there, following Arch's
+[AUR submission guidelines](https://wiki.archlinux.org/title/AUR_submission_guidelines)
+and [package guidelines](https://manual.archlinux.page/package-guidelines/).
+
+```bash
+~/path/to/store-submit.sh aur            # new package or update: it works out which
+~/path/to/store-submit.sh aur --dry-run  # everything up to the commit, nothing pushed
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing; an update goes straight through, a new package stops before publishing for you to review it |
+| `--ask` | ask every question again |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--key FILE` | the SSH key your AUR account has (default: `~/.ssh/aur`) |
+| `--no-test` | skip the test build in an Arch container |
+| `-n`, `--dry-run` | write, check and commit locally; push nothing |
+| `--no-save`, `--forget` | control `~/.config/aur-submit/last.conf` |
+
+### What it does
+
+- **the rules first:** refuses a name Arch already ships in its official
+  repositories; finds out whether the AUR package is new, yours (an update),
+  orphaned (adopt it first — linked) or someone else's (comment or ask to
+  co-maintain — linked)
+- **SSH:** checks the AUR accepts your key (`ssh aur@aur.archlinux.org
+  list-repos`); if not, offers to create a dedicated `~/.ssh/aur` key as Arch
+  recommends, shows the public key and where to paste it, and checks again. It
+  uses the key for AUR commands only — your `~/.ssh/config` is left alone
+- **PKGBUILD:** in Arch's current style for Rust (`cargo fetch --locked`,
+  `--frozen`), Go (PIE build flags), Python (`python -m build` /
+  `installer`), Node (`npm pack` + global install), Meson (`arch-meson`),
+  CMake, Make, and Flutter (Linux bundle in `/usr/lib/<name>`, a desktop entry
+  and icon). Maintainer line with an obfuscated email, SPDX `license=()`, the
+  license text installed where Arch needs it, dependencies checked against the
+  official repos and the AUR. The checksum comes from the real release tarball
+- **updates:** bumps `pkgver`, resets `pkgrel`, refreshes the checksum
+- **alongside it:** a 0BSD `LICENSE` for the PKGBUILD (as the AUR guidelines
+  encourage) and a `.gitignore` that keeps build leftovers out
+- **check:** `.SRCINFO` written (with `makepkg` when installed, else read from
+  the PKGBUILD the same way — it works on any distro); a clean test build in an
+  Arch container with podman or docker: AUR dependencies built first, the
+  package built, `namcap` run on the PKGBUILD and the package, the package
+  installed and its program run with `--version`. A failed build names the
+  problem (a dependency that doesn't exist, a checksum) and offers edit /
+  read the log / rebuild / skip / quit
+- **review:** the whole change is shown; the AUR asks for it to be verified
+  carefully, so a new package is never published unread
+- **publish:** committed as you (from the config), pushed to the AUR's
+  `master`, and the AUR's own API checked to show the new version
+
+### What you need
+
+- an [AUR account](https://aur.archlinux.org/register) — the wizard handles
+  the SSH key
+- `git`, `ssh`, `curl`; podman or docker for the test build (recommended)
+- the app on GitHub, GitLab, Codeberg or another public git host
+
+## Flathub: `store-submit.sh flathub`
+
+Prepares an app for [Flathub](https://flathub.org), or an update of one
+already there — everything **up to the pull request, which you open
+yourself**. Flathub's [Generative AI policy](https://docs.flathub.org/docs/for-app-authors/requirements#generative-ai-policy)
+says tools must not open or automate submission pull requests, so the wizard
+ends with your to-do list and a link that opens the pull request form with
+the branch and title filled in.
+
+```bash
+~/path/to/store-submit.sh flathub            # new app or update: it works out which
+~/path/to/store-submit.sh flathub --dry-run  # build and check; your fork isn't touched
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing (the metadata step still needs you once) |
+| `--ask` | ask every question again |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--app-id ID` | the Flathub app ID (else from the config, or worked out) |
+| `-n`, `--dry-run` | build and check; don't touch your fork |
+
+### What it does
+
+1. **app ID** — worked out from where the app lives (`io.github.<owner>.<repo>`
+   for GitHub) and checked against every rule in Flathub's requirements,
+   including that the repository it points at exists. Asked once — it's
+   permanent on Flathub — and kept in `.store-submit.conf`
+2. **tools** — adds the Flathub remote and installs `org.flatpak.Builder`
+   (Flathub's own builder and linter) for your user if needed; the Python
+   helpers come from nixpkgs (or a private virtualenv) — nothing system-wide
+3. **metadata** — Flathub wants a metainfo file, a desktop file and an icon
+   (SVG or ≥256×256 PNG) *in your app's repository*. Missing ones are written
+   into it (name, the description in your words, screenshots, age rating,
+   releases from your tags), validated with Flathub's linter, and the wizard
+   stops: you check them, commit, release, and run it again
+4. **manifest** — yours if the repo has `<app-id>.yml` or `flatpak-flutter.yml`;
+   otherwise made with the community tools Flathub points to:
+   [flatpak-flutter](https://github.com/TheAppgineer/flatpak-flutter)'s own
+   template for Flutter apps (in subdirectories too), the documented recipes
+   for Rust (with `flatpak-cargo-generator`), Meson and CMake. Always the
+   latest runtime, the source pinned to your tag and commit, and
+   `x-checker-data` so Flathub's bot opens update pull requests for new tags
+5. **build + lint** — `flathub-build` (offline, sandboxed, like Flathub's
+   builders), then `flatpak-builder-lint` on the manifest and the build, each
+   error linked to its explanation; the app is started for you to try
+6. **hand-off** — your fork (made if missing), a branch with exactly the
+   files the pull request needs, pushed; then the to-do list:
+
+```
+   ┏━━ Your turn — Flathub wants a person to open this pull request
+   ┃ 1. Open the pull request — the link below fills in the branch and the title
+   ┃ 2. In the pull request, fill in Flathub's checklist yourself
+   ┃ 3. Flathub's AI policy: say whether AI-generated material is in your app or
+   ┃    its packaging … — state it as it is; reviewers decide
+   ┃ 4. Answer the reviewers yourself; comment "bot, build" for a test build
+   ┃ 5. Turn on GitHub two-factor authentication — accept the maintainer invite
+   ┃    within a week
+   ┃ 6. Once it's live: verify the app on flathub.org's Developer Portal
+   ┃
+   ┃    https://github.com/flathub/flathub/compare/new-pr...you:flathub:<app-id>?expand=1&title=…
+   ┗━━
+```
+
+**Updates** go to the app's own repository (`flathub/<app-id>`): the source
+moves to the new tag, flatpak-flutter or the cargo generator runs again,
+it's built and linted, and the link opens the update pull request there. If
+Flathub's bot already opened one for that version, you're told.
+
+Any store that wants a person to open the pull request can end the same way:
+`handoff_add` and `handoff_show` in the shared Linux helpers.
+
+### What you need
+
+- Flatpak (NixOS: `services.flatpak.enable = true;`), `git`, `python3`, `gh`
+- a GitHub account with two-factor authentication (for the maintainer invite)

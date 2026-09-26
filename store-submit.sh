@@ -2076,90 +2076,13 @@ DONE
 }
 
 # ##########################################################################
-#   nixpkgs wizard — store-submit.sh nix [options]
-#   (body unindented on purpose: its here-documents start at column 0)
+#   shared by the Linux wizards — linux_common (helpers) and linux_app (the
+#   "Your app" stage); bodies unindented like the wizards'
 # ##########################################################################
-wizard_nix() {
-#
-# store-submit.sh nix — get an app into nixpkgs (the package set Nix and NixOS
-# install from), or ship a new version of one that is already there.
-#
-# Follows nixpkgs' own guides:
-#   https://github.com/NixOS/nixpkgs/blob/master/pkgs/README.md
-#   https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/README.md
-#   https://github.com/NixOS/nixpkgs/blob/master/CONTRIBUTING.md
-#
-# It detects the project and writes pkgs/by-name/<xx>/<name>/package.nix (a
-# package already in nixpkgs is bumped with nix-update instead), fills in every
-# hash by building, checks the result the way reviewers do, adds you to the
-# maintainer list the first time, and opens the pull request with gh.
-#
-# nixpkgs requires a person to review generated code and the use of automation
-# to be disclosed (CONTRIBUTING.md, "Automation/AI policy"): the wizard shows
-# you the whole change and asks you to review it, and says in the pull request
-# how the package was made.
-#
-# Nothing leaves your machine without asking first, unless you pass --yes.
-
-set -eu
-# NOTE: deliberately no `set -o pipefail` — `cmd | head` would SIGPIPE and abort.
-
-# ------------------------------------------------------------------ arguments
-DRYRUN=0
-SAVE=1
-ASSUME_YES=0   # --yes: take every detected answer, only stop on problems
-ASK_ALL=0      # --ask: ask every question, even the ones it can answer itself
-RUN_REVIEW=0   # --review: run nixpkgs-review without asking
-DRAFT=0        # --draft: open the pull request as a draft
-REPO_ARG=""
-NIXPKGS_ARG=""
-CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nixpkgs-submit"
-CONF="$CONF_DIR/last.conf"
-UPSTREAM_SLUG="NixOS/nixpkgs"
-# where nixpkgs is cloned from (overridable for testing)
-UPSTREAM_URL="${NIXPKGS_UPSTREAM:-https://github.com/$UPSTREAM_SLUG.git}"
-# named in the pull request, as nixpkgs' automation policy asks
-TOOL_URL="https://github.com/by-architect/StoreHelper"
-
-usage() {
-  cat <<'USAGE'
-store-submit.sh nix — get an app into nixpkgs, or update it there.
-
-  -h, --help          show this text
-  -y, --yes           use everything it detects and don't ask; stops only on
-                      problems. A new package is then opened as a draft pull
-                      request, since nixpkgs wants you to review it first.
-      --ask           ask every question, including the ones it can answer
-      --repo PATH     the app's git checkout (default: the repo you run it in)
-      --nixpkgs PATH  your nixpkgs checkout (default: asked, ~/nixpkgs)
-      --review        also run nixpkgs-review (slow: evaluates nixpkgs twice)
-      --draft         open the pull request as a draft
-  -n, --dry-run       build, check and commit locally; push nothing
-      --no-save       do not remember the answers for next time
-      --forget        delete the remembered answers and exit
-
-Detects what it can from your app's checkout, writes (or updates) its
-package in your nixpkgs checkout, builds it, checks it, and opens the pull
-request against NixOS/nixpkgs.
-USAGE
-}
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -h|--help)    usage; exit 0 ;;
-    -n|--dry-run) DRYRUN=1 ;;
-    -y|--yes)     ASSUME_YES=1 ;;
-    --ask)        ASK_ALL=1 ;;
-    --repo)       REPO_ARG="${2-}"; shift ;;
-    --nixpkgs)    NIXPKGS_ARG="${2-}"; shift ;;
-    --review)     RUN_REVIEW=1 ;;
-    --draft)      DRAFT=1 ;;
-    --no-save)    SAVE=0 ;;
-    --forget)     rm -f "$CONF"; printf 'forgot %s\n' "$CONF"; exit 0 ;;
-    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
-  esac
-  shift
-done
+linux_common() {
+# Shared by the Linux wizards (linux, nix, aur): presentation, questions, the
+# scratch directory and small helpers. Call it once, after the wizard has
+# parsed its options; $WIZ_NAME names the scratch directory.
 
 # ---------------------------------------------------------------- presentation
 if [ -t 1 ]; then
@@ -2244,7 +2167,7 @@ auto() {
 }
 
 # ---------------------------------------------------------------- scratch space
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/nixpkgs-submit.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/$WIZ_NAME.XXXXXX")"
 KEEP_WORK=0
 BG_PID=""
 cleanup() {
@@ -2286,51 +2209,8 @@ run_logged() {
   return "$rc"
 }
 
-# ------------------------------------------------------- remembered answers
-# Written by this script only, as `SAVED_X=<shell-quoted>` lines.
-SAVED_REPO=""; SAVED_NIXPKGS=""; SAVED_HANDLE_NAME=""; SAVED_HANDLE_EMAIL=""
-if [ -f "$CONF" ]; then
-  # shellcheck disable=SC1090
-  . "$CONF" || warn "could not read $CONF"
-fi
-save_answers() {
-  [ "$SAVE" = 1 ] || return 0
-  mkdir -p "$CONF_DIR"
-  {
-    printf '# written by store-submit.sh nix — safe to delete (or run --forget)\n'
-    printf 'SAVED_REPO=%q\n'         "${REPO:-${SAVED_REPO:-}}"
-    printf 'SAVED_NIXPKGS=%q\n'      "${NIXPKGS:-${SAVED_NIXPKGS:-}}"
-    printf 'SAVED_HANDLE_NAME=%q\n'  "${M_NAME:-${SAVED_HANDLE_NAME:-}}"
-    printf 'SAVED_HANDLE_EMAIL=%q\n' "${M_EMAIL:-${SAVED_HANDLE_EMAIL:-}}"
-  } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
-  chmod 600 "$CONF" 2>/dev/null || true
-}
-
-# ------------------------------------------------------------------- helpers
 # nix_str <text> — escaped for use inside a "…" Nix string
 nix_str() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\${/\\${/g'; }
-
-# fake_hash <letter> — a well-formed placeholder hash. Every field gets its own
-# letter, so a "hash mismatch" names exactly the field it belongs to.
-fake_hash() { printf 'sha256-%sAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' "$1"; }
-
-# fake_hashes <all|git> — in an existing package.nix, swap the source and
-# dependency hashes (or only Flutter's gitHashes) for distinct placeholders;
-# the build loop then fills in the real ones. Patches' hashes are left alone.
-fake_hashes() {
-  local f="$WT/$FILE"
-  awk -v what="$1" -v L="LMNOPQRSTUVWXYZ" -v A="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" '
-    function fake() { n++; return "\"sha256-" substr(L, n, 1) A "=\"" }
-    /^  src = /            { insrc = 1 }
-    /^  gitHashes = \{/    { ingit = 1 }
-    ingit && /= "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
-    /^  gitHashes\.[^ ]+ = "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
-    what == "all" && insrc && /^    hash = "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
-    what == "all" && /^  (cargoHash|vendorHash|npmDepsHash) = "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
-    insrc && /^  };/ { insrc = 0 }
-    ingit && /^  };/ { ingit = 0 }
-    { print }' "$f" > "$f.new" && mv "$f.new" "$f"
-}
 
 NIX_FLAKES=0
 # tool <nixpkgs attr> <command> [args...] — run a command, fetched from nixpkgs
@@ -2352,67 +2232,60 @@ nix_tool_paths() {  # nix_tool_paths <attr> — its store paths, built/fetched i
   elif nix-instantiate --find-file nixpkgs >/dev/null 2>&1; then nix-build '<nixpkgs>' -A "$1" --no-out-link 2>/dev/null
   else nix-build "${NIXPKGS:?}" -A "$1" --no-out-link 2>/dev/null; fi
 }
-in_wt() { ( cd "$WT" && "$@" ); }
-
-# nixpkgs as CI sees it: without your ~/.config/nixpkgs config and overlays
-PKGS='(import ./. { config = { }; overlays = [ ]; })'
-NIXARGS=(--arg config '{ }' --arg overlays '[ ]')
-
-# neval <expr> — evaluate in the nixpkgs worktree, JSON out ("" on failure,
-# with the error in $WORK/eval.err)
-neval() { ( cd "$WT" && nix-instantiate --eval --strict --json -E "$1" 2>"$WORK/eval.err" ) || true; }
-neval_str() { neval "$1" | sed -e 's/^"//' -e 's/"$//'; }
 
 gh_ready() { gh auth status --hostname github.com >/dev/null 2>&1; }
 
-# =============================================================== 0. orientation
-cat <<BANNER
-
-  ${B}nixpkgs submission wizard${R}
-
-  Seven stages:
-    1. your app          — what nixpkgs needs to know, and the release tag
-    2. GitHub + nixpkgs  — your fork, a checkout, new package or update
-    3. maintainer        — you in maintainer-list.nix (first time only)
-    4. package           — package.nix written (or bumped with nix-update)
-    5. build + check     — hashes filled in by building, then reviewers' checks
-    6. review + commit   — you read the change; commits in nixpkgs' format
-    7. pull request      — branch pushed to your fork, PR opened
-
-BANNER
-[ "$DRYRUN" = 1 ] && warn "dry run: everything up to the commits; nothing is pushed"
-[ "$ASSUME_YES" = 1 ] && note "--yes: using everything detected; stopping only on problems"
-
-for t in git nix-build nix-instantiate nix-shell; do
-  have "$t" || die "$t is missing — this needs Nix: https://nixos.org/download"
-done
-have gh || die "gh (GitHub CLI) is missing — it makes the fork and the pull request. Install it, e.g.: nix profile install nixpkgs#gh"
-
-# Nix itself must work before anything else: a stopped daemon shows up here
-# rather than as a confusing build failure later.
-if ! SYSTEM="$(nix-instantiate --eval --json -E 'builtins.currentSystem' 2>"$WORK/nix.err")"; then
-  sed 's/^/     /' "$WORK/nix.err" | tail -5
-  die "Nix can't evaluate anything — is the nix-daemon running? (systemctl status nix-daemon)"
-fi
-SYSTEM="$(printf '%s' "$SYSTEM" | tr -d '"')"
-ok "Nix $(nix --version 2>/dev/null | sed 's/.* //') on $SYSTEM"
 { nix config show experimental-features 2>/dev/null || nix show-config 2>/dev/null; } \
   | grep -qw flakes && NIX_FLAKES=1
 
-if ! gh_ready; then
-  warn "gh is not logged in to GitHub"
-  [ "$ASSUME_YES" = 1 ] && die "run 'gh auth login' first"
-  if confirm "Log in now (gh auth login)?" y; then gh auth login --hostname github.com || true; fi
-  gh_ready || die "still not logged in — run 'gh auth login', then re-run"
-fi
-GH_USER="$(gh api user --jq .login 2>/dev/null || true)"
-[ -n "$GH_USER" ] || die "could not ask GitHub who you are (gh api user) — check your connection"
-GH_ID="$(gh api user --jq .id)"
-GH_NAME="$(gh api user --jq '.name // ""' 2>/dev/null || true)"
-ok "GitHub: $GH_USER (id $GH_ID)"
+# --- the hand-off: what a person has to finish (stores that don't take
+# automated submissions). Shown as a boxed to-do list, kept in the cache, and
+# passed up to `store-submit.sh linux` for its summary.
+handoff_add() { printf '%s\n' "$*" >> "$WORK/handoff.txt"; }
+handoff_show() {  # handoff_show "title" [link]
+  local title="$1" link="${2-}" n=0 l out
+  out="${XDG_CACHE_HOME:-$HOME/.cache}/store-submit/todo-$WIZ_NAME.txt"
+  mkdir -p "$(dirname "$out")"
+  { printf '%s\n' "$title"
+    [ -f "$WORK/handoff.txt" ] && awk '{ printf "  %d. %s\n", NR, $0 }' "$WORK/handoff.txt"
+    [ -n "$link" ] && printf '\n  %s\n' "$link"; } > "$out"
+  printf '\n   %s┏━━ %s%s\n' "$B$YLW" "$title" "$R"
+  if [ -f "$WORK/handoff.txt" ]; then
+    while IFS= read -r l; do n=$((n + 1)); printf '   %s┃%s %d. %s\n' "$YLW" "$R" "$n" "$l"; done < "$WORK/handoff.txt"
+  fi
+  [ -n "$link" ] && printf '   %s┃%s\n   %s┃%s    %s%s%s\n' "$YLW" "$R" "$YLW" "$R" "$B" "$link" "$R"
+  printf '   %s┗━━%s %s(also in %s)%s\n\n' "$YLW" "$R" "$DIM" "$out" "$R"
+  if [ -n "${SS_HANDOFF_DIR:-}" ]; then mkdir -p "$SS_HANDOFF_DIR"; cp "$out" "$SS_HANDOFF_DIR/$WIZ_NAME.txt"; fi
+}
 
-# ============================================================== 1. the app
-step "1/7  Your app"
+# --- the shared config: one set of answers about the app, used by every
+# distro. A plain `key = value` file in the app's repository (read, never
+# executed), so it can be edited by hand and committed with the app.
+cfg_get() {  # cfg_get <key> — its value, or nothing
+  [ -n "${LINUX_CONF:-}" ] && [ -f "$LINUX_CONF" ] || return 0
+  sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p" "$LINUX_CONF" | tail -1
+}
+cfg_set() {  # cfg_set <key> <value> — update or add a line; blank values are left out
+  local f="$LINUX_CONF" k="$1" v="$2"
+  [ -f "$f" ] || {
+    printf '# store-submit.sh — what the Linux packages say about this app.\n'
+    printf '# One set of answers for every distro; edit freely, commit it with the app.\n'
+    printf '# The version and release tag come from each release, not from here.\n\n'
+  } > "$f"
+  if grep -qE "^[[:space:]]*${k}[[:space:]]*=" "$f"; then
+    awk -v k="$k" -v v="$v" '$0 ~ "^[[:space:]]*" k "[[:space:]]*=" { if (v != "") print k " = " v; next } { print }' "$f" > "$f.new" && mv "$f.new" "$f"
+  elif [ -n "$v" ]; then
+    printf '%s = %s\n' "$k" "$v" >> "$f"
+  fi
+}
+}
+
+linux_app() {
+# "Your app" — the stage every Linux wizard starts with: works out the app,
+# asks what it can't, makes sure the release tag is pushed, and keeps the
+# answers in the shared config. $1 is the step label. Sets the globals the
+# wizards build on (REPO, KIND, VERSION, PNAME, TAG, SPDX, DESC, …).
+step "$1"
 
 # The app repo: --repo, else the git repo you run this from (unless that's
 # this script's own), else the one from last time.
@@ -2433,10 +2306,14 @@ while :; do
 done
 REPO="$(cd "$REPO" && git rev-parse --show-toplevel)"
 
-# --- where does it live? nixpkgs fetches the source from there.
+# --- the shared config: answers from last time (or from another distro's run)
+LINUX_CONF="${LINUX_CONF:-$REPO/.store-submit.conf}"
+[ -f "$LINUX_CONF" ] && ok "config: ${LINUX_CONF#"$REPO"/} — its answers are used as they are"
+
+# --- where does it live? The distros fetch the source from there.
 # The URL as configured: `remote get-url` would apply url.*.insteadOf rewrites.
 ORIGIN="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
-[ -n "$ORIGIN" ] || die "no 'origin' remote — nixpkgs builds from a public repository: push yours and add it as origin"
+[ -n "$ORIGIN" ] || die "no 'origin' remote — Linux distributions build from a public repository: push yours and add it as origin"
 HOST="$(printf '%s' "$ORIGIN" | sed -E 's#^[a-z+]+://##; s#^[^@/]+@##; s#[:/].*##')"
 SLUG="$(printf '%s' "$ORIGIN" | sed -E 's#^[a-z+]+://##; s#^[^@/]+@##; s#^[^:/]+(:[0-9]+)?[:/]##; s#\.git$##; s#/$##')"
 OWNER="${SLUG%/*}"; REPONAME="${SLUG##*/}"
@@ -2453,7 +2330,8 @@ ok "source: $WEB"
 FORGE_PRIVATE=""; FORGE_DESC=""; FORGE_HOME=""; FORGE_SPDX=""
 forge_json() {
   case "$FORGE" in
-    github)   gh api "repos/$SLUG" 2>/dev/null ;;
+    github)   if have gh && gh_ready; then gh api "repos/$SLUG" 2>/dev/null
+              else curl -sf --max-time 20 "https://api.github.com/repos/$SLUG"; fi ;;
     gitlab)   curl -sf --max-time 20 "https://gitlab.com/api/v4/projects/$(printf '%s' "$SLUG" | sed 's#/#%2F#g')?license=true" ;;
     codeberg) curl -sf --max-time 20 "https://codeberg.org/api/v1/repos/$SLUG" ;;
     *)        return 1 ;;
@@ -2464,11 +2342,11 @@ if forge_json > "$WORK/forge.json" 2>/dev/null && [ -s "$WORK/forge.json" ]; the
   FORGE_DESC="$(tool jq jq -r '.description // ""' < "$WORK/forge.json" 2>/dev/null || true)"
   FORGE_HOME="$(tool jq jq -r '(.homepage // .website // "")' < "$WORK/forge.json" 2>/dev/null || true)"
   FORGE_SPDX="$(tool jq jq -r '(.license.spdx_id // .license.key // "")' < "$WORK/forge.json" 2>/dev/null || true)"
-  [ "$FORGE_PRIVATE" = true ] && die "$WEB is private — nixpkgs can only build public sources; make it public first"
+  [ "$FORGE_PRIVATE" = true ] && die "$WEB is private — distros can only build public sources; make it public first"
   ok "the repository is public"
 elif [ "$FORGE" != git ]; then
   if [ "$FORGE" = gitlab ] || [ "$FORGE" = codeberg ]; then
-    die "$WEB can't be reached anonymously — nixpkgs can only build public sources (is it private?)"
+    die "$WEB can't be reached anonymously — distros can only build public sources (is it private?)"
   fi
   warn "could not read $WEB from GitHub's API; carrying on with what the checkout says"
 fi
@@ -2492,6 +2370,7 @@ elif [ -f "$REPO/meson.build" ];        then KIND_GUESS=meson
 elif [ -f "$REPO/CMakeLists.txt" ];     then KIND_GUESS=cmake
 elif [ -f "$REPO/Makefile" ];           then KIND_GUESS="make"
 fi
+[ -n "$(cfg_get build-system)" ] && KIND_GUESS="$(cfg_get build-system)"
 [ -n "$KIND_GUESS" ] || note "could not tell the build system — one of: flutter rust go node python meson cmake make"
 FIRST=1
 while :; do
@@ -2564,25 +2443,26 @@ while :; do
   if [ "$FIRST" = 1 ]; then auto VERSION "Version" "$VERSION_GUESS"; else ask VERSION "Version" ""; fi
   FIRST=0
   case "$VERSION" in [0-9]*) break ;; esac
-  [ "$ASSUME_YES" = 1 ] && die "version '$VERSION' must start with a digit (nixpkgs' rule)"
-  warn "a nixpkgs version must start with a digit, e.g. 1.2.3"
+  [ "$ASSUME_YES" = 1 ] && die "version '$VERSION' must start with a digit (the distros' rule)"
+  warn "a package version must start with a digit, e.g. 1.2.3"
 done
 
-# --- the name: lowercase, as nixpkgs requires; the attribute is the same
+# --- the name: lowercase, as the distros require; nixpkgs' attribute is the same
 # (with a leading _ if it starts with a digit)
-PNAME_GUESS="$(name_at . | tr 'A-Z' 'a-z' | tr ' ' '-')"
+PNAME_GUESS="$(cfg_get name)"
+[ -n "$PNAME_GUESS" ] || PNAME_GUESS="$(name_at . | tr 'A-Z' 'a-z' | tr ' ' '-')"
 FIRST=1
 while :; do
   if [ "$FIRST" = 1 ]; then auto PNAME "Package name" "$PNAME_GUESS"; else ask PNAME "Package name" "$PNAME_GUESS"; fi
   FIRST=0
   printf '%s' "$PNAME" | grep -qE '^[a-z0-9][a-z0-9_-]*$' && break
   [ "$ASSUME_YES" = 1 ] && die "'$PNAME' is not a valid package name (lowercase letters, digits, - and _)"
-  warn "lowercase letters, digits, - and _ only (nixpkgs forbids uppercase; . and + can't be attribute names)"
+  warn "lowercase letters, digits, - and _ only (distros forbid uppercase; . and + can't be nixpkgs attribute names)"
   PNAME_GUESS="$(printf '%s' "$PNAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_\n-' '-')"
 done
 ATTR="$PNAME"; case "$ATTR" in [0-9]*) ATTR="_$ATTR" ;; esac
 
-# --- the release tag: nixpkgs fetches it, so it must exist, be pushed, and
+# --- the release tag: the packages fetch it, so it must exist, be pushed, and
 # hold exactly this version. The wizard sorts that out itself.
 tag_on_remote() { git -C "$REPO" ls-remote --tags --exit-code origin "refs/tags/$1" >/dev/null 2>&1; }
 ref_matches() {  # ref_matches <ref> — true if that ref declares $VERSION (or declares none)
@@ -2610,20 +2490,20 @@ if ! git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
     warn "you have uncommitted changes; the tag only covers what is committed"
   if [ "$DRYRUN" = 1 ]; then
     warn "dry run — would tag HEAD ($HEAD_SHORT) as $TAG and push it; reading HEAD for now"
-    note "without the tag online nixpkgs can't fetch the source: the dry run stops after writing package.nix"
+    note "without the tag online the source can't be fetched: the dry run stops before building"
     TAG_REF=HEAD; DRY_NO_TAG=1
   elif go "Tag HEAD ($HEAD_SHORT) as $TAG and push it to origin?"; then
     git -C "$REPO" tag "$TAG" HEAD
     git -C "$REPO" push -q origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "tagged and pushed $TAG"
   else
-    die "nixpkgs needs the release tag — create and push $TAG, then re-run"
+    die "the packages need the release tag — create and push $TAG, then re-run"
   fi
 elif ! ref_matches "$TAG"; then
   # The classic slip: a tag made before the version bump.
   die "tag $TAG says version $(version_at "$TAG"), not $VERSION — tag the release commit, or bump the version"
 elif ! tag_on_remote "$TAG"; then
-  warn "tag $TAG is not on origin yet — nixpkgs would not find it"
+  warn "tag $TAG is not on origin yet — the packages would not find it"
   if [ "$DRYRUN" = 1 ]; then
     warn "dry run — would push tag $TAG"
   elif go "Push tag $TAG to origin?"; then
@@ -2643,7 +2523,7 @@ case "$TAG" in
   *)           TAG_EXPR="\"$(nix_str "$TAG")\"";      TAG_INTERP="$(nix_str "$TAG")" ;;
 esac
 
-# Everything below is read from the tag: that is what nixpkgs will build.
+# Everything below is read from the tag: that is what the distros will build.
 git -C "$REPO" ls-tree -r --name-only "$TAG_REF" > "$WORK/tree.txt"
 in_tree() { grep -qxF "$1" "$WORK/tree.txt"; }
 in_tree_re() { grep -qE "$1" "$WORK/tree.txt"; }
@@ -2653,13 +2533,13 @@ BLOCKERS=0
 blocker() { bad "$*"; BLOCKERS=$((BLOCKERS + 1)); }
 case "$KIND" in
   flutter)
-    in_tree "$(pp pubspec.lock)" || blocker "no $(pp pubspec.lock) in $TAG — commit it (nixpkgs pins every Dart package from it)"
+    in_tree "$(pp pubspec.lock)" || blocker "no $(pp pubspec.lock) in $TAG — commit it (the builds pin every Dart package from it)"
     if in_tree "$(pp linux/CMakeLists.txt)"; then ok "Flutter Linux desktop target: $(pp linux/)"
     else blocker "no Linux desktop target in $TAG — run 'flutter create --platforms=linux .' in $PROOT, commit, and release again"; fi ;;
-  rust)   in_tree Cargo.lock || blocker "no Cargo.lock in $TAG — commit it (nixpkgs builds with exactly those crates)" ;;
+  rust)   in_tree Cargo.lock || blocker "no Cargo.lock in $TAG — commit it (the builds use exactly those crates)" ;;
   node)   in_tree package-lock.json || blocker "no package-lock.json in $TAG — this wizard packages npm projects; commit the lock file" ;;
   go)     in_tree go.mod || blocker "no go.mod in $TAG" ;;
-  python) in_tree pyproject.toml || blocker "no pyproject.toml in $TAG — nixpkgs builds Python apps with pyproject = true" ;;
+  python) in_tree pyproject.toml || blocker "no pyproject.toml in $TAG — the Python builds need it" ;;
 esac
 [ "$BLOCKERS" -gt 0 ] && die "$BLOCKERS thing(s) above must be in the release first"
 
@@ -2681,7 +2561,8 @@ license_from_text() {
     *"This is free and unencumbered software"*)          printf 'Unlicense' ;;
   esac
 }
-SPDX_GUESS=""
+SPDX_GUESS="$(cfg_get license)"
+if [ -z "$SPDX_GUESS" ]; then
 case "$FORGE_SPDX" in ''|NOASSERTION|other) ;; *) SPDX_GUESS="$FORGE_SPDX" ;; esac
 if [ -z "$SPDX_GUESS" ]; then
   case "$KIND" in
@@ -2693,7 +2574,7 @@ if [ -z "$SPDX_GUESS" ]; then
 fi
 [ -n "$SPDX_GUESS" ] || SPDX_GUESS="$(license_from_text || true)"
 # GPL-family ids without -only/-or-later (GitHub reports them this way) are
-# ambiguous, and nixpkgs has a different license for each: settle it.
+# ambiguous, and the distros have a different license for each: settle it.
 case "$SPDX_GUESS" in
   GPL-2.0|GPL-3.0|LGPL-2.1|LGPL-3.0|AGPL-3.0)
     LATER=only
@@ -2705,7 +2586,8 @@ case "$SPDX_GUESS" in
       case "$LATER" in or-later|later|l*) SPDX_GUESS="$SPDX_GUESS-or-later" ;; *) SPDX_GUESS="$SPDX_GUESS-only" ;; esac
     fi ;;
 esac
-[ -n "$SPDX_GUESS" ] || warn "no license found — nixpkgs treats software without one as unfree; add a LICENSE file"
+fi
+[ -n "$SPDX_GUESS" ] || warn "no license found — distros treat software without one as unfree; add a LICENSE file"
 auto SPDX "License (SPDX)" "$SPDX_GUESS"
 
 # --- description, following pkgs/README.md's rules for meta.description
@@ -2725,7 +2607,8 @@ desc_problems() {  # desc_problems <description> — one line per rule it breaks
   printf '%s' "$d" | grep -qE '[.!?] [A-Z]' && echo "it should be a single sentence"
   [ "${#d}" -le 100 ] || echo "it is long (${#d} characters) — keep it to a short sentence"
 }
-DESC_RAW="$FORGE_DESC"
+DESC_RAW="$(cfg_get description)"
+[ -n "$DESC_RAW" ] || DESC_RAW="$FORGE_DESC"
 if [ -z "$DESC_RAW" ]; then
   case "$KIND" in
     flutter) DESC_RAW="$(at "$TAG_REF" "$(pp pubspec.yaml)" | sed -nE "s/^description:[[:space:]]*[\"']?([^\"']*)[\"']?[[:space:]]*$/\\1/p" | sed -n 1p)" ;;
@@ -2757,6 +2640,7 @@ done
 
 HOME_GUESS="$WEB"
 case "$FORGE_HOME" in https://*) HOME_GUESS="$FORGE_HOME" ;; esac
+[ -n "$(cfg_get homepage)" ] && HOME_GUESS="$(cfg_get homepage)"
 auto HOMEPAGE "Homepage" "$HOME_GUESS"
 
 # --- changelog: a CHANGELOG file at the tag, else the forge's release page
@@ -2790,6 +2674,231 @@ case "$KIND" in
   python)  MAIN_GUESS="$(at "$TAG_REF" pyproject.toml | awk '/^\[project\.scripts\]/{s=1;next} /^\[/{s=0} s && /=/{sub(/[[:space:]]*=.*/,""); gsub(/"/,""); print; exit}')" ;;
 esac
 [ -n "$MAIN_GUESS" ] || MAIN_GUESS="$PNAME"
+[ -n "$(cfg_get main-program)" ] && MAIN_GUESS="$(cfg_get main-program)"
+
+# --- you, as the maintainer: nixpkgs' maintainer list and the PKGBUILD's
+# "# Maintainer:" line are public, so these are asked (once — then the
+# config has them).
+MAINT_NAME="$(cfg_get maintainer-name)"; MAINT_EMAIL="$(cfg_get maintainer-email)"
+if [ -n "$MAINT_NAME" ] && [ -n "$MAINT_EMAIL" ] && [ "$ASK_ALL" = 0 ]; then
+  ok "maintainer: $MAINT_NAME <$MAINT_EMAIL>"
+else
+  G="${MAINT_NAME:-${SAVED_HANDLE_NAME:-${GH_NAME:-$(git -C "$REPO" config user.name 2>/dev/null || true)}}}"
+  note "your name and email go into the packages as their maintainer — both are public"
+  ask MAINT_NAME "Maintainer name" "$G"
+  G="${MAINT_EMAIL:-${SAVED_HANDLE_EMAIL:-$(git -C "$REPO" config user.email 2>/dev/null || true)}}"
+  [ -n "$G" ] && note "email from ${MAINT_EMAIL:+the config}${MAINT_EMAIL:-your git identity (git config user.email)} — Enter keeps it, - leaves it out"
+  ask_opt MAINT_EMAIL "Maintainer email" "$G"
+fi
+
+# --- keep the answers for every distro and every next release
+if [ "${SAVE:-1}" = 1 ]; then
+  BEFORE="$(cat "$LINUX_CONF" 2>/dev/null || true)"
+  cfg_set name "$PNAME"; cfg_set build-system "$KIND"; cfg_set description "$DESC"
+  cfg_set license "$SPDX"; cfg_set homepage "$HOMEPAGE"; cfg_set main-program "$MAIN_GUESS"
+  cfg_set maintainer-name "$MAINT_NAME"; cfg_set maintainer-email "$MAINT_EMAIL"
+  if [ "$BEFORE" != "$(cat "$LINUX_CONF")" ]; then
+    ok "answers saved to ${LINUX_CONF#"$REPO"/} — every distro uses them; edit it any time"
+    git -C "$REPO" ls-files --error-unmatch "$LINUX_CONF" >/dev/null 2>&1 \
+      || note "(commit it with the app to keep it, or add it to .gitignore)"
+  fi
+fi
+}
+
+# ##########################################################################
+#   nixpkgs wizard — store-submit.sh nix [options]
+#   (body unindented on purpose: its here-documents start at column 0)
+# ##########################################################################
+wizard_nix() {
+#
+# store-submit.sh nix — get an app into nixpkgs (the package set Nix and NixOS
+# install from), or ship a new version of one that is already there.
+#
+# Follows nixpkgs' own guides:
+#   https://github.com/NixOS/nixpkgs/blob/master/pkgs/README.md
+#   https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/README.md
+#   https://github.com/NixOS/nixpkgs/blob/master/CONTRIBUTING.md
+#
+# It detects the project and writes pkgs/by-name/<xx>/<name>/package.nix (a
+# package already in nixpkgs is bumped with nix-update instead), fills in every
+# hash by building, checks the result the way reviewers do, adds you to the
+# maintainer list the first time, and opens the pull request with gh.
+#
+# nixpkgs requires a person to review generated code and the use of automation
+# to be disclosed (CONTRIBUTING.md, "Automation/AI policy"): the wizard shows
+# you the whole change and asks you to review it, and says in the pull request
+# how the package was made.
+#
+# Nothing leaves your machine without asking first, unless you pass --yes.
+
+set -eu
+# NOTE: deliberately no `set -o pipefail` — `cmd | head` would SIGPIPE and abort.
+
+# ------------------------------------------------------------------ arguments
+DRYRUN=0
+SAVE=1
+ASSUME_YES=0   # --yes: take every detected answer, only stop on problems
+ASK_ALL=0      # --ask: ask every question, even the ones it can answer itself
+RUN_REVIEW=0   # --review: run nixpkgs-review without asking
+DRAFT=0        # --draft: open the pull request as a draft
+REPO_ARG=""
+NIXPKGS_ARG=""
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nixpkgs-submit"
+CONF="$CONF_DIR/last.conf"
+UPSTREAM_SLUG="NixOS/nixpkgs"
+# where nixpkgs is cloned from (overridable for testing)
+UPSTREAM_URL="${NIXPKGS_UPSTREAM:-https://github.com/$UPSTREAM_SLUG.git}"
+# named in the pull request, as nixpkgs' automation policy asks
+TOOL_URL="https://github.com/by-architect/StoreHelper"
+
+usage() {
+  cat <<'USAGE'
+store-submit.sh nix — get an app into nixpkgs, or update it there.
+
+  -h, --help          show this text
+  -y, --yes           use everything it detects and don't ask; stops only on
+                      problems. A new package is then opened as a draft pull
+                      request, since nixpkgs wants you to review it first.
+      --ask           ask every question, including the ones it can answer
+      --repo PATH     the app's git checkout (default: the repo you run it in)
+      --nixpkgs PATH  your nixpkgs checkout (default: asked, ~/nixpkgs)
+      --config FILE   the shared answers (default: .store-submit.conf in the repo)
+      --review        also run nixpkgs-review (slow: evaluates nixpkgs twice)
+      --draft         open the pull request as a draft
+  -n, --dry-run       build, check and commit locally; push nothing
+      --no-save       do not remember the answers for next time
+      --forget        delete the remembered answers and exit
+
+Detects what it can from your app's checkout, writes (or updates) its
+package in your nixpkgs checkout, builds it, checks it, and opens the pull
+request against NixOS/nixpkgs.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    -n|--dry-run) DRYRUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --ask)        ASK_ALL=1 ;;
+    --repo)       REPO_ARG="${2-}"; shift ;;
+    --nixpkgs)    NIXPKGS_ARG="${2-}"; shift ;;
+    --config)     LINUX_CONF="${2-}"; shift ;;
+    --review)     RUN_REVIEW=1 ;;
+    --draft)      DRAFT=1 ;;
+    --no-save)    SAVE=0 ;;
+    --forget)     rm -f "$CONF"; printf 'forgot %s\n' "$CONF"; exit 0 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+WIZ_NAME=nixpkgs-submit
+linux_common
+
+# ------------------------------------------------------- remembered answers
+# Written by this script only, as `SAVED_X=<shell-quoted>` lines.
+SAVED_REPO=""; SAVED_NIXPKGS=""; SAVED_HANDLE_NAME=""; SAVED_HANDLE_EMAIL=""
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF" || warn "could not read $CONF"
+fi
+save_answers() {
+  [ "$SAVE" = 1 ] || return 0
+  mkdir -p "$CONF_DIR"
+  {
+    printf '# written by store-submit.sh nix — safe to delete (or run --forget)\n'
+    printf 'SAVED_REPO=%q\n'         "${REPO:-${SAVED_REPO:-}}"
+    printf 'SAVED_NIXPKGS=%q\n'      "${NIXPKGS:-${SAVED_NIXPKGS:-}}"
+    printf 'SAVED_HANDLE_NAME=%q\n'  "${M_NAME:-${SAVED_HANDLE_NAME:-}}"
+    printf 'SAVED_HANDLE_EMAIL=%q\n' "${M_EMAIL:-${SAVED_HANDLE_EMAIL:-}}"
+  } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+  chmod 600 "$CONF" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------- helpers
+
+# fake_hash <letter> — a well-formed placeholder hash. Every field gets its own
+# letter, so a "hash mismatch" names exactly the field it belongs to.
+fake_hash() { printf 'sha256-%sAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=' "$1"; }
+
+# fake_hashes <all|git> — in an existing package.nix, swap the source and
+# dependency hashes (or only Flutter's gitHashes) for distinct placeholders;
+# the build loop then fills in the real ones. Patches' hashes are left alone.
+fake_hashes() {
+  local f="$WT/$FILE"
+  awk -v what="$1" -v L="LMNOPQRSTUVWXYZ" -v A="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" '
+    function fake() { n++; return "\"sha256-" substr(L, n, 1) A "=\"" }
+    /^  src = /            { insrc = 1 }
+    /^  gitHashes = \{/    { ingit = 1 }
+    ingit && /= "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
+    /^  gitHashes\.[^ ]+ = "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
+    what == "all" && insrc && /^    hash = "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
+    what == "all" && /^  (cargoHash|vendorHash|npmDepsHash) = "sha256-/ { sub(/"sha256-[^"]*"/, fake()) }
+    insrc && /^  };/ { insrc = 0 }
+    ingit && /^  };/ { ingit = 0 }
+    { print }' "$f" > "$f.new" && mv "$f.new" "$f"
+}
+
+in_wt() { ( cd "$WT" && "$@" ); }
+
+# nixpkgs as CI sees it: without your ~/.config/nixpkgs config and overlays
+PKGS='(import ./. { config = { }; overlays = [ ]; })'
+NIXARGS=(--arg config '{ }' --arg overlays '[ ]')
+
+# neval <expr> — evaluate in the nixpkgs worktree, JSON out ("" on failure,
+# with the error in $WORK/eval.err)
+neval() { ( cd "$WT" && nix-instantiate --eval --strict --json -E "$1" 2>"$WORK/eval.err" ) || true; }
+neval_str() { neval "$1" | sed -e 's/^"//' -e 's/"$//'; }
+
+
+# =============================================================== 0. orientation
+cat <<BANNER
+
+  ${B}nixpkgs submission wizard${R}
+
+  Seven stages:
+    1. your app          — what nixpkgs needs to know, and the release tag
+    2. GitHub + nixpkgs  — your fork, a checkout, new package or update
+    3. maintainer        — you in maintainer-list.nix (first time only)
+    4. package           — package.nix written (or bumped with nix-update)
+    5. build + check     — hashes filled in by building, then reviewers' checks
+    6. review + commit   — you read the change; commits in nixpkgs' format
+    7. pull request      — branch pushed to your fork, PR opened
+
+BANNER
+[ "$DRYRUN" = 1 ] && warn "dry run: everything up to the commits; nothing is pushed"
+[ "$ASSUME_YES" = 1 ] && note "--yes: using everything detected; stopping only on problems"
+
+for t in git nix-build nix-instantiate nix-shell; do
+  have "$t" || die "$t is missing — this needs Nix: https://nixos.org/download"
+done
+have gh || die "gh (GitHub CLI) is missing — it makes the fork and the pull request. Install it, e.g.: nix profile install nixpkgs#gh"
+
+# Nix itself must work before anything else: a stopped daemon shows up here
+# rather than as a confusing build failure later.
+if ! SYSTEM="$(nix-instantiate --eval --json -E 'builtins.currentSystem' 2>"$WORK/nix.err")"; then
+  sed 's/^/     /' "$WORK/nix.err" | tail -5
+  die "Nix can't evaluate anything — is the nix-daemon running? (systemctl status nix-daemon)"
+fi
+SYSTEM="$(printf '%s' "$SYSTEM" | tr -d '"')"
+ok "Nix $(nix --version 2>/dev/null | sed 's/.* //') on $SYSTEM"
+{ nix config show experimental-features 2>/dev/null || nix show-config 2>/dev/null; } \
+  | grep -qw flakes && NIX_FLAKES=1
+
+if ! gh_ready; then
+  warn "gh is not logged in to GitHub"
+  [ "$ASSUME_YES" = 1 ] && die "run 'gh auth login' first"
+  if confirm "Log in now (gh auth login)?" y; then gh auth login --hostname github.com || true; fi
+  gh_ready || die "still not logged in — run 'gh auth login', then re-run"
+fi
+GH_USER="$(gh api user --jq .login 2>/dev/null || true)"
+[ -n "$GH_USER" ] || die "could not ask GitHub who you are (gh api user) — check your connection"
+GH_ID="$(gh api user --jq .id)"
+GH_NAME="$(gh api user --jq '.name // ""' 2>/dev/null || true)"
+ok "GitHub: $GH_USER (id $GH_ID)"
+
+linux_app "1/7  Your app"
 
 # ======================================================= 2. GitHub + nixpkgs
 step "2/7  Your nixpkgs fork and checkout"
@@ -2993,10 +3102,8 @@ else
     ask HANDLE "Handle to use" "$HANDLE-gh"
   done
   ok "handle: $HANDLE (github $GH_USER, id $GH_ID)"
-  M_NAME_GUESS="${SAVED_HANDLE_NAME:-${GH_NAME:-$(git -C "$REPO" config user.name 2>/dev/null || true)}}"
-  ask M_NAME "Your name, as people know you" "$M_NAME_GUESS"
-  note "the email goes into the public maintainer list; blank leaves it out"
-  ask_opt M_EMAIL "Email" "${SAVED_HANDLE_EMAIL:-$(git -C "$REPO" config user.email 2>/dev/null || true)}"
+  M_NAME="$MAINT_NAME"; M_EMAIL="$MAINT_EMAIL"
+  ok "as: $M_NAME${M_EMAIL:+ <$M_EMAIL>} (the maintainer from stage 1)"
   ADD_MAINTAINER=1
 fi
 
@@ -3846,10 +3953,1772 @@ echo
 }
 
 # ##########################################################################
+#   Linux distributions — the list, and a checkbox picker for it
+# ##########################################################################
+# id|name|wizard (blank = not written yet)|what publishing there means
+DISTROS="nix|NixOS / Nix (nixpkgs)|wizard_nix|a package in nixpkgs, through a pull request
+aur|Arch Linux (AUR)|wizard_aur|a PKGBUILD in the Arch User Repository
+deb|Debian / Ubuntu||coming later
+fedora|Fedora (COPR)||coming later
+flathub|Flathub (every distro)|wizard_flathub|prepared up to the pull request; you open it"
+
+distro_field() {  # distro_field <id> <1=id 2=name 3=wizard 4=description>
+  printf '%s\n' "$DISTROS" | awk -F'|' -v id="$1" -v f="$2" '$1 == id { print $f }'
+}
+distro_items() {  # the list as multi_select lines: id|label|selectable|note
+  printf '%s\n' "$DISTROS" | awk -F'|' '{ print $1 "|" $2 "|" ($3 != "" ? 1 : 0) "|" $4 }'
+}
+
+# multi_select VAR "<id|label|selectable|note lines>" "<preselected ids>"
+# A checkbox list: ↑/↓ (or j/k) move, Space toggles, a toggles all, a digit
+# toggles that line, Enter confirms. Lines that aren't selectable are shown
+# dimmed and can't be picked. Without a terminal it reads numbers or ids
+# instead. VAR gets the chosen ids, space-separated.
+multi_select() {
+  local __var="$1" __pre=" ${3:-} " __ids=() __labels=() __on=() __notes=() __sel=()
+  local id label en note i n cur=0 key rest count all msg="" in tok ok_ids
+  while IFS='|' read -r id label en note; do
+    [ -n "$id" ] || continue
+    __ids+=("$id"); __labels+=("$label"); __on+=("$en"); __notes+=("$note")
+    case "$__pre" in *" $id "*) [ "$en" = 1 ] && __sel+=(1) || __sel+=(0) ;; *) __sel+=(0) ;; esac
+  done <<EOF
+$2
+EOF
+  n=${#__ids[@]}
+  if [ ! -t 0 ] || [ ! -t 1 ]; then
+    # no terminal to draw on: numbers (or ids), space or comma separated
+    for ((i = 0; i < n; i++)); do
+      if [ "${__on[$i]}" = 1 ]; then printf '   %s%d)%s %-28s %s%s%s\n' "$B" $((i + 1)) "$R" "${__labels[$i]}" "$DIM" "${__notes[$i]}" "$R"
+      else printf '   %s%d) %-28s %s%s\n' "$DIM" $((i + 1)) "${__labels[$i]}" "${__notes[$i]}" "$R"; fi
+    done
+    local def=""
+    for ((i = 0; i < n; i++)); do [ "${__sel[$i]}" = 1 ] && def="$def${def:+ }$((i + 1))"; done
+    while :; do
+      printf '   %sPick one or more%s%s: ' "$B" "$R" "${def:+ [$def]}" >&2
+      IFS= read -r in || { printf '\n' >&2; printf '\n%sERROR: end of input%s\n' "$RED" "$R" >&2; exit 1; }
+      [ -n "$in" ] || in="$def"
+      ok_ids=""; msg=""
+      for tok in $(printf '%s' "$in" | tr ',' ' '); do
+        i=-1
+        case "$tok" in
+          *[!0-9]*) for ((j = 0; j < n; j++)); do [ "${__ids[$j]}" = "$tok" ] && i=$j; done ;;
+          *)        i=$((tok - 1)) ;;
+        esac
+        if [ "$i" -lt 0 ] || [ "$i" -ge "$n" ]; then msg="no such choice: $tok"; break; fi
+        [ "${__on[$i]}" = 1 ] || { msg="${__labels[$i]} is not available yet"; break; }
+        case " $ok_ids " in *" ${__ids[$i]} "*) ;; *) ok_ids="$ok_ids${ok_ids:+ }${__ids[$i]}" ;; esac
+      done
+      [ -z "$msg" ] && [ -n "$ok_ids" ] && break
+      printf '   %s! %s%s\n' "$YLW" "${msg:-pick at least one}" "$R" >&2
+    done
+    printf -v "$__var" '%s' "$ok_ids"
+    return 0
+  fi
+  # the checkbox list
+  printf '\033[?25l'
+  local drawn=0
+  while :; do
+    [ "$drawn" = 1 ] && printf '\033[%dA' $((n + 2))
+    drawn=1
+    for ((i = 0; i < n; i++)); do
+      local mark="  " box="[ ]"
+      [ "$i" = "$cur" ] && mark="${CYN}›${R} "
+      [ "${__sel[$i]}" = 1 ] && box="${GRN}[x]${R}"
+      if [ "${__on[$i]}" = 1 ]; then
+        printf '\r\033[K   %s%s %-28s %s%s%s\n' "$mark" "$box" "${__labels[$i]}" "$DIM" "${__notes[$i]}" "$R"
+      else
+        printf '\r\033[K   %s%s[ ] %-28s %s%s\n' "$mark" "$DIM" "${__labels[$i]}" "${__notes[$i]}" "$R"
+      fi
+    done
+    printf '\r\033[K   %s↑/↓ move · Space select · a all · Enter confirm%s\n' "$DIM" "$R"
+    printf '\r\033[K   %s%s%s\n' "$YLW" "$msg" "$R"
+    msg=""
+    IFS= read -rsn1 key || key=q
+    case "$key" in
+      $'\e') rest=""; IFS= read -rsn2 -t 0.05 rest || true
+             case "$rest" in '[A') cur=$(( (cur + n - 1) % n )) ;; '[B') cur=$(( (cur + 1) % n )) ;; esac ;;
+      k) cur=$(( (cur + n - 1) % n )) ;;
+      j) cur=$(( (cur + 1) % n )) ;;
+      ' ') if [ "${__on[$cur]}" = 1 ]; then __sel[$cur]=$(( 1 - __sel[cur] )); else msg="${__labels[$cur]} is not available yet"; fi ;;
+      [1-9]) i=$((key - 1))
+             if [ "$i" -lt "$n" ] && [ "${__on[$i]}" = 1 ]; then __sel[$i]=$(( 1 - __sel[i] )); cur=$i
+             elif [ "$i" -lt "$n" ]; then msg="${__labels[$i]} is not available yet"; fi ;;
+      a|A) all=1
+           for ((i = 0; i < n; i++)); do [ "${__on[$i]}" = 1 ] && [ "${__sel[$i]}" = 0 ] && all=0; done
+           for ((i = 0; i < n; i++)); do [ "${__on[$i]}" = 1 ] && __sel[$i]=$(( 1 - all )); done ;;
+      '') count=0; for ((i = 0; i < n; i++)); do count=$((count + __sel[i])); done
+          [ "$count" -gt 0 ] && break
+          msg="pick at least one (Space selects)" ;;
+      q|Q) printf '\033[?25h'; printf '\n'; exit 1 ;;
+    esac
+  done
+  printf '\033[?25h'
+  ok_ids=""
+  for ((i = 0; i < n; i++)); do [ "${__sel[$i]}" = 1 ] && ok_ids="$ok_ids${ok_ids:+ }${__ids[$i]}"; done
+  printf -v "$__var" '%s' "$ok_ids"
+}
+
+# ##########################################################################
+#   Linux wizard — store-submit.sh linux [options]
+#   (body unindented on purpose: its here-documents start at column 0)
+# ##########################################################################
+wizard_linux() {
+#
+# store-submit.sh linux — publish one app to several Linux distributions:
+# pick the distros, answer the questions about the app once (they're kept in
+# .store-submit.conf in the app's repository), then each distro's wizard runs
+# with those answers, one after the other.
+
+set -eu
+
+DRYRUN=0
+SAVE=1
+ASSUME_YES=0
+ASK_ALL=0
+REPO_ARG=""
+DISTROS_ARG=""
+CONFIG_ARG=""
+ID_ARG=""
+
+usage() {
+  cat <<'USAGE'
+store-submit.sh linux — publish an app to several Linux distributions at once.
+
+  -h, --help           show this text
+  -d, --distros LIST   distros to publish to, skipping the question:
+                       nix, aur, flathub — comma-separated, or "all"
+      --repo PATH      the app's git checkout (default: the repo you run it in)
+      --config FILE    the shared answers (default: .store-submit.conf in the repo)
+  -y, --yes            passed to each distro's wizard
+      --ask            ask every question about the app again
+  -n, --dry-run        passed to each distro's wizard: nothing is published
+      --no-save        don't write the answers to the config
+
+The questions about the app are asked once; every distro uses the answers.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    -d|--distros) DISTROS_ARG="${2-}"; shift ;;
+    --repo)       REPO_ARG="${2-}"; shift ;;
+    --config)     CONFIG_ARG="${2-}"; shift ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --ask)        ASK_ALL=1 ;;
+    -n|--dry-run) DRYRUN=1 ;;
+    --no-save)    SAVE=0 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+WIZ_NAME=linux-submit
+linux_common
+SELF="$(readlink -f "$0")"
+
+cat <<BANNER
+
+  ${B}Linux distributions${R}
+
+  Three stages:
+    1. distros    — where the app goes (as many as you like)
+    2. your app   — asked once, kept in .store-submit.conf for every distro
+    3. publish    — each distro's own wizard, with those answers
+
+BANNER
+[ "$DRYRUN" = 1 ] && warn "dry run: nothing is published"
+
+# ------------------------------------------------------------- 1. distros
+step "1/3  Distros"
+# the config (if there is one yet) remembers the distros picked last time
+PRE_REPO="${REPO_ARG:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+PRE_CONF="${CONFIG_ARG:-$PRE_REPO/.store-submit.conf}"
+PRESET="$(LINUX_CONF="$PRE_CONF" cfg_get distros)"
+if [ -n "$DISTROS_ARG" ]; then
+  CHOSEN=""
+  for d in $(printf '%s' "$DISTROS_ARG" | tr ',' ' '); do
+    [ "$d" = all ] && { CHOSEN="$(printf '%s\n' "$DISTROS" | awk -F'|' '$3 != "" { printf "%s ", $1 }')"; break; }
+    [ -n "$(distro_field "$d" 1)" ] || die "no such distro: $d (one of: $(printf '%s\n' "$DISTROS" | cut -d'|' -f1 | tr '\n' ' '))"
+    [ -n "$(distro_field "$d" 3)" ] || die "$(distro_field "$d" 2) is not available yet"
+    CHOSEN="$CHOSEN $d"
+  done
+  CHOSEN="$(printf '%s' "$CHOSEN" | xargs)"
+else
+  [ "$ASSUME_YES" = 1 ] && [ -z "$PRESET" ] && die "--yes needs --distros (or a config that names them)"
+  if [ "$ASSUME_YES" = 1 ]; then CHOSEN="$PRESET"
+  else
+    say "Which distributions? One set of answers is used for all of them."
+    multi_select CHOSEN "$(distro_items)" "$PRESET"
+  fi
+fi
+for d in $CHOSEN; do ok "$(distro_field "$d" 2)"; done
+
+# ------------------------------------------------------------- 2. the app
+LINUX_CONF="${CONFIG_ARG:-}"
+[ -n "$LINUX_CONF" ] && case "$LINUX_CONF" in /*) ;; *) LINUX_CONF="$PWD/$LINUX_CONF" ;; esac
+linux_app "2/3  Your app — asked once, for every distro"
+case " $CHOSEN " in *" flathub "*) flathub_questions ;; esac
+[ "$SAVE" = 1 ] && cfg_set distros "$CHOSEN"
+
+# ------------------------------------------------------------- 3. publish
+step "3/3  Publish"
+FWD=(--repo "$REPO" --config "$LINUX_CONF")
+export SS_HANDOFF_DIR="$WORK/handoff"
+[ "$ASSUME_YES" = 1 ] && FWD+=(--yes)
+[ "$DRYRUN" = 1 ]     && FWD+=(--dry-run)
+[ "$SAVE" = 0 ]       && FWD+=(--no-save)
+RESULTS=""
+set -- $CHOSEN
+TOTAL=$#; n=0
+for d in "$@"; do
+  n=$((n + 1))
+  name="$(distro_field "$d" 2)"
+  printf '\n%s━━ %s (%d/%d): store-submit.sh %s %s%s\n' "$B$CYN" "$name" "$n" "$TOTAL" "$d" "${FWD[*]}" "$R"
+  # its own process, like every wizard: its traps and exits stay its own
+  rc=0
+  ( cd "$REPO" && bash "$SELF" "$d" "${FWD[@]}" ) || rc=$?
+  if [ "$rc" = 0 ]; then
+    RESULTS="$RESULTS$d|ok|"$'\n'
+  else
+    RESULTS="$RESULTS$d|fail|$rc"$'\n'
+    if [ "$n" -lt "$TOTAL" ]; then
+      warn "$name stopped (exit $rc)"
+      [ "$ASSUME_YES" = 1 ] || confirm "Carry on with the other distro(s)?" y || break
+    fi
+  fi
+done
+
+printf '\n   %sSummary%s\n' "$B" "$R"
+FAILED=0
+while IFS='|' read -r d res rc; do
+  [ -n "$d" ] || continue
+  if [ "$res" = ok ]; then ok "$(distro_field "$d" 2)"
+  else bad "$(distro_field "$d" 2) — stopped (exit $rc); run it again with: store-submit.sh $d"; FAILED=1; fi
+done <<EOF
+$RESULTS
+EOF
+for d in "$@"; do
+  printf '%s' "$RESULTS" | grep -q "^$d|" || { note "$(distro_field "$d" 2) — not started"; FAILED=1; }
+done
+if [ -d "$SS_HANDOFF_DIR" ]; then
+  printf '\n   %sStill to do by you%s\n' "$B$YLW" "$R"
+  for f in "$SS_HANDOFF_DIR"/*.txt; do
+    [ -f "$f" ] || continue
+    printf '   %s%s%s\n' "$B" "$(head -1 "$f")" "$R"
+    tail -n +2 "$f" | sed 's/^/   /'
+  done
+fi
+echo
+[ "$FAILED" = 0 ] || exit 1
+}
+
+# ##########################################################################
+#   AUR wizard — store-submit.sh aur [options]
+#   (body unindented on purpose: its here-documents start at column 0)
+# ##########################################################################
+wizard_aur() {
+#
+# store-submit.sh aur — publish an app to the AUR (Arch User Repository), or
+# ship a new version of one that is already there.
+#
+# Follows Arch's own guides:
+#   https://wiki.archlinux.org/title/AUR_submission_guidelines
+#   https://manual.archlinux.page/package-guidelines/  (Rust, Go, Python, …)
+#
+# Writes a PKGBUILD in Arch's current style (a package already on the AUR is
+# bumped instead), takes the checksum from the real release tarball, writes
+# .SRCINFO, test-builds it in a clean Arch container with namcap, and — after
+# you've read it — pushes it to the AUR over SSH.
+
+set -eu
+
+DRYRUN=0
+SAVE=1
+ASSUME_YES=0
+ASK_ALL=0
+NO_TEST=0
+REPO_ARG=""
+KEY_ARG=""
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/aur-submit"
+CONF="$CONF_DIR/last.conf"
+AUR_HOST="aur@aur.archlinux.org"
+# where AUR repositories are cloned from and pushed to (overridable for testing)
+AUR_GIT="${AUR_GIT_BASE:-ssh://aur@aur.archlinux.org}"
+AUR_WEB="https://aur.archlinux.org"
+ARCH_IMAGE="${ARCH_IMAGE:-docker.io/archlinux/archlinux:base-devel}"
+
+usage() {
+  cat <<'USAGE'
+store-submit.sh aur — publish an app to the AUR, or update it there.
+
+  -h, --help          show this text
+  -y, --yes           use everything it detects and don't ask; stops only on
+                      problems. A new package still needs you to review it.
+      --ask           ask every question, including the ones it can answer
+      --repo PATH     the app's git checkout (default: the repo you run it in)
+      --config FILE   the shared answers (default: .store-submit.conf in the repo)
+      --key FILE      the SSH key your AUR account has (default: ~/.ssh/aur)
+      --no-test       skip the test build in an Arch container
+  -n, --dry-run       write, check and commit locally; push nothing
+      --no-save       do not remember the answers for next time
+      --forget        delete the remembered answers and exit
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    -n|--dry-run) DRYRUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --ask)        ASK_ALL=1 ;;
+    --repo)       REPO_ARG="${2-}"; shift ;;
+    --config)     LINUX_CONF="${2-}"; shift ;;
+    --key)        KEY_ARG="${2-}"; shift ;;
+    --no-test)    NO_TEST=1 ;;
+    --no-save)    SAVE=0 ;;
+    --forget)     rm -f "$CONF"; printf 'forgot %s\n' "$CONF"; exit 0 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+WIZ_NAME=aur-submit
+linux_common
+
+# ------------------------------------------------------- remembered answers
+SAVED_REPO=""; SAVED_AUR_KEY=""
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF" || warn "could not read $CONF"
+fi
+save_answers() {
+  [ "$SAVE" = 1 ] || return 0
+  mkdir -p "$CONF_DIR"
+  {
+    printf '# written by store-submit.sh aur — safe to delete (or run --forget)\n'
+    printf 'SAVED_REPO=%q\n'    "${REPO:-${SAVED_REPO:-}}"
+    printf 'SAVED_AUR_KEY=%q\n' "${KEY:-${SAVED_AUR_KEY:-}}"
+  } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+  chmod 600 "$CONF" 2>/dev/null || true
+}
+
+# ------------------------------------------------------------------ helpers
+# arch_where <package> — "official", "aur" or "" (not packaged), cached per run
+arch_where() {
+  local c="$WORK/where.cache" r
+  r="$(sed -n "s/^$1 //p" "$c" 2>/dev/null | head -1)"
+  if [ -z "$r" ]; then
+    if curl -sf --max-time 20 "https://archlinux.org/packages/search/json/?name=$1" | grep -q '"pkgname"'; then r=official
+    elif curl -sf --max-time 20 "$AUR_WEB/rpc/v5/info?arg[]=$1" | grep -q '"resultcount":[1-9]'; then r=aur
+    else r=none; fi
+    printf '%s %s\n' "$1" "$r" >> "$c"
+  fi
+  [ "$r" = none ] || printf '%s' "$r"
+}
+# pc_arch <pkg-config module> — the Arch package that ships it
+pc_arch() {
+  case "$1" in
+    gtk4) echo gtk4 ;; gtk+-3.0) echo gtk3 ;; libadwaita-1) echo libadwaita ;;
+    glib-2.0|gio-2.0|gobject-2.0|gio-unix-2.0) echo glib2 ;; json-glib-1.0) echo json-glib ;;
+    libsoup-3.0) echo libsoup3 ;; webkitgtk-6.0) echo webkitgtk-6.0 ;; webkit2gtk-4.1) echo webkit2gtk-4.1 ;;
+    gtksourceview-5) echo gtksourceview5 ;; sqlite3) echo sqlite ;; openssl|libssl|libcrypto) echo openssl ;;
+    libcurl) echo curl ;; zlib) echo zlib ;; x11) echo libx11 ;; wayland-client|wayland-cursor) echo wayland ;;
+    xkbcommon) echo libxkbcommon ;; dbus-1) echo dbus ;; libpulse|libpulse-simple) echo libpulse ;;
+    alsa) echo alsa-lib ;; libxml-2.0) echo libxml2 ;; cairo) echo cairo ;; pango|pangocairo) echo pango ;;
+    gdk-pixbuf-2.0) echo gdk-pixbuf2 ;; fontconfig) echo fontconfig ;; freetype2) echo freetype2 ;;
+    libpng) echo libpng ;; libjpeg) echo libjpeg-turbo ;; sdl2) echo sdl2-compat ;; sdl3) echo sdl3 ;;
+    vulkan) echo vulkan-icd-loader ;; libsystemd|libudev) echo systemd-libs ;; libsecret-1) echo libsecret ;;
+    libnotify) echo libnotify ;; gstreamer-1.0) echo gstreamer ;; gstreamer-plugins-base-1.0) echo gst-plugins-base-libs ;;
+    epoxy) echo libepoxy ;; libarchive) echo libarchive ;; libzstd) echo zstd ;; liblzma) echo xz ;; libpcre2-8) echo pcre2 ;;
+    *) echo "$1" ;;
+  esac
+}
+# srcinfo <dir> — the .SRCINFO makepkg would write for <dir>/PKGBUILD. makepkg
+# itself is used when it's installed; otherwise the PKGBUILD is read the same
+# way makepkg does (sourced in a clean shell), so it works on any distro.
+srcinfo() {
+  if have makepkg; then ( cd "$1" && makepkg --printsrcinfo ); return; fi
+  ( cd "$1" && env -i PATH="$PATH" bash --norc --noprofile -c '
+    CARCH=x86_64
+    source ./PKGBUILD || exit 1
+    f() { local k="$1" v; shift; for v in "$@"; do [ -n "$v" ] && printf "\t%s = %s\n" "$k" "$v"; done; return 0; }
+    printf "pkgbase = %s\n" "${pkgbase:-$pkgname}"
+    f pkgdesc "${pkgdesc:-}"; f pkgver "$pkgver"; f pkgrel "$pkgrel"; f epoch "${epoch:-}"
+    f url "${url:-}"; f install "${install:-}"; f changelog "${changelog:-}"
+    f arch "${arch[@]}"; f groups "${groups[@]}"; f license "${license[@]}"
+    f checkdepends "${checkdepends[@]}"; f makedepends "${makedepends[@]}"; f depends "${depends[@]}"
+    f optdepends "${optdepends[@]}"; f provides "${provides[@]}"; f conflicts "${conflicts[@]}"
+    f replaces "${replaces[@]}"; f backup "${backup[@]}"; f options "${options[@]}"
+    f source "${source[@]}"; f validpgpkeys "${validpgpkeys[@]}"; f noextract "${noextract[@]}"
+    f md5sums "${md5sums[@]}"; f sha1sums "${sha1sums[@]}"; f sha224sums "${sha224sums[@]}"
+    f sha256sums "${sha256sums[@]}"; f sha384sums "${sha384sums[@]}"; f sha512sums "${sha512sums[@]}"
+    f b2sums "${b2sums[@]}"
+    printf "\npkgname = %s\n" "$pkgname"
+  ' )
+}
+# shq <text> — as a double-quoted shell string for the PKGBUILD
+shq() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/[\\"$`]/\\&/g')"; }
+
+# =============================================================== 0. orientation
+cat <<BANNER
+
+  ${B}AUR submission wizard${R}
+
+  Six stages:
+    1. your app     — shared with the other distros (.store-submit.conf)
+    2. the AUR      — your SSH key, the package name, new package or update
+    3. PKGBUILD     — written (or bumped); checksum from the real tarball
+    4. check        — .SRCINFO, and a clean test build in an Arch container
+    5. review       — you read the change
+    6. publish      — committed and pushed to the AUR
+
+BANNER
+[ "$DRYRUN" = 1 ] && warn "dry run: everything up to the commit; nothing is pushed"
+[ "$ASSUME_YES" = 1 ] && note "--yes: using everything detected; stopping only on problems"
+for t in git ssh curl sha256sum tar; do
+  have "$t" || die "$t is missing — install it and re-run"
+done
+
+# ============================================================== 1. the app
+linux_app "1/6  Your app"
+# Arch versions can't contain "-" (makepkg splits pkgver-pkgrel on it)
+PKGVER="$(printf '%s' "$VERSION" | tr -- '-' '_')"
+[ "$PKGVER" != "$VERSION" ] && note "Arch versions can't contain '-': pkgver is $PKGVER"
+case "$PKGVER" in *[:/[:space:]]*) die "version '$VERSION' has characters Arch doesn't allow in pkgver (: / space)" ;; esac
+
+# ================================================================= 2. AUR
+step "2/6  The AUR"
+PKG="$PNAME"
+
+# --- the rules: nothing that Arch already ships
+OFFICIAL="$(curl -sf --max-time 20 "https://archlinux.org/packages/search/json/?name=$PKG" || true)"
+if printf '%s' "$OFFICIAL" | grep -q '"pkgname"'; then
+  REPOS="$(printf '%s' "$OFFICIAL" | tool jq jq -r '[.results[].repo] | unique | join(", ")' 2>/dev/null || echo official)"
+  die "Arch already ships '$PKG' in its official repositories ($REPOS) — the AUR doesn't allow duplicates"
+fi
+[ -n "$OFFICIAL" ] && ok "'$PKG' isn't in Arch's official repositories"
+
+# --- your SSH key: the AUR only takes pushes over SSH
+KEY="${KEY_ARG:-${SAVED_AUR_KEY:-}}"
+[ -z "$KEY" ] && [ -f "$HOME/.ssh/aur" ] && KEY="$HOME/.ssh/aur"
+KEY="${KEY/#\~/$HOME}"
+aur_ssh() {
+  ssh ${KEY:+-i "$KEY" -o IdentitiesOnly=yes} -o BatchMode=yes -o ConnectTimeout=15 \
+      -o StrictHostKeyChecking=accept-new "$AUR_HOST" "$@"
+}
+export GIT_SSH_COMMAND="ssh ${KEY:+-i $(printf '%q' "$KEY") -o IdentitiesOnly=yes} -o StrictHostKeyChecking=accept-new"
+while ! aur_ssh list-repos > "$WORK/repos" 2> "$WORK/ssh.err"; do
+  sed 's/^/     /' "$WORK/ssh.err" | tail -3
+  if grep -qiE "permission denied|publickey" "$WORK/ssh.err"; then
+    warn "the AUR doesn't accept ${KEY:-your default SSH key} yet"
+    if [ -z "$KEY" ] || [ ! -f "$KEY" ]; then
+      say "Arch recommends a key just for the AUR. The wizard can make one: ~/.ssh/aur"
+      [ "$ASSUME_YES" = 1 ] && die "set up your AUR SSH key once without --yes"
+      if confirm "Create ~/.ssh/aur now? (ssh-keygen asks for an optional passphrase)" y; then
+        mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+        ssh-keygen -t ed25519 -f "$HOME/.ssh/aur" -C "aur $(id -un)@$(uname -n)" || die "ssh-keygen failed"
+        KEY="$HOME/.ssh/aur"
+        GIT_SSH_COMMAND="ssh -i $(printf '%q' "$KEY") -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        export GIT_SSH_COMMAND
+      fi
+    fi
+    if [ -n "$KEY" ] && [ -f "$KEY.pub" ]; then
+      say "Add this public key to your AUR account:"
+      printf '\n     %s\n\n' "$(cat "$KEY.pub")"
+    else
+      say "Add your SSH public key to your AUR account — the .pub file of the key ssh uses,"
+      say "e.g. $(ls "$HOME"/.ssh/id_*.pub 2>/dev/null | head -1 || true)${KEY:+ (or $KEY.pub)}"
+    fi
+    note "1. log in at $AUR_WEB/login (no account yet? $AUR_WEB/register)"
+    note "2. My Account → SSH Public Key → paste it → Update"
+    note "   (to use it outside this wizard too: 'Host aur.archlinux.org / IdentityFile ${KEY:-~/.ssh/aur} / User aur' in ~/.ssh/config)"
+  else
+    warn "couldn't reach the AUR over SSH — the network, or a firewall blocking port 22?"
+  fi
+  [ "$ASSUME_YES" = 1 ] && die "no SSH access to the AUR"
+  confirm "Check again?" y || die "the AUR needs SSH access to publish"
+done
+ok "the AUR accepts your SSH key${KEY:+ ($KEY)}"
+
+# --- new package, update, or someone else's?
+INFO="$(curl -sf --max-time 20 "$AUR_WEB/rpc/v5/info?arg[]=$PKG" || true)"
+[ -n "$INFO" ] || die "couldn't ask the AUR about '$PKG' ($AUR_WEB) — check your connection"
+MODE=new; OLD_PKGVER=""
+if printf '%s' "$INFO" | grep -q '"resultcount":[1-9]'; then
+  MAINTAINER="$(printf '%s' "$INFO" | tool jq jq -r '.results[0].Maintainer // ""')"
+  AUR_VERSION="$(printf '%s' "$INFO" | tool jq jq -r '.results[0].Version')"
+  if grep -qxF "$PKG" "$WORK/repos"; then
+    MODE=update; OLD_PKGVER="${AUR_VERSION%-*}"
+    ok "'$PKG' is yours on the AUR, at $AUR_VERSION — this is an update"
+  elif [ -z "$MAINTAINER" ]; then
+    die "'$PKG' is on the AUR but orphaned — adopt it on $AUR_WEB/packages/$PKG (\"Adopt Package\"), then re-run"
+  else
+    say "'$PKG' is on the AUR, maintained by $MAINTAINER: $AUR_WEB/packages/$PKG"
+    note "only its maintainers can push to it — comment there to suggest the update, or ask to co-maintain"
+    die "'$PKG' belongs to $MAINTAINER on the AUR"
+  fi
+else
+  ok "'$PKG' is new to the AUR"
+fi
+if [ "$MODE" = update ]; then
+  [ "$OLD_PKGVER" = "$PKGVER" ] && die "the AUR already has $PKG $PKGVER — nothing to do"
+  if [ "$(printf '%s\n%s\n' "$OLD_PKGVER" "$PKGVER" | sort -V | tail -1)" != "$PKGVER" ]; then
+    die "$PKGVER is older than the AUR's $OLD_PKGVER"
+  fi
+fi
+
+# --- the AUR repository, in a cache the wizard owns
+AURDIR="${XDG_CACHE_HOME:-$HOME/.cache}/store-submit/aur/$PKG"
+if [ -d "$AURDIR/.git" ]; then
+  git -C "$AURDIR" fetch -q origin 2>/dev/null || true
+  if git -C "$AURDIR" rev-parse -q --verify origin/master >/dev/null; then
+    git -C "$AURDIR" checkout -q -f -B master origin/master
+  fi
+  git -C "$AURDIR" clean -qfdx
+else
+  mkdir -p "$(dirname "$AURDIR")"
+  git -c init.defaultBranch=master clone -q "$AUR_GIT/$PKG.git" "$AURDIR" 2>"$WORK/clone.err" \
+    || { cat "$WORK/clone.err"; die "couldn't clone $AUR_GIT/$PKG.git"; }
+fi
+if [ "$MODE" = new ] && [ -f "$AURDIR/PKGBUILD" ]; then
+  note "the AUR has history for '$PKG' (a deleted package): building on top of it"
+fi
+[ "$MODE" = update ] && [ ! -f "$AURDIR/PKGBUILD" ] && die "the AUR repository for $PKG has no PKGBUILD"
+ok "AUR repository: $AURDIR"
+
+# ============================================================= 3. PKGBUILD
+step "3/6  PKGBUILD"
+
+# --- the source: the forge's tarball of the tag, and its real checksum
+case "$TAG" in
+  "v$VERSION") TAGX='v${pkgver}' ;;
+  "$VERSION")  TAGX='${pkgver}' ;;
+  *)           TAGX="$TAG" ;;
+esac
+[ "$PKGVER" != "$VERSION" ] && TAGX="$TAG"   # pkgver was rewritten: keep the literal tag
+tag_url() {  # tag_url <tag> — the tarball URL for that tag
+  case "$FORGE" in
+    github)   printf 'https://github.com/%s/archive/refs/tags/%s.tar.gz' "$SLUG" "$1" ;;
+    gitlab)   printf 'https://gitlab.com/%s/-/archive/%s/%s-%s.tar.gz' "$SLUG" "$1" "$REPONAME" "$1" ;;
+    codeberg) printf 'https://codeberg.org/%s/archive/%s.tar.gz' "$SLUG" "$1" ;;
+  esac
+}
+SRC_SUM=SKIP; SRCDIR_X=""
+if [ "$FORGE" = git ]; then
+  GITURL="$(printf '%s' "$ORIGIN" | sed -E 's#^[^@/]+@([^:]+):#https://\1/#')"
+  SOURCE="git+$GITURL#tag=$TAGX"
+  SRCDIR_X="$REPONAME"
+else
+  URL_REAL="$(tag_url "$TAG")"
+  SOURCE="\$pkgname-\$pkgver.tar.gz::$(tag_url "$TAGX")"
+  if [ "${DRY_NO_TAG:-0}" = 1 ]; then
+    warn "dry run and the tag isn't online: no checksum yet"; SRC_SUM=SKIP; SRCDIR_X="$REPONAME-\${pkgver}"
+  else
+    run_logged "$WORK/download.log" "downloading $URL_REAL" curl -fL --retry 3 -o "$WORK/src.tar.gz" "$URL_REAL" \
+      || { tail -n 3 "$WORK/download.log" | sed 's/^/     /'; die "couldn't download $URL_REAL — is tag $TAG pushed?"; }
+    SRC_SUM="$(sha256sum "$WORK/src.tar.gz" | cut -d' ' -f1)"
+    TOP="$(tar tzf "$WORK/src.tar.gz" | head -1 | cut -d/ -f1)"
+    [ -n "$TOP" ] || die "the tarball from $URL_REAL is empty or not a tarball"
+    # the directory it unpacks to, written in terms of the version
+    if [ "$PKGVER" = "$VERSION" ]; then
+      SRCDIR_X="$(printf '%s' "$TOP" | sed -e "s/$(printf '%s' "$VERSION" | sed 's/[.]/\\./g')/\${pkgver}/")"
+    else
+      SRCDIR_X="$TOP"   # pkgver was rewritten: the directory keeps the real version
+    fi
+    ok "source: $(basename "$URL_REAL") → $TOP/ (sha256 ${SRC_SUM:0:16}…)"
+  fi
+fi
+SUB=""; [ "$PROOT" != . ] && SUB="/$PROOT"
+CDLINE="  cd \"\$_srcdir$SUB\""
+
+if [ "$MODE" = update ]; then
+  # ------------------------------------------------------------- update
+  P="$AURDIR/PKGBUILD"
+  sed -i -E "s/^pkgver=.*/pkgver=$PKGVER/; s/^pkgrel=.*/pkgrel=1/" "$P"
+  NSRC="$( (cd "$AURDIR" && env -i PATH="$PATH" bash --norc -c 'source ./PKGBUILD >/dev/null 2>&1; echo ${#source[@]}') )"
+  if [ "$NSRC" = 1 ] && [ "$SRC_SUM" != SKIP ]; then
+    if grep -q '^sha256sums=' "$P"; then
+      sed -i -E "s/^sha256sums=\(.*\)$/sha256sums=('$SRC_SUM')/" "$P"
+    elif grep -q '^b2sums=' "$P"; then
+      sed -i -E "s/^b2sums=\(.*\)$/b2sums=('$(b2sum "$WORK/src.tar.gz" | cut -d' ' -f1)')/" "$P"
+    else
+      warn "no sha256sums/b2sums line to update — check the checksums yourself"
+    fi
+  elif [ "$NSRC" != 1 ]; then
+    warn "the PKGBUILD has $NSRC sources — their checksums are refreshed by the test build (updpkgsums)"
+    NEED_UPDPKGSUMS=1
+  fi
+  grep -q "^pkgver=$PKGVER$" "$P" || die "couldn't set pkgver in the PKGBUILD — update it by hand in $AURDIR"
+  ok "PKGBUILD bumped: $OLD_PKGVER → $PKGVER, pkgrel=1"
+else
+  # --------------------------------------------------------- new package
+  ARCHS="'x86_64' 'aarch64'"; DEPS=(); MAKEDEPS=(); BUILD=""; CHECK=""; PACKAGE=""; ENVS=""
+  case "$KIND" in
+    rust)
+      MAKEDEPS+=(cargo); DEPS+=(gcc-libs glibc)
+      for crate in $(at "$TAG_REF" Cargo.lock | sed -nE 's/^name = "([a-z0-9_-]+-sys)"$/\1/p' | sort -u); do
+        case "$crate" in
+          openssl-sys) DEPS+=(openssl) ;; alsa-sys) DEPS+=(alsa-lib) ;; libdbus-sys) DEPS+=(dbus) ;;
+          libudev-sys) DEPS+=(systemd-libs) ;; gtk4-sys) DEPS+=(gtk4) ;; gtk-sys) DEPS+=(gtk3) ;;
+          libadwaita-sys) DEPS+=(libadwaita) ;; webkit2gtk-sys) DEPS+=(webkit2gtk-4.1) ;;
+        esac
+      done
+      PREPARE='  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target host-tuple'
+      BUILD='  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features'
+      CHECK='  export RUSTUP_TOOLCHAIN=stable
+  cargo test --frozen --all-features'
+      PACKAGE='  find target/release -maxdepth 1 -executable -type f -exec install -Dm0755 -t "$pkgdir/usr/bin/" {} +' ;;
+    go)
+      MAKEDEPS+=(go); DEPS+=(glibc)
+      GOTARGET=.; grep -qE '^cmd/[^/]+/main\.go$' "$WORK/tree.txt" && GOTARGET='./cmd/...'
+      PREPARE='  mkdir -p build'
+      BUILD="  export CGO_CPPFLAGS=\"\${CPPFLAGS}\"
+  export CGO_CFLAGS=\"\${CFLAGS}\"
+  export CGO_CXXFLAGS=\"\${CXXFLAGS}\"
+  export CGO_LDFLAGS=\"\${LDFLAGS}\"
+  export GOPATH=\"\${srcdir}\"
+  export GOFLAGS=\"-buildmode=pie -trimpath -ldflags=-linkmode=external -mod=readonly -modcacherw\"
+  go build -o build $GOTARGET"
+      CHECK='  go test ./...'
+      PACKAGE='  install -Dm755 -t "$pkgdir/usr/bin" build/*' ;;
+    python)
+      ARCHS="'any'"; MAKEDEPS+=(python-build python-installer python-wheel); DEPS+=(python)
+      at "$TAG_REF" pyproject.toml > "$WORK/pyproject.toml"
+      tool python3 python3 - "$WORK/pyproject.toml" > "$WORK/pydeps" <<'PY' || die "could not read pyproject.toml"
+import re, sys, tomllib
+d = tomllib.load(open(sys.argv[1], "rb"))
+name = lambda s: re.match(r"[A-Za-z0-9._-]+", s.strip()).group(0)
+for r in d.get("build-system", {}).get("requires", []):
+    print("build", name(r))
+for r in d.get("project", {}).get("dependencies", []):
+    if not (";" in r and "extra ==" in r):
+        print("dep", name(r))
+PY
+      while read -r k dname; do
+        a="python-$(printf '%s' "$dname" | tr 'A-Z' 'a-z' | tr '_.' '--')"
+        case "$a" in python-setuptools-scm|python-hatch-vcs) ENVS='  export SETUPTOOLS_SCM_PRETEND_VERSION="$pkgver"' ;; esac
+        if [ "$k" = build ]; then MAKEDEPS+=("$a"); else DEPS+=("$a"); fi
+      done < "$WORK/pydeps"
+      BUILD='  python -m build --wheel --no-isolation'
+      PACKAGE='  python -m installer --destdir="$pkgdir" dist/*.whl' ;;
+    node)
+      ARCHS="'any'"; MAKEDEPS+=(npm); DEPS+=(nodejs)
+      NB=""; [ -n "$(at "$TAG_REF" package.json | tool jq jq -r '.scripts.build // ""' 2>/dev/null || true)" ] && NB='
+  npm run build'
+      BUILD="  npm ci --cache \"\$srcdir/npm-cache\"$NB
+  npm pack --pack-destination \"\$srcdir\""
+      PACKAGE='  npm install -g --prefix "$pkgdir/usr" --cache "$srcdir/npm-cache" "$srcdir"/*.tgz
+  # npm leaves group-writable directories behind
+  find "$pkgdir/usr" -type d -exec chmod 755 {} +' ;;
+    meson|cmake)
+      if [ "$KIND" = meson ]; then
+        MAKEDEPS+=(meson)
+        PCS="$(for f in $(grep -E '(^|/)meson\.build$' "$WORK/tree.txt"); do at "$TAG_REF" "$f"; done \
+               | grep -oE "dependency\([[:space:]]*'[^']+'" | sed -E "s/.*'([^']+)'/\\1/" | sort -u)"
+        BUILD='  arch-meson "$_srcdir" build
+  meson compile -C build'
+        CHECK='  meson test -C build --print-errorlogs'
+        PACKAGE='  meson install -C build --destdir "$pkgdir"'
+      else
+        MAKEDEPS+=(cmake)
+        PCS="$(at "$TAG_REF" CMakeLists.txt | tr '\n' ' ' | grep -oE 'pkg_check_modules\([^)]*\)' \
+               | sed -E 's/^pkg_check_modules\(//; s/\)$//' \
+               | awk '{ for (i = 2; i <= NF; i++) if ($i !~ /^(REQUIRED|QUIET|IMPORTED_TARGET|GLOBAL)$/) { m = $i; sub(/[<>=].*/, "", m); if (m != "") print m } }' | sort -u)"
+        BUILD='  local cmake_options=(
+    -B build
+    -S "$_srcdir"
+    -W no-author
+    -D CMAKE_BUILD_TYPE=None
+    -D CMAKE_INSTALL_PREFIX=/usr
+  )
+  cmake "${cmake_options[@]}"
+  cmake --build build'
+        CHECK='  ctest --test-dir build --output-on-failure'
+        PACKAGE='  DESTDIR="$pkgdir" cmake --install build'
+      fi
+      [ -n "$PCS" ] && MAKEDEPS+=(pkgconf)
+      for pc in $PCS; do
+        case "$pc" in threads|m|dl|rt|dependency) continue ;; esac
+        DEPS+=("$(pc_arch "$pc")")
+      done ;;
+    make)
+      BUILD='  make PREFIX=/usr'
+      PACKAGE='  make PREFIX=/usr DESTDIR="$pkgdir" install' ;;
+    flutter)
+      MAKEDEPS+=(flutter clang cmake ninja pkgconf); DEPS+=(gtk3)
+      BIN="$MAIN_GUESS"
+      TITLE="$(at "$TAG_REF" "$(pp linux/runner/my_application.cc)" | sed -nE 's/.*(gtk_header_bar_set_title|gtk_window_set_title)\([^,]+,[[:space:]]*"([^"]+)".*/\2/p' | sed -n 1p)"
+      [ -n "$TITLE" ] || TITLE="$PNAME"
+      hd() { printf '%s' "$1" | sed -e 's/[\\$`]/\\&/g'; }
+      ICON="$(grep -E "^$( [ "$PROOT" = . ] || printf '%s/' "$PROOT")(assets/.*(icon|logo|launcher)[^/]*\.png|linux/.*\.png|android/app/src/main/res/mipmap-xxxhdpi/ic_launcher\.png)$" "$WORK/tree.txt" \
+             | awk '{ print (/assets\//) ? 1 : (/linux\//) ? 2 : 3, $0 }' | sort -n | head -1 | cut -d' ' -f2- || true)"
+      ICON="${ICON#"$PROOT"/}"
+      BUILD='  export PUB_CACHE="$srcdir/pub-cache"
+  flutter --disable-analytics >/dev/null 2>&1 || true
+  flutter pub get --enforce-lockfile
+  flutter build linux --release'
+      PACKAGE="  install -dm755 \"\$pkgdir/usr/lib/\$pkgname\" \"\$pkgdir/usr/bin\"
+  cp -a build/linux/*/release/bundle/. \"\$pkgdir/usr/lib/\$pkgname/\"
+  ln -s \"/usr/lib/\$pkgname/$BIN\" \"\$pkgdir/usr/bin/$BIN\"
+  install -Dm644 /dev/stdin \"\$pkgdir/usr/share/applications/\$pkgname.desktop\" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=$(hd "$TITLE")
+Comment=$(hd "$DESC")
+Exec=$BIN
+${ICON:+Icon=\$pkgname
+}Categories=Utility;
+DESKTOP"
+      [ -n "$ICON" ] && PACKAGE="$PACKAGE
+  install -Dm644 \"$ICON\" \"\$pkgdir/usr/share/pixmaps/\$pkgname.png\""
+      ok "desktop entry \"$TITLE\"${ICON:+ with icon $ICON}" ;;
+  esac
+  [ "$FORGE" = git ] && MAKEDEPS+=(git)
+  # licenses Arch doesn't ship as common texts must be installed with the package
+  case "$SPDX" in
+    *MIT*|*BSD*|*ISC*|*Zlib*|*Unlicense*|*BSL-1.0*)   # (*BSD* covers 0BSD)
+      LIC="$(grep -m1 -xE '(LICENSE|LICENSE\.md|LICENSE\.txt|LICENCE|COPYING)' "$WORK/tree.txt" || true)"
+      [ -n "$LIC" ] && PACKAGE="$PACKAGE
+  install -Dm644 \"\$srcdir/\$_srcdir/$LIC\" \"\$pkgdir/usr/share/licenses/\$pkgname/LICENSE\"" ;;
+  esac
+
+  # every dependency must exist in Arch or the AUR
+  UNKNOWN=()
+  for d in $(printf '%s\n' "${DEPS[@]}" "${MAKEDEPS[@]}" | awk 'NF && !seen[$0]++'); do
+    case "$(arch_where "$d")" in
+      official) ;;
+      aur) note "$d comes from the AUR (users' AUR helper builds it first)" ;;
+      *) UNKNOWN+=("$d") ;;
+    esac
+  done
+  [ "${#UNKNOWN[@]}" -gt 0 ] && warn "no Arch or AUR package named: ${UNKNOWN[*]} — the test build will say if they're needed; fix the names in the PKGBUILD"
+
+  arr() { printf '%s\n' "$@" | awk 'NF && !seen[$0]++ { printf "%s'"'"'%s'"'"'", (n++ ? " " : ""), $0 }'; }
+  OBF="$(printf '%s' "${MAINT_EMAIL:-}" | sed -e 's/@/ at /' -e 's/\./ dot /g')"
+  {
+    printf '# Maintainer: %s%s\n\n' "$MAINT_NAME" "${OBF:+ <$OBF>}"
+    printf 'pkgname=%s\npkgver=%s\npkgrel=1\n' "$PKG" "$PKGVER"
+    printf 'pkgdesc=%s\n' "$(shq "$DESC")"
+    printf 'arch=(%s)\n' "$ARCHS"
+    printf 'url=%s\n' "$(shq "$HOMEPAGE")"
+    printf "license=('%s')\n" "$SPDX"
+    [ "${#DEPS[@]}" -gt 0 ] && printf 'depends=(%s)\n' "$(arr "${DEPS[@]}")"
+    [ "${#MAKEDEPS[@]}" -gt 0 ] && printf 'makedepends=(%s)\n' "$(arr "${MAKEDEPS[@]}")"
+    printf 'source=("%s")\n' "$SOURCE"
+    printf "sha256sums=('%s')\n" "$SRC_SUM"
+    printf '_srcdir="%s"\n' "$SRCDIR_X"
+    [ -n "${PREPARE:-}" ] && printf '\nprepare() {\n%s\n%s\n}\n' "$CDLINE" "$PREPARE"
+    printf '\nbuild() {\n%s\n%s%s\n}\n' "$CDLINE" "${ENVS:+$ENVS
+}" "$BUILD"
+    [ -n "$CHECK" ] && printf '\ncheck() {\n%s\n%s\n}\n' "$CDLINE" "$CHECK"
+    printf '\npackage() {\n%s\n%s\n}\n' "$CDLINE" "$PACKAGE"
+  } > "$AURDIR/PKGBUILD"
+  # meson/cmake build out of the source tree: they start in $srcdir
+  if [ "$KIND" = meson ] || [ "$KIND" = cmake ]; then
+    sed -i '/^build() {$/,/^}$/{/^  cd "\$_srcdir"$/d;}; /^check() {$/,/^}$/{/^  cd "\$_srcdir"$/d;}; /^package() {$/,/^}$/{/^  cd "\$_srcdir"$/d;}' "$AURDIR/PKGBUILD"
+    sed -i 's#"\$srcdir/\$_srcdir/#"$_srcdir/#' "$AURDIR/PKGBUILD"
+  fi
+  # the PKGBUILD's own license (0BSD, as the AUR guidelines encourage), and a
+  # .gitignore that keeps build leftovers out of the AUR repository
+  if [ ! -f "$AURDIR/LICENSE" ]; then
+    cat > "$AURDIR/LICENSE" <<LICENSE
+Copyright $(date +%Y) ${MAINT_NAME}
+
+Permission to use, copy, modify, and/or distribute this software for
+any purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE
+FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY
+DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN
+AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
+OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+LICENSE
+  fi
+  [ -f "$AURDIR/.gitignore" ] || printf '*\n!.gitignore\n!PKGBUILD\n!.SRCINFO\n!LICENSE\n' > "$AURDIR/.gitignore"
+  ok "wrote PKGBUILD ($KIND), LICENSE (0BSD) and .gitignore"
+fi
+
+# ================================================================ 4. check
+step "4/6  Check"
+bash -n "$AURDIR/PKGBUILD" 2>"$WORK/syntax.err" || { cat "$WORK/syntax.err"; die "the PKGBUILD has a shell syntax error"; }
+ok "PKGBUILD is valid shell"
+
+# a clean test build: an Arch container (podman or docker), else makepkg on Arch
+RUNTIME=""
+for r in podman docker; do
+  have "$r" && "$r" info >/dev/null 2>&1 && { RUNTIME="$r"; break; }
+done
+AURDEPS=""
+for d in $( (cd "$AURDIR" && env -i PATH="$PATH" bash --norc -c 'source ./PKGBUILD >/dev/null 2>&1; printf "%s\n" "${depends[@]}" "${makedepends[@]}"') | sed 's/[<>=].*//'); do
+  [ "$(arch_where "$d")" = aur ] || continue
+  # flutter: the prebuilt SDK is much faster to set up, and provides "flutter"
+  [ "$d" = flutter ] && d=flutter-bin
+  AURDEPS="$AURDEPS $d"
+done
+TESTED=0
+VCHECK=1; [ "$KIND" = flutter ] && VCHECK=0
+BIN_MAIN="$(cfg_get main-program)"; BIN_MAIN="${BIN_MAIN:-$MAIN_GUESS}"
+test_build() {
+  mkdir -p "$WORK/out"
+  "$RUNTIME" run --rm -v "$AURDIR:/pkg:ro" -v "$WORK/out:/out" -e AURDEPS="$AURDEPS" -e MAIN="$BIN_MAIN" -e VCHECK="$VCHECK" \
+    -e UPD="${NEED_UPDPKGSUMS:-0}" "$ARCH_IMAGE" bash -c '
+    set -e
+    pacman -Syu --noconfirm --needed git namcap pacman-contrib >/dev/null
+    useradd -m builder
+    echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+    cp -r /pkg /home/builder/pkg && chown -R builder: /home/builder/pkg
+    for d in $AURDEPS; do
+      echo "==> building AUR dependency $d"
+      su builder -c "cd ~ && git clone -q https://aur.archlinux.org/$d.git && cd $d && makepkg -si --noconfirm" \
+        || { echo "STORE-SUBMIT: the AUR dependency $d did not build"; exit 4; }
+    done
+    if [ "$UPD" = 1 ]; then su builder -c "cd ~/pkg && updpkgsums"; cp /home/builder/pkg/PKGBUILD /out/PKGBUILD; fi
+    echo "==> makepkg"
+    su builder -c "cd ~/pkg && makepkg -s --noconfirm" || { echo "STORE-SUBMIT: makepkg failed"; exit 5; }
+    echo "==> namcap"
+    namcap /home/builder/pkg/PKGBUILD 2>&1 | sed "s/^/NAMCAP: /" || true
+    namcap /home/builder/pkg/*.pkg.tar.zst 2>&1 | sed "s/^/NAMCAP: /" || true
+    echo "==> files"
+    pacman -Qlp /home/builder/pkg/*.pkg.tar.zst | grep -E "/usr/bin/." | sed "s/^/BIN: /" || true
+    pacman -U --noconfirm /home/builder/pkg/*.pkg.tar.zst >/dev/null
+    if [ -n "$MAIN" ] && [ "$VCHECK" = 1 ]; then
+      echo "==> $MAIN --version"
+      timeout 10 "$MAIN" --version 2>&1 | sed "s/^/VERSION: /" || echo "STORE-SUBMIT: $MAIN --version failed"
+    fi
+    echo "STORE-SUBMIT: OK"'
+}
+if [ "$NO_TEST" = 1 ]; then
+  warn "--no-test: not test-built"
+elif [ -z "$RUNTIME" ]; then
+  warn "no podman or docker here to test-build in a clean Arch container"
+  note "install one (e.g. podman) to have every release built before it's published"
+else
+  say "A clean build in an Arch container catches missing dependencies before users do."
+  if [ "$ASSUME_YES" = 1 ] || confirm "Test-build it with $RUNTIME? (first time: ~500 MB download; a few minutes)" y; then
+    while :; do
+      if run_logged "$WORK/test.log" "test build in an Arch container${AURDEPS:+ (first building:$AURDEPS)}" test_build \
+         && grep -q "STORE-SUBMIT: OK" "$WORK/test.log"; then
+        ok "built cleanly in Arch"
+        if [ -f "$WORK/out/PKGBUILD" ]; then cp "$WORK/out/PKGBUILD" "$AURDIR/PKGBUILD"; ok "checksums refreshed (updpkgsums)"; fi
+        grep '^BIN: ' "$WORK/test.log" | sed 's/^BIN: /   installs /' | head -5
+        grep '^VERSION: ' "$WORK/test.log" | head -1 | sed 's/^VERSION: /   ✓ --version → /'
+        grep -q "STORE-SUBMIT: .* --version failed" "$WORK/test.log" && warn "$BIN_MAIN --version didn't work in the container"
+        if grep -q '^NAMCAP: ' "$WORK/test.log"; then
+          warn "namcap (Arch's package linter) says:"
+          grep '^NAMCAP: ' "$WORK/test.log" | sed 's/^NAMCAP: /       /' | head -15
+        else
+          ok "namcap has no complaints"
+        fi
+        TESTED=1
+        break
+      fi
+      if grep -q "target not found" "$WORK/test.log"; then
+        bad "a dependency name doesn't exist: $(grep -o 'target not found: [^ ]*' "$WORK/test.log" | head -3 | sed 's/target not found: //' | tr '\n' ' ')"
+      elif grep -q "did not pass the validity check" "$WORK/test.log"; then
+        bad "a checksum doesn't match the download"
+      elif grep -q "the AUR dependency" "$WORK/test.log"; then
+        bad "$(grep -o 'the AUR dependency .* did not build' "$WORK/test.log" | head -1)"
+      else
+        bad "the test build failed"
+      fi
+      printf '   %s── last lines of the build log ──%s\n' "$DIM" "$R"
+      grep -vE '^\s*$' "$WORK/test.log" | tail -n 15 | cut -c1-200 | sed 's/^/     /'
+      [ "$ASSUME_YES" = 1 ] && { KEEP_WORK=1; die "the test build failed (log: $WORK/test.log)"; }
+      say "e) edit the PKGBUILD (in ${EDITOR:-vi}), then build again     l) read the whole log"
+      say "r) build again as it is     s) skip the test build     q) quit"
+      ask CHOICE "Choice" "e"
+      case "$CHOICE" in
+        e|E) "${EDITOR:-vi}" "$AURDIR/PKGBUILD" ;;
+        l|L) "${PAGER:-less}" "$WORK/test.log" || cat "$WORK/test.log" ;;
+        s|S) warn "not test-built"; break ;;
+        q|Q) note "your work is in $AURDIR; re-run to pick it up again"; exit 1 ;;
+      esac
+    done
+  fi
+fi
+[ "${NEED_UPDPKGSUMS:-0}" = 1 ] && [ "$TESTED" = 0 ] && die "the checksums of the extra sources need refreshing (updpkgsums) — only the test build can do that here"
+
+srcinfo "$AURDIR" > "$AURDIR/.SRCINFO" 2>"$WORK/srcinfo.err" \
+  || { cat "$WORK/srcinfo.err"; die "couldn't write .SRCINFO from the PKGBUILD"; }
+grep -qx "	pkgver = $PKGVER" "$AURDIR/.SRCINFO" && grep -qx "pkgname = $PKG" "$AURDIR/.SRCINFO" \
+  || die ".SRCINFO doesn't match the PKGBUILD (pkgname $PKG, pkgver $PKGVER)"
+ok ".SRCINFO written"
+
+# ================================================================ 5. review
+step "5/6  Review"
+git -C "$AURDIR" add -A
+git -C "$AURDIR" --no-pager diff --cached --stat | sed 's/^/   /'
+echo
+git -C "$AURDIR" diff --cached --color=auto -- PKGBUILD
+echo
+if [ "$MODE" = new ] && [ "$ASSUME_YES" = 1 ]; then
+  git -C "$AURDIR" reset -q
+  warn "--yes: nobody has read the new PKGBUILD — the AUR asks you to verify carefully before uploading"
+  die "run once without --yes to review and publish it (it's ready in $AURDIR)"
+fi
+if [ "$ASSUME_YES" = 0 ]; then
+  confirm "Have you read it, and do you stand behind it?" n \
+    || { note "edit it in $AURDIR, then re-run"; exit 1; }
+fi
+
+# =============================================================== 6. publish
+step "6/6  Publish"
+git -C "$AURDIR" config user.name "$MAINT_NAME"
+git -C "$AURDIR" config user.email "${MAINT_EMAIL:-$(git -C "$REPO" config user.email 2>/dev/null || echo "$(id -un)@localhost")}"
+if [ "$MODE" = new ]; then MSG="Initial upload: $PKG $PKGVER"; else MSG="Update to $PKGVER"; fi
+git -C "$AURDIR" commit -q -m "$MSG"
+ok "committed: $MSG"
+save_answers
+if [ "$DRYRUN" = 1 ]; then
+  warn "dry run — stopping before the push"
+  note "the commit is ready in $AURDIR"
+  exit 0
+fi
+go "Push $PKG $PKGVER to the AUR?" || { note "the commit is ready in $AURDIR"; exit 0; }
+while ! run_logged "$WORK/push.log" "pushing to the AUR" git -C "$AURDIR" push origin HEAD:master; do
+  tail -n 4 "$WORK/push.log" | sed 's/^/     /'
+  grep -qi "srcinfo" "$WORK/push.log" && die "the AUR rejected the .SRCINFO — see above"
+  [ "$ASSUME_YES" = 0 ] && confirm "Try again?" y || die "not pushed; the commit is ready in $AURDIR"
+done
+# the AUR updates its page right away: check it shows this version
+LIVE=""
+for _ in 1 2 3 4 5 6; do
+  LIVE="$(curl -sf --max-time 20 "$AUR_WEB/rpc/v5/info?arg[]=$PKG" | tool jq jq -r '.results[0].Version // ""' 2>/dev/null || true)"
+  [ "$LIVE" = "$PKGVER-1" ] && break
+  sleep 5
+done
+if [ "$LIVE" = "$PKGVER-1" ]; then ok "live: $AUR_WEB/packages/$PKG ($LIVE)"
+else warn "pushed, but the AUR still shows ${LIVE:-nothing} — check $AUR_WEB/packages/$PKG"; fi
+
+printf '\n   %sDone.%s %s %s is on the AUR.\n   %s/packages/%s\n\n' "$B" "$R" "$PKG" "$PKGVER" "$AUR_WEB" "$PKG"
+say "  • People install it with an AUR helper: yay -S $PKG  (or paru -S $PKG)"
+say "  • Watch the comments on its AUR page — that's where users report problems."
+say "  • Next release: run store-submit.sh aur (or linux) again; it bumps pkgver."
+[ "$TESTED" = 1 ] || say "  • It wasn't test-built here: a clean build before the next release is worth it."
+echo
+}
+
+# ##########################################################################
+#   Flathub's questions — the app ID and network access. Part of "Your app"
+#   whenever Flathub is among the distros, so a Linux run asks them up front
+#   and the config keeps them. Needs linux_common and linux_app's globals.
+# ##########################################################################
+# fh_default_id — the code-hosting app ID Flathub expects for this repo
+fh_default_id() {
+  local pre="" owner repo
+  case "$FORGE" in github) pre=io.github ;; gitlab) pre=io.gitlab ;; codeberg) pre=page.codeberg ;; *) return 0 ;; esac
+  owner="$(printf '%s' "$OWNER" | tr 'A-Z' 'a-z' | tr '/' '.' | sed -E 's/-/_/g; s/(^|\.)([0-9])/\1_\2/g')"
+  repo="$(printf '%s' "$REPONAME" | tr '.' '_' | sed -E 's/^([0-9])/_\1/')"
+  printf '%s.%s.%s' "$pre" "$owner" "$repo"
+}
+# fh_id_problems <id> — one line per Flathub app-ID rule it breaks
+fh_id_problems() {
+  local id="$1" n i last c
+  IFS=. read -ra c <<< "$id"
+  n=${#c[@]}; last="${c[$((n - 1))]:-}"
+  [ "${#id}" -le 255 ] || echo "it is longer than 255 characters"
+  [ "$n" -ge 3 ] || echo "it needs at least 3 parts, like tld.vendor.app"
+  [ "$n" -le 5 ] || echo "it has more than 5 parts"
+  for ((i = 0; i < n - 1; i++)); do
+    printf '%s' "${c[$i]}" | grep -qE '^[a-z0-9_]+$' || { echo "'${c[$i]}': the domain parts must be lowercase letters, digits or _"; break; }
+  done
+  printf '%s' "$last" | grep -qE '^[A-Za-z0-9_-]+$' || echo "'$last': the last part may only have letters, digits, _ and -"
+  case "$id" in
+    io.github.*|io.gitlab.*|page.codeberg.*|io.frama.*) [ "$n" -ge 4 ] || echo "code-hosting IDs need at least 4 parts" ;;
+    com.github.*|com.gitlab.*|org.codeberg.*|org.framagit.*) echo "that prefix is reserved for the hosting platform itself — use io.github. / io.gitlab. / page.codeberg." ;;
+    org.gnome.*|org.kde.*|com.system76.*) echo "that prefix is protected — only for those projects' own apps" ;;
+  esac
+  case "$last" in desktop|app|linux) echo "it must not end in a generic word (.$last)" ;; esac
+}
+# fh_id_repo_url <id> — the repository a code-hosting ID points at
+fh_id_repo_url() {
+  local id="$1" host rest owner last
+  case "$id" in
+    io.github.*) host=github.com; rest="${id#io.github.}" ;;
+    io.gitlab.*) host=gitlab.com; rest="${id#io.gitlab.}" ;;
+    page.codeberg.*) host=codeberg.org; rest="${id#page.codeberg.}" ;;
+    *) return 0 ;;
+  esac
+  last="${rest##*.}"; owner="${rest%.*}"
+  owner="$(printf '%s' "$owner" | tr '.' '/' | sed -E 's#(^|/)_#\1#g; s/_/-/g')"
+  last="$(printf '%s' "$last" | sed -E 's/^_([0-9])/\1/')"
+  printf 'https://%s/%s/%s' "$host" "$owner" "$last"
+}
+
+flathub_questions() {
+# --- the app ID: permanent on Flathub (a rename means a new submission)
+ID_GUESS="${ID_ARG:-$(cfg_get flathub-id)}"
+[ -n "$ID_GUESS" ] || ID_GUESS="$(fh_default_id)"
+FIRST=1
+while :; do
+  if [ "$FIRST" = 1 ] && [ -n "$(cfg_get flathub-id)" ] && [ -z "$ID_ARG" ] && [ "$ASK_ALL" = 0 ]; then
+    APP_ID="$ID_GUESS"; ok "app ID: $APP_ID"
+  elif [ -n "$ID_ARG" ] && [ "$FIRST" = 1 ]; then
+    APP_ID="$ID_ARG"
+  else
+    [ "$FIRST" = 1 ] && note "the app ID names your app on Flathub for good — a rename means submitting again"
+    [ "$FIRST" = 1 ] && [ "$FORGE" != git ] && note "for an app on ${HOST}, Flathub wants $(fh_default_id | cut -d. -f1-2).<owner>.<repo>"
+    ask APP_ID "Flathub app ID" "$ID_GUESS"
+  fi
+  FIRST=0
+  PROBS="$(fh_id_problems "$APP_ID")"
+  if [ -z "$PROBS" ]; then
+    CLAIM="$(fh_id_repo_url "$APP_ID")"
+    if [ -z "$CLAIM" ] || curl -sfIL --max-time 20 -o /dev/null "$CLAIM"; then break; fi
+    PROBS="it points at $CLAIM, which doesn't exist — Flathub checks that it does"
+  fi
+  printf '%s\n' "$PROBS" | while read -r l; do warn "app ID: $l"; done
+  [ "$ASSUME_YES" = 1 ] && die "fix the app ID (--app-id) and re-run"
+  ID_GUESS="$APP_ID"
+done
+[ -n "${CLAIM:-}" ] && ok "app ID $APP_ID ↔ $CLAIM"
+[ "$SAVE" = 1 ] && cfg_set flathub-id "$APP_ID"
+
+# --- network access (a Flatpak permission): guessed from the dependencies
+NET="$(cfg_get flathub-network)"
+if [ -z "$NET" ]; then
+  NET=no
+  { at "$TAG_REF" "$(pp pubspec.yaml)"; at "$TAG_REF" Cargo.lock; at "$TAG_REF" package.json; } 2>/dev/null \
+    | grep -qiE '(^|[^a-z])(http|dio|web_socket|supabase|firebase|reqwest|hyper|ureq|axios|grpc)([^a-z]|$)' && NET=yes
+  if [ "$ASSUME_YES" = 0 ]; then confirm "Does $PNAME use the internet?" "$( [ "$NET" = yes ] && echo y || echo n)" && NET=yes || NET=no; fi
+  [ "$SAVE" = 1 ] && cfg_set flathub-network "$NET"
+fi
+}
+
+# ##########################################################################
+#   Flathub wizard — store-submit.sh flathub [options]
+#   (body unindented on purpose: its here-documents start at column 0)
+# ##########################################################################
+wizard_flathub() {
+#
+# store-submit.sh flathub — prepare an app for Flathub (or a new version of
+# one that's already there), up to the pull request.
+#
+# Follows Flathub's own documentation:
+#   https://docs.flathub.org/docs/for-app-authors/submission
+#   https://docs.flathub.org/docs/for-app-authors/requirements
+#   https://docs.flathub.org/docs/for-app-authors/metainfo-guidelines
+#
+# Flathub's policy is that people, not tools, open submission pull requests
+# (requirements, "Generative AI policy"). So this wizard does everything up to
+# it — checks, metadata, manifest, an offline build like Flathub's, Flathub's
+# linter, a branch in your fork — and ends with your to-do list and the link
+# that opens the pull request.
+
+set -eu
+
+DRYRUN=0
+SAVE=1
+ASSUME_YES=0
+ASK_ALL=0
+REPO_ARG=""
+ID_ARG=""
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flathub-submit"
+CONF="$CONF_DIR/last.conf"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/store-submit"
+# pinned versions of the community tools Flathub points to
+FF_VERSION="0.15.0"                                   # flatpak-flutter
+FBT_COMMIT="41c20aa10819cdb2a4f3ca171758a96d1955c018" # flatpak-builder-tools
+FLATHUB_REPO="${FLATHUB_REPO:-flathub/flathub}"
+
+usage() {
+  cat <<'USAGE'
+store-submit.sh flathub — prepare an app for Flathub, or an update of it.
+You open the pull request yourself, as Flathub's policy asks: the wizard
+ends with the link and your to-do list.
+
+  -h, --help          show this text
+  -y, --yes           use everything it detects and don't ask
+      --ask           ask every question, including the ones it can answer
+      --repo PATH     the app's git checkout (default: the repo you run it in)
+      --config FILE   the shared answers (default: .store-submit.conf in the repo)
+      --app-id ID     the Flathub app ID (default: from the config, or worked out)
+  -n, --dry-run       build and check; don't touch your fork
+      --no-save       do not remember the answers for next time
+      --forget        delete the remembered answers and exit
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help)    usage; exit 0 ;;
+    -n|--dry-run) DRYRUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --ask)        ASK_ALL=1 ;;
+    --repo)       REPO_ARG="${2-}"; shift ;;
+    --config)     LINUX_CONF="${2-}"; shift ;;
+    --app-id)     ID_ARG="${2-}"; shift ;;
+    --no-save)    SAVE=0 ;;
+    --forget)     rm -f "$CONF"; printf 'forgot %s\n' "$CONF"; exit 0 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+WIZ_NAME=flathub-submit
+linux_common
+
+SAVED_REPO=""
+if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF" || warn "could not read $CONF"
+fi
+save_answers() {
+  [ "$SAVE" = 1 ] || return 0
+  mkdir -p "$CONF_DIR"
+  { printf '# written by store-submit.sh flathub — safe to delete (or run --forget)\n'
+    printf 'SAVED_REPO=%q\n' "${REPO:-${SAVED_REPO:-}}"; } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+}
+
+# ------------------------------------------------------------------ helpers
+# fb <command> [args...] — a command from Flathub's own builder, org.flatpak.Builder
+fb() { local fbcmd="$1"; shift; flatpak run --command="$fbcmd" org.flatpak.Builder "$@"; }
+
+# fh_py <script args...> — python with the modules the Flathub tools need
+# (PyYAML, tomlkit, aiohttp, packaging): from nixpkgs when Nix is here, else a
+# private virtualenv in the cache. Nothing is installed system-wide.
+fh_py() {
+  if python3 -c 'import yaml, tomlkit, aiohttp, packaging' 2>/dev/null; then python3 "$@"; return; fi
+  if have nix-shell && nix-instantiate --find-file nixpkgs >/dev/null 2>&1; then
+    nix-shell -p "python3.withPackages (p: [ p.pyyaml p.tomlkit p.aiohttp p.packaging ])" \
+      --run "$(printf '%q ' python3 "$@")"
+    return
+  fi
+  local v="$CACHE/flathub-tools/venv"
+  if [ ! -x "$v/bin/python3" ] || ! "$v/bin/python3" -c 'import yaml, tomlkit, aiohttp, packaging' 2>/dev/null; then
+    python3 -m venv "$v" >/dev/null && "$v/bin/pip" install -q pyyaml tomlkit aiohttp packaging >/dev/null \
+      || { printf 'could not set up the Python tools in %s\n' "$v" >&2; return 1; }
+  fi
+  "$v/bin/python3" "$@"
+}
+
+# fh_latest <runtime> — its newest stable branch on Flathub
+fh_latest() {
+  flatpak remote-ls --user flathub --runtime --columns=application,branch 2>/dev/null \
+    | awk -v a="$1" '$1 == a { print $2 }' | grep -E '^[0-9]+(\.[0-9]+)?$' | sort -V | tail -1
+}
+# png_size <file> — "WxH" of a PNG
+png_size() { python3 -c 'import struct,sys; d=open(sys.argv[1],"rb").read(24); print("%dx%d" % struct.unpack(">II", d[16:24])) if d[:8]==b"\x89PNG\r\n\x1a\n" else print("")' "$1" 2>/dev/null; }
+# raw_url <path> — a file of the app at the release tag, as a direct link
+raw_url() {
+  case "$FORGE" in
+    github)   printf 'https://raw.githubusercontent.com/%s/%s/%s' "$SLUG" "$TAG" "$1" ;;
+    gitlab)   printf '%s/-/raw/%s/%s' "$WEB" "$TAG" "$1" ;;
+    codeberg) printf '%s/raw/tag/%s/%s' "$WEB" "$TAG" "$1" ;;
+    *)        printf '' ;;
+  esac
+}
+xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# =============================================================== 0. orientation
+cat <<BANNER
+
+  ${B}Flathub wizard${R}
+
+  Six stages:
+    1. your app      — shared with the other distros, plus the Flathub app ID
+    2. tools         — Flathub's builder and linter (org.flatpak.Builder)
+    3. metadata      — metainfo, desktop file and icon in your app, validated
+    4. manifest      — yours, or made with Flathub's community tools
+    5. build + lint  — built offline like Flathub does, linted, tried out
+    6. hand-off      — a branch in your fork; ${B}you${R} open the pull request
+
+BANNER
+[ "$DRYRUN" = 1 ] && warn "dry run: your fork is not touched"
+for t in git flatpak python3 curl; do
+  have "$t" || die "$t is missing — $( [ "$t" = flatpak ] && echo 'on NixOS: services.flatpak.enable = true; elsewhere your package manager has it' || echo 'install it and re-run')"
+done
+
+# ============================================================== 1. the app
+linux_app "1/6  Your app"
+
+flathub_questions
+IDRE="$(printf '%s' "$APP_ID" | sed 's/[.]/\\./g')"
+
+# --- new on Flathub, or an update? Every app there has its own repository.
+MODE=new
+if curl -sfIL --max-time 20 -o /dev/null "https://github.com/flathub/$APP_ID"; then
+  MODE=update; ok "$APP_ID is on Flathub already — this is an update"
+else
+  ok "$APP_ID is new to Flathub"
+fi
+
+# ================================================================= 2. tools
+step "2/6  Flathub's tools"
+if ! flatpak remotes --user --columns=name 2>/dev/null | grep -qx flathub; then
+  flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo \
+    || die "couldn't add the Flathub remote"
+  ok "added the Flathub remote (for your user)"
+else
+  ok "Flathub remote"
+fi
+if flatpak info org.flatpak.Builder >/dev/null 2>&1; then
+  ok "org.flatpak.Builder (Flathub's builder and linter)"
+else
+  say "Flathub builds and lints with org.flatpak.Builder; it isn't installed yet."
+  go "Install it for your user? (a few hundred MB)" || die "the build and the linter need org.flatpak.Builder"
+  run_logged "$WORK/builder.log" "installing org.flatpak.Builder" flatpak install --user -y --noninteractive flathub org.flatpak.Builder \
+    || { tail -n 5 "$WORK/builder.log" | sed 's/^/     /'; die "couldn't install org.flatpak.Builder"; }
+  ok "installed org.flatpak.Builder"
+fi
+fh_py -c 'import yaml' 2>/dev/null || die "couldn't set up the Python modules the Flathub tools need"
+ok "Python tools (PyYAML, tomlkit, aiohttp)"
+
+# ============================================================== 3. metadata
+step "3/6  Metadata in your app"
+# Flathub wants these in the app's own repository (not in the pull request),
+# installed by the build: a metainfo file, a desktop file and an icon.
+find_tag() { grep -E "$1" "$WORK/tree.txt" | head -1 || true; }
+META="$(find_tag "(^|/)$IDRE\\.(metainfo|appdata)\\.xml(\\.in)?$")"
+DESKTOP="$(find_tag "(^|/)$IDRE\\.desktop(\\.in)?$")"
+ICON="$(find_tag "(^|/)$IDRE\\.(svg|png)$")"
+[ -n "$META" ] && ok "metainfo: $META" || warn "no $APP_ID.metainfo.xml in $TAG"
+[ -n "$DESKTOP" ] && ok "desktop file: $DESKTOP" || warn "no $APP_ID.desktop in $TAG"
+if [ -n "$ICON" ]; then
+  case "$ICON" in
+    *.png) at "$TAG_REF" "$ICON" > "$WORK/icon.png"; SZ="$(png_size "$WORK/icon.png")"
+           if [ "${SZ%x*}" -ge 256 ] 2>/dev/null && [ "${SZ%x*}" = "${SZ#*x}" ]; then ok "icon: $ICON ($SZ)"
+           else warn "icon $ICON is $SZ — Flathub needs a square PNG of at least 256×256, or an SVG"; ICON=""; fi ;;
+    *) ok "icon: $ICON" ;;
+  esac
+else
+  warn "no $APP_ID.svg or .png icon in $TAG"
+fi
+
+# --- what's missing is written into your app — you release it, then re-run
+if [ -z "$META" ] || [ -z "$DESKTOP" ] || [ -z "$ICON" ]; then
+  MDIR="flatpak"; [ "$PROOT" != . ] && MDIR="$PROOT/flatpak"
+  say "Flathub needs these in your app's repository. The wizard can write the"
+  say "missing ones into $MDIR/ — you check them, commit, and release a new version."
+  [ "$ASSUME_YES" = 1 ] && die "the metadata needs you — run once without --yes"
+  go "Create them in $MDIR/?" || die "add the metainfo, desktop file and icon to your app, release, then re-run"
+  mkdir -p "$REPO/$MDIR"
+  NAME_GUESS="$(at "$TAG_REF" "$(pp linux/runner/my_application.cc)" | sed -nE 's/.*(gtk_header_bar_set_title|gtk_window_set_title)\([^,]+,[[:space:]]*"([^"]+)".*/\2/p' | sed -n 1p)"
+  [ -n "$NAME_GUESS" ] || NAME_GUESS="$(printf '%s' "$PNAME" | sed -E 's/[-_]/ /g; s/(^| )([a-z])/\1\u\2/g')"
+  [ -n "$(cfg_get display-name)" ] && NAME_GUESS="$(cfg_get display-name)"
+  ask DNAME "The app's name, as people see it" "$NAME_GUESS"
+  [ "$SAVE" = 1 ] && cfg_set display-name "$DNAME"
+  if [ -z "$DESKTOP" ]; then
+    CATS="AudioVideo Audio Video Development Education Game Graphics Network Office Science Settings System Utility"
+    CAT="$(cfg_get categories)"; CAT="${CAT%%;*}"
+    while :; do
+      ask CAT "Main menu category ($CATS)" "${CAT:-Utility}"
+      case " $CATS " in *" $CAT "*) break ;; esac
+      warn "one of: $CATS"
+    done
+    [ "$SAVE" = 1 ] && cfg_set categories "$CAT;"
+    {
+      printf '[Desktop Entry]\nType=Application\nName=%s\nComment=%s\n' "$DNAME" "$DESC"
+      printf 'Exec=%s\nIcon=%s\nTerminal=false\nCategories=%s;\n' "$MAIN_GUESS" "$APP_ID" "$CAT"
+    } > "$REPO/$MDIR/$APP_ID.desktop"
+    DESKTOP="$MDIR/$APP_ID.desktop"; ok "wrote $DESKTOP"
+  fi
+  if [ -z "$ICON" ]; then
+    CAND=""
+    for f in $(grep -iE '\.(svg|png)$' "$WORK/tree.txt" | grep -iE 'icon|logo|launcher|ic_launcher' || true); do
+      case "$f" in
+        *.svg) CAND="$f"; break ;;
+        *.png) at "$TAG_REF" "$f" > "$WORK/cand.png"; SZ="$(png_size "$WORK/cand.png")"
+               [ "${SZ%x*}" -ge 256 ] 2>/dev/null && [ "${SZ%x*}" = "${SZ#*x}" ] && { CAND="$f"; break; } ;;
+      esac
+    done
+    if [ -n "$CAND" ]; then
+      at "$TAG_REF" "$CAND" > "$REPO/$MDIR/$APP_ID.${CAND##*.}"
+      ICON="$MDIR/$APP_ID.${CAND##*.}"; ok "icon: copied $CAND to $ICON"
+    else
+      handoff_add "Add an icon: a square PNG of at least 256×256 (or an SVG) at $MDIR/$APP_ID.png"
+      warn "no icon of 256×256 or more (or SVG) found — add one at $MDIR/$APP_ID.png"
+    fi
+  fi
+  if [ -z "$META" ]; then
+    # the store page text is yours: the README's first paragraph as a start
+    README_P="$(for f in README.md README; do at "$TAG_REF" "$f"; done 2>/dev/null | awk '/^#|^\[!|^!\[|^<|^$/ { if (p) exit; next } { p = p (p ? " " : "") $0 } END { print p }' | cut -c1-400)"
+    note "a few sentences for the Flathub page, in your own words (Flathub reviews its wording)"
+    ask ABOUT "What the app does" "$README_P"
+    # screenshots: required. Images in the repo at this tag, or links you give.
+    SHOTS="$(grep -iE '(^|/)(screenshots?|screens|images/screenshots?|docs/images?)/[^/]+\.(png|jpe?g|webp)$' "$WORK/tree.txt" | head -5 || true)"
+    URLS=""
+    for s in $SHOTS; do u="$(raw_url "$s")"; [ -n "$u" ] && URLS="$URLS $u"; done
+    if [ -n "$URLS" ]; then ok "screenshots: $(printf '%s' "$SHOTS" | tr '\n' ' ')"
+    else
+      note "Flathub needs at least one screenshot: a direct image link (from a tag or commit, not a branch)"
+      while :; do
+        ask_opt U "Screenshot URL (blank when done)" ""
+        [ -n "$U" ] || break
+        URLS="$URLS $U"
+      done
+      [ -n "$URLS" ] || { handoff_add "Add screenshots to $MDIR/$APP_ID.metainfo.xml (<screenshots>) — Flathub requires one"; warn "no screenshot — the linter will insist on one"; }
+    fi
+    confirm "Does the app have chat with strangers, in-app purchases, ads, location sharing or mature content?" n && {
+      handoff_add "Fill in the age rating: answer https://hughsie.github.io/oars/ and paste the result into <content_rating> in $MDIR/$APP_ID.metainfo.xml"
+      OARS_NOTE=1; }
+    DEV_ID="$(printf '%s' "$APP_ID" | cut -d. -f1-"$(( $(printf '%s' "$APP_ID" | tr -cd . | wc -c) ))")"
+    TYPE=desktop-application
+    {
+      printf '<?xml version="1.0" encoding="UTF-8"?>\n<!-- Copyright %s %s -->\n' "$(date +%Y)" "$(xml_esc "$MAINT_NAME")"
+      printf '<component type="%s">\n  <id>%s</id>\n\n' "$TYPE" "$APP_ID"
+      printf '  <name>%s</name>\n  <summary>%s</summary>\n\n' "$(xml_esc "$DNAME")" "$(xml_esc "$DESC")"
+      printf '  <metadata_license>CC0-1.0</metadata_license>\n  <project_license>%s</project_license>\n\n' "$SPDX"
+      printf '  <developer id="%s">\n    <name>%s</name>\n  </developer>\n\n' "$DEV_ID" "$(xml_esc "$MAINT_NAME")"
+      printf '  <description>\n    <p>%s</p>\n  </description>\n\n' "$(xml_esc "$ABOUT")"
+      printf '  <launchable type="desktop-id">%s.desktop</launchable>\n\n' "$APP_ID"
+      printf '  <url type="homepage">%s</url>\n' "$(xml_esc "$HOMEPAGE")"
+      [ "$FORGE" = github ] || [ "$FORGE" = gitlab ] || [ "$FORGE" = codeberg ] && printf '  <url type="bugtracker">%s/issues</url>\n' "$WEB"
+      printf '  <url type="vcs-browser">%s</url>\n\n' "$WEB"
+      if [ -n "$URLS" ]; then
+        printf '  <screenshots>\n'
+        d=' type="default"'
+        for u in $URLS; do printf '    <screenshot%s>\n      <image>%s</image>\n    </screenshot>\n' "$d" "$(xml_esc "$u")"; d=""; done
+        printf '  </screenshots>\n\n'
+      fi
+      [ "${OARS_NOTE:-0}" = 1 ] && printf '  <!-- replace with the answers from https://hughsie.github.io/oars/ -->\n'
+      printf '  <content_rating type="oars-1.1" />\n\n'
+      printf '  <releases>\n'
+      git -C "$REPO" for-each-ref --sort=-creatordate --format='%(refname:short) %(creatordate:short)' refs/tags \
+        | grep -E '^v?[0-9]' | head -10 | while read -r t d; do printf '    <release version="%s" date="%s" />\n' "${t#v}" "$d"; done
+      printf '  </releases>\n</component>\n'
+    } > "$REPO/$MDIR/$APP_ID.metainfo.xml"
+    META="$MDIR/$APP_ID.metainfo.xml"; ok "wrote $META"
+  fi
+  # check them now, before they go into a release
+  if run_logged "$WORK/meta-lint.log" "validating the metainfo with Flathub's linter" fb flatpak-builder-lint appstream "$REPO/$META"; then
+    ok "metainfo passes Flathub's linter"
+  else
+    warn "Flathub's linter has remarks about $META:"; grep -vE '^\s*$' "$WORK/meta-lint.log" | head -12 | sed 's/^/       /'
+    handoff_add "Fix what Flathub's linter says about $META (docs: https://docs.flathub.org/docs/for-app-authors/metainfo-guidelines)"
+  fi
+  if fb desktop-file-validate "$REPO/$DESKTOP" > "$WORK/desktop.log" 2>&1; then ok "desktop file is valid"
+  else warn "desktop-file-validate: $(head -3 "$WORK/desktop.log" | tr '\n' ' ')"; fi
+  handoff_add "Read the files in $MDIR/ — they describe your app on Flathub; correct anything that's off"
+  handoff_add "Commit them, and add a <release version=… date=…> line to the metainfo for the version you're about to release"
+  handoff_add "Release that version (a new tag), then run store-submit.sh flathub again — it picks up from here"
+  handoff_show "Flathub needs these in a release of your app first"
+  save_answers
+  exit 0
+fi
+
+# the metainfo must list this release (Flathub shows it as "what's new")
+at "$TAG_REF" "$META" | grep -qE "<release[^>]+version=\"${VERSION//./\\.}\"" \
+  || { warn "$META has no <release version=\"$VERSION\"> entry"; handoff_add "Next time, add <release version=\"…\" date=\"…\"> to $META before tagging the release"; }
+
+# ============================================================== 4. manifest
+step "4/6  Manifest"
+WD="$CACHE/flathub/$APP_ID"
+REV="$(git -C "$REPO" rev-list -n1 "$TAG_REF")"
+GITURL="$WEB.git"; [ "$FORGE" = git ] && GITURL="$(printf '%s' "$ORIGIN" | sed -E 's#^[^@/]+@([^:]+):#https://\1/#')"
+case "$TAG" in "v$VERSION") TAGPAT='^v([\d.]+)$' ;; *) TAGPAT='^([\d.]+)$' ;; esac
+NET="$(cfg_get flathub-network)"; NET="${NET:-no}"
+ok "network access: $NET"
+
+# install lines for the metadata, relative to where the module builds
+rel() { python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$1" "$2"; }
+BUILDDIR="."; [ "$KIND" = flutter ] && BUILDDIR="$PROOT"
+ICONDEST="share/icons/hicolor/scalable/apps/$APP_ID.svg"
+case "$ICON" in *.png) at "$TAG_REF" "$ICON" > "$WORK/icon.png"; SZ="$(png_size "$WORK/icon.png")"; ICONDEST="share/icons/hicolor/$SZ/apps/$APP_ID.png" ;; esac
+INSTALLS="install -Dm644 $(rel "$META" "$BUILDDIR") \${FLATPAK_DEST}/share/metainfo/$APP_ID.metainfo.xml
+install -Dm644 $(rel "$DESKTOP" "$BUILDDIR") \${FLATPAK_DEST}/share/applications/$APP_ID.desktop
+install -Dm644 $(rel "$ICON" "$BUILDDIR") \${FLATPAK_DEST}/$ICONDEST"
+case "$META$DESKTOP" in *.in*) INSTALLS="" ; note "your build installs the metadata itself (.in templates)" ;; esac
+
+GENERATED_BY=""
+if [ "$MODE" = update ]; then
+  # --------------------------------------------------------------- update
+  rm -rf "$WD"; mkdir -p "$(dirname "$WD")"
+  run_logged "$WORK/clone.log" "cloning flathub/$APP_ID" git clone -q --depth 1 "https://github.com/flathub/$APP_ID.git" "$WD" \
+    || die "couldn't clone https://github.com/flathub/$APP_ID"
+  # point the app's source at the new tag (git: tag + commit; archive: url + sha256)
+  for mf in "$WD/flatpak-flutter.yml" "$WD/$APP_ID.yml" "$WD/$APP_ID.yaml" "$WD/$APP_ID.json"; do
+    [ -f "$mf" ] || continue
+    ARCHIVE_URL=""; ARCHIVE_SHA=""
+    if [ "$FORGE" = github ]; then
+      ARCHIVE_URL="https://github.com/$SLUG/archive/refs/tags/$TAG.tar.gz"
+      if grep -q "archive" "$mf" && curl -sfL --max-time 60 -o "$WORK/src.tar.gz" "$ARCHIVE_URL"; then ARCHIVE_SHA="$(sha256sum "$WORK/src.tar.gz" | cut -d' ' -f1)"; fi
+    fi
+    fh_py - "$mf" "$SLUG" "$TAG" "$REV" "$ARCHIVE_URL" "$ARCHIVE_SHA" <<'PY' || die "couldn't update the source in $(basename "$mf")"
+import json, re, sys, yaml
+path, slug, tag, rev, aurl, asha = sys.argv[1:7]
+is_json = path.endswith(".json")
+text = open(path).read()
+head = "" if is_json else "".join(l for l in text.splitlines(True) if l.startswith("#") and not text.startswith("---"))
+m = json.loads(text) if is_json else yaml.safe_load(text)
+hit = 0
+def walk(mods):
+    global hit
+    for mod in mods or []:
+        if not isinstance(mod, dict):
+            continue
+        for s in mod.get("sources", []) or []:
+            if not isinstance(s, dict) or slug.lower() not in str(s.get("url", "")).lower():
+                continue
+            if s.get("type") == "git":
+                s["tag"] = tag; s["commit"] = rev; hit += 1
+            elif s.get("type") == "archive" and aurl and asha:
+                s["url"] = aurl; s["sha256"] = asha; hit += 1
+        walk(mod.get("modules"))
+walk(m.get("modules"))
+if not hit:
+    sys.exit("no source pointing at " + slug)
+class D(yaml.SafeDumper):
+    def increase_indent(self, flow=False, indentless=False):
+        return super().increase_indent(flow, False)
+with open(path, "w") as f:
+    if is_json:
+        json.dump(m, f, indent=4); f.write("\n")
+    else:
+        f.write(head); yaml.dump(m, f, Dumper=D, sort_keys=False, indent=2, allow_unicode=True, width=4096)
+PY
+    ok "$(basename "$mf"): source → $TAG ($(printf '%s' "$REV" | cut -c1-12))"
+  done
+  MANIFEST=""
+  for f in "$APP_ID.yml" "$APP_ID.yaml" "$APP_ID.json"; do [ -f "$WD/$f" ] && { MANIFEST="$f"; break; }; done
+  [ -n "$MANIFEST" ] || die "flathub/$APP_ID has no $APP_ID.yml/.json manifest"
+  if [ -f "$WD/flatpak-flutter.yml" ]; then GENERATED_BY=flatpak-flutter; fi
+  if [ -f "$WD/cargo-sources.json" ] && [ "$KIND" = rust ]; then GENERATED_BY=cargo; fi
+else
+  # ---------------------------------------------------------- new: whose manifest?
+  rm -rf "$WD"; mkdir -p "$WD"
+  OWN="$(grep -E "(^|/)($IDRE\\.(ya?ml|json)|flatpak-flutter\\.ya?ml)$" "$WORK/tree.txt" | head -1 || true)"
+  if [ -n "$OWN" ]; then
+    # yours, from the app repo — with the local files it refers to
+    ODIR="$(dirname "$OWN")"
+    at "$TAG_REF" "$OWN" > "$WD/$(basename "$OWN")"
+    fh_py - "$WD/$(basename "$OWN")" <<'PY' > "$WORK/own-refs"
+import json, sys, yaml
+p = sys.argv[1]
+m = json.load(open(p)) if p.endswith(".json") else yaml.safe_load(open(p))
+out = set()
+def walk(mods):
+    for mod in mods or []:
+        if isinstance(mod, str):
+            out.add(mod); continue
+        for s in mod.get("sources", []) or []:
+            if isinstance(s, str):
+                out.add(s)
+            elif isinstance(s, dict):
+                for k in ("path", "paths"):
+                    v = s.get(k)
+                    for x in (v if isinstance(v, list) else [v] if v else []):
+                        out.add(x)
+        walk(mod.get("modules"))
+walk(m.get("modules"))
+print("\n".join(sorted(out)))
+PY
+    while read -r r; do
+      [ -n "$r" ] || continue
+      src="$ODIR/$r"; [ "$ODIR" = . ] && src="$r"
+      if grep -qxF "$src" "$WORK/tree.txt"; then mkdir -p "$WD/$(dirname "$r")"; at "$TAG_REF" "$src" > "$WD/$r"
+      elif grep -q "^$src/" "$WORK/tree.txt"; then
+        grep "^$src/" "$WORK/tree.txt" | while read -r f; do mkdir -p "$WD/$(dirname "${f#"$ODIR"/}")"; at "$TAG_REF" "$f" > "$WD/${f#"$ODIR"/}"; done
+      fi
+    done < "$WORK/own-refs"
+    ok "your manifest: $OWN"
+    case "$OWN" in *flatpak-flutter.y*ml) GENERATED_BY=flatpak-flutter ;; *) MANIFEST="$(basename "$OWN")" ;; esac
+  else
+    # ------------------------------------------- made with the community tools
+    RUNTIME=org.freedesktop.Platform; SDK=org.freedesktop.Sdk; GUI=1
+    case "$KIND" in
+      flutter) ;;
+      rust) if at "$TAG_REF" Cargo.lock | grep -qE '^name = "(gtk4|libadwaita|gtk)"'; then RUNTIME=org.gnome.Platform; SDK=org.gnome.Sdk
+            elif ! at "$TAG_REF" Cargo.lock | grep -qE '^name = "(iced|egui|eframe|slint|winit|tauri|relm4|fltk|druid|dioxus)"'; then GUI=0; fi ;;
+      meson) if { for f in $(grep -E '(^|/)meson\.build$' "$WORK/tree.txt"); do at "$TAG_REF" "$f"; done; } | grep -qE "dependency\\([[:space:]]*'(gtk4|libadwaita-1|gtk\\+-3\\.0)'"; then
+               RUNTIME=org.gnome.Platform; SDK=org.gnome.Sdk; fi ;;
+      cmake) if at "$TAG_REF" CMakeLists.txt | grep -qE 'find_package\([[:space:]]*Qt6'; then RUNTIME=org.kde.Platform; SDK=org.kde.Sdk
+             elif at "$TAG_REF" CMakeLists.txt | grep -qiE 'gtk'; then RUNTIME=org.gnome.Platform; SDK=org.gnome.Sdk; fi ;;
+      *) die "the wizard makes Flathub manifests for Flutter, Rust, Meson and CMake apps — for a $KIND app, add your own $APP_ID.yml to the repo (see https://docs.flathub.org/docs/for-app-authors/requirements) and re-run: it then checks, builds and lints yours" ;;
+    esac
+    [ "$GUI" = 1 ] || die "this looks like a command-line app — Flathub is mostly for graphical apps; the AUR and nixpkgs fit it better"
+    RTV="$(fh_latest "$RUNTIME")"
+    [ -n "$RTV" ] || die "couldn't ask Flathub for the latest $RUNTIME (is the network up?)"
+    ok "runtime: $RUNTIME $RTV (the latest, as Flathub requires)"
+    MODULE="${APP_ID##*.}"
+    FINISH='["--share=ipc", "--socket=fallback-x11", "--socket=wayland", "--device=dri"'
+    [ "$NET" = yes ] && FINISH="$FINISH, \"--share=network\""
+    FINISH="$FINISH]"
+    if [ "$KIND" = flutter ]; then
+      # flatpak-flutter's own template, pinned to this release
+      FF="$CACHE/flatpak-flutter-$FF_VERSION"
+      if [ ! -f "$FF/flatpak-flutter.py" ]; then
+        run_logged "$WORK/ff.log" "downloading flatpak-flutter $FF_VERSION" \
+          curl -fL --retry 3 -o "$WORK/ff.tar.gz" "https://github.com/TheAppgineer/flatpak-flutter/archive/refs/tags/$FF_VERSION.tar.gz" \
+          || die "couldn't download flatpak-flutter"
+        mkdir -p "$FF" && tar xzf "$WORK/ff.tar.gz" -C "$FF" --strip-components=1
+      fi
+      FV="$( { at "$TAG_REF" "$(pp .fvmrc)" | sed -nE 's/.*"flutter"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p'
+               at "$TAG_REF" "$(pp .fvm/fvm_config.json)" | sed -nE 's/.*"flutterSdkVersion"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p'; } 2>/dev/null | sed -n 1p)"
+      fh_py - "$FF/flatpak-flutter.py" "$WD/flatpak-flutter.yml" "$WEB" "$APP_ID" "$MAIN_GUESS" "$RTV" "$GITURL" "$TAG" "$REV" "$TAGPAT" \
+            "${FV:-}" "$PROOT" "$INSTALLS" "$FINISH" <<'PY' || die "couldn't make the flatpak-flutter manifest"
+import importlib.util, json, sys, yaml
+ff, out, web, app_id, cmd, rtv, giturl, tag, rev, tagpat, fv, proot, installs, finish = sys.argv[1:15]
+spec = importlib.util.spec_from_file_location("ff", ff); mod = importlib.util.module_from_spec(spec)
+sys.argv = [ff]; spec.loader.exec_module(mod)
+m = mod._generate_template_for_url(web, app_id, cmd)
+m["runtime-version"] = rtv
+m["finish-args"] = json.loads(finish)
+app = m["modules"][0]
+if proot != ".":
+    app["subdir"] = proot
+app["build-commands"] += [l for l in installs.splitlines() if l.strip()]
+for s in app["sources"]:
+    if "flutter/flutter" in s["url"]:
+        if fv: s["tag"] = fv
+    else:
+        s.update({"url": giturl, "tag": tag, "commit": rev, "x-checker-data": {"type": "git", "tag-pattern": tagpat}})
+MOD_ORDER = ["name", "buildsystem", "build-options", "make-args", "make-install-args", "rm-configure", "no-autogen",
+             "no-parallel-make", "subdir", "builddir", "run-tests", "license-files", "only-arches", "skip-arches",
+             "config-opts", "build-commands", "post-install", "cleanup", "sources", "modules"]
+def ordered(mod):
+    if not isinstance(mod, dict):
+        return mod
+    out = {k: mod[k] for k in MOD_ORDER if k in mod}
+    out.update({k: v for k, v in mod.items() if k not in out})
+    if "modules" in out:
+        out["modules"] = [ordered(x) for x in out["modules"]]
+    return out
+m["modules"] = [ordered(x) for x in m["modules"]]
+class D(yaml.SafeDumper):
+    def increase_indent(self, flow=False, indentless=False):
+        return super().increase_indent(flow, False)
+with open(out, "w") as f:
+    yaml.dump(m, f, Dumper=D, sort_keys=False, indent=2, width=4096)
+PY
+      ok "flatpak-flutter.yml from flatpak-flutter's template (Flutter ${FV:-its default})"
+      GENERATED_BY=flatpak-flutter
+    else
+      # Rust, Meson, CMake: the recipes from Flathub's docs and the cargo generator's README
+      EXT=""; BUILD_JSON=""
+      case "$KIND" in
+        rust)
+          EXT='["org.freedesktop.Sdk.Extension.rust-stable"]'
+          BUILD_JSON="$(python3 -c 'import json,sys; m,b,i=sys.argv[1:4]; print(json.dumps({"name": m, "buildsystem": "simple",
+  "build-options": {"append-path": "/usr/lib/sdk/rust-stable/bin", "env": {"CARGO_HOME": "/run/build/%s/cargo" % m, "CARGO_NET_OFFLINE": "true"}},
+  "build-commands": ["cargo --offline fetch --manifest-path Cargo.toml --verbose", "cargo build --offline --release --all-features",
+                     "install -Dm0755 target/release/%s ${FLATPAK_DEST}/bin/%s" % (b, b)] + [l for l in i.splitlines() if l.strip()]}))' "$MODULE" "$MAIN_GUESS" "$INSTALLS")" ;;
+        meson)
+          BUILD_JSON="$(python3 -c 'import json,sys; m,i=sys.argv[1:3]; d={"name": m, "buildsystem": "meson"}
+if i.strip(): d["post-install"]=[l for l in i.splitlines() if l.strip()]
+print(json.dumps(d))' "$MODULE" "$INSTALLS")" ;;
+        cmake)
+          BUILD_JSON="$(python3 -c 'import json,sys; m,i=sys.argv[1:3]; d={"name": m, "buildsystem": "cmake-ninja", "builddir": True, "config-opts": ["-DCMAKE_BUILD_TYPE=Release"]}
+if i.strip(): d["post-install"]=[l for l in i.splitlines() if l.strip()]
+print(json.dumps(d))' "$MODULE" "$INSTALLS")" ;;
+      esac
+      fh_py - "$WD/$APP_ID.yml" "$APP_ID" "$RUNTIME" "$RTV" "$SDK" "${EXT:-[]}" "$MAIN_GUESS" "$FINISH" "$BUILD_JSON" \
+            "$GITURL" "$TAG" "$REV" "$TAGPAT" "$KIND" <<'PY' || die "couldn't write the manifest"
+import json, sys, yaml
+out, app_id, rt, rtv, sdk, ext, cmd, finish, build, giturl, tag, rev, tagpat, kind = sys.argv[1:15]
+m = {"id": app_id, "runtime": rt, "runtime-version": rtv, "sdk": sdk}
+if json.loads(ext): m["sdk-extensions"] = json.loads(ext)
+m["command"] = cmd
+m["finish-args"] = json.loads(finish)
+mod = json.loads(build)
+mod["sources"] = [{"type": "git", "url": giturl, "tag": tag, "commit": rev,
+                   "x-checker-data": {"type": "git", "tag-pattern": tagpat}}]
+if kind == "rust":
+    mod["sources"].append("cargo-sources.json")
+MOD_ORDER = ["name", "buildsystem", "build-options", "make-args", "make-install-args", "rm-configure", "no-autogen",
+             "no-parallel-make", "subdir", "builddir", "run-tests", "license-files", "only-arches", "skip-arches",
+             "config-opts", "build-commands", "post-install", "cleanup", "sources", "modules"]
+def ordered(mod):
+    if not isinstance(mod, dict):
+        return mod
+    out = {k: mod[k] for k in MOD_ORDER if k in mod}
+    out.update({k: v for k, v in mod.items() if k not in out})
+    if "modules" in out:
+        out["modules"] = [ordered(x) for x in out["modules"]]
+    return out
+m["modules"] = [ordered(mod)]
+class D(yaml.SafeDumper):
+    def increase_indent(self, flow=False, indentless=False):
+        return super().increase_indent(flow, False)
+with open(out, "w") as f:
+    yaml.dump(m, f, Dumper=D, sort_keys=False, indent=2, width=4096)
+PY
+      MANIFEST="$APP_ID.yml"
+      ok "wrote $MANIFEST ($KIND, following Flathub's documented recipe)"
+      [ "$KIND" = rust ] && GENERATED_BY=cargo
+    fi
+  fi
+fi
+
+# --- the offline dependency sources, from the community tools Flathub points to
+case "$GENERATED_BY" in
+  flatpak-flutter)
+    FF="$CACHE/flatpak-flutter-$FF_VERSION"
+    if [ ! -f "$FF/flatpak-flutter.py" ]; then
+      curl -fsL --retry 3 -o "$WORK/ff.tar.gz" "https://github.com/TheAppgineer/flatpak-flutter/archive/refs/tags/$FF_VERSION.tar.gz" \
+        && mkdir -p "$FF" && tar xzf "$WORK/ff.tar.gz" -C "$FF" --strip-components=1 || die "couldn't download flatpak-flutter"
+    fi
+    in_wd() { ( cd "$WD" && "$@" ); }
+    run_logged "$WORK/ff-run.log" "flatpak-flutter: pinning every Dart package and the Flutter SDK (a while)" \
+      in_wd fh_py "$FF/flatpak-flutter.py" flatpak-flutter.yml \
+      || { tail -n 12 "$WORK/ff-run.log" | sed 's/^/     /'; KEEP_WORK=1; die "flatpak-flutter failed — log: $WORK/ff-run.log"; }
+    MANIFEST=""
+    for f in "$APP_ID.yml" "$APP_ID.yaml" "$APP_ID.json"; do [ -f "$WD/$f" ] && { MANIFEST="$f"; break; }; done
+    [ -n "$MANIFEST" ] || die "flatpak-flutter didn't write $APP_ID.yml"
+    rm -rf "$WD/.flatpak-builder"
+    ok "flatpak-flutter wrote $MANIFEST and generated/ (the offline sources)" ;;
+  cargo)
+    GEN="$CACHE/flatpak-builder-tools-${FBT_COMMIT:0:12}/flatpak-cargo-generator.py"
+    if [ ! -f "$GEN" ]; then
+      mkdir -p "$(dirname "$GEN")"
+      curl -fsL --retry 3 -o "$GEN" "https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/$FBT_COMMIT/cargo/flatpak-cargo-generator.py" \
+        || die "couldn't download flatpak-cargo-generator"
+    fi
+    at "$TAG_REF" Cargo.lock > "$WORK/Cargo.lock"
+    run_logged "$WORK/cargo-gen.log" "flatpak-cargo-generator: listing every crate as a source" \
+      fh_py "$GEN" "$WORK/Cargo.lock" -o "$WD/cargo-sources.json" \
+      || { tail -n 8 "$WORK/cargo-gen.log" | sed 's/^/     /'; die "flatpak-cargo-generator failed"; }
+    ok "cargo-sources.json ($(grep -c '"type"' "$WD/cargo-sources.json") sources)" ;;
+esac
+
+# ============================================================ 5. build + lint
+step "5/6  Build and lint"
+in_wd() { ( cd "$WD" && "$@" ); }
+while :; do
+  if run_logged "$WORK/build.log" "building like Flathub does (offline, in the sandbox — a first build takes a while)" \
+       in_wd fb flathub-build --install "$MANIFEST"; then
+    ok "built and installed $APP_ID for your user"
+    break
+  fi
+  bad "the build failed:"
+  grep -vE '^\s*$' "$WORK/build.log" | tail -n 15 | cut -c1-200 | sed 's/^/     /'
+  grep -qE "Could not resolve|Failed to download|network" "$WORK/build.log" \
+    && note "a download failed — Flathub builds have no network; every dependency must be a source in the manifest"
+  [ "$ASSUME_YES" = 1 ] && { KEEP_WORK=1; die "the build failed (log: $WORK/build.log)"; }
+  say "e) edit $MANIFEST (in ${EDITOR:-vi}), then build again     l) read the whole log"
+  say "r) build again as it is     q) quit"
+  ask CHOICE "Choice" "e"
+  case "$CHOICE" in
+    e|E) "${EDITOR:-vi}" "$WD/$MANIFEST" ;;
+    l|L) "${PAGER:-less}" "$WORK/build.log" || cat "$WORK/build.log" ;;
+    q|Q) note "the manifest is in $WD"; exit 1 ;;
+  esac
+done
+
+# Flathub's linter, on the manifest and on the build — the same checks as CI
+LINT_OK=1
+for what in "manifest $MANIFEST" "repo repo"; do
+  # shellcheck disable=SC2086
+  in_wd fb flatpak-builder-lint $what > "$WORK/lint.json" 2>"$WORK/lint.err" || true
+  python3 - "$WORK/lint.json" "${what%% *}" > "$WORK/lint.txt" <<'PY' || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for kind in ("errors", "warnings"):
+    for e in d.get(kind, []) or []:
+        print("%s %s https://docs.flathub.org/docs/for-app-authors/linter#%s" % (kind[:-1], e, e))
+for m in d.get("message", []) if isinstance(d.get("message"), list) else []:
+    print("info", m, "")
+PY
+  if grep -q '^error ' "$WORK/lint.txt"; then
+    LINT_OK=0; bad "Flathub's linter (${what%% *}) found errors:"
+    grep '^error ' "$WORK/lint.txt" | while read -r _ id url; do printf '       %s\n         %s%s%s\n' "$id" "$DIM" "$url" "$R"; done
+  else
+    ok "Flathub's linter (${what%% *}): no errors"
+  fi
+  grep '^warning ' "$WORK/lint.txt" | while read -r _ id url; do warn "linter warning: $id — $url"; done
+done
+if [ "$LINT_OK" = 0 ]; then
+  note "an error that's intended can get an exception from Flathub: https://docs.flathub.org/docs/for-app-authors/linter#exceptions"
+  [ "$ASSUME_YES" = 1 ] || confirm "Carry on anyway? (the reviewers will see the same errors)" n || { note "the manifest is in $WD"; exit 1; }
+  handoff_add "Fix the linter errors above, or ask for an exception in the pull request"
+fi
+
+# try it out
+TESTED=0
+if [ "$ASSUME_YES" = 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  if confirm "Start $APP_ID now to check it works? (close it to carry on)" y; then
+    flatpak run --user "$APP_ID" >"$WORK/run.log" 2>&1 || true
+    confirm "Did it work?" y && TESTED=1
+    [ "$TESTED" = 1 ] || { tail -n 15 "$WORK/run.log" | sed 's/^/     /'; handoff_add "Fix what went wrong when running it (output above), then run the wizard again"; }
+  fi
+fi
+
+# ============================================================== 6. hand-off
+step "6/6  Hand-off"
+PR_FILES="$(cd "$WD" && find . -path ./.flatpak-builder -prune -o -path ./builddir -prune -o -path ./repo -prune -o -path ./.git -prune \
+  -o -type f ! -name '*.flatpak' -print | sed 's#^\./##' | sort)"
+say "Files for the pull request:"
+printf '%s\n' "$PR_FILES" | sed 's/^/     /'
+save_answers
+if [ "$DRYRUN" = 1 ]; then
+  warn "dry run — your fork isn't touched; the files are in $WD"
+  exit 0
+fi
+have gh || die "gh (GitHub CLI) is needed to put the branch in your fork"
+gh auth status --hostname github.com >/dev/null 2>&1 || {
+  [ "$ASSUME_YES" = 1 ] && die "run 'gh auth login' first"
+  confirm "gh isn't logged in to GitHub — log in now?" y && gh auth login --hostname github.com || true
+  gh auth status --hostname github.com >/dev/null 2>&1 || die "not logged in to GitHub"; }
+GH_USER="$(gh api user --jq .login)"
+if [ "$MODE" = new ]; then UPREPO="$FLATHUB_REPO"; BASE=new-pr; BRANCH="$APP_ID"; TITLE="Add $APP_ID"
+else UPREPO="flathub/$APP_ID"; BASE=master; BRANCH="update-$VERSION"; TITLE="Update to $VERSION"; fi
+
+# your fork (all branches: new submissions start from new-pr)
+FORK="$(gh api "repos/$GH_USER/${UPREPO#*/}" --jq "select(.fork and .parent.full_name == \"$UPREPO\") | .name" 2>/dev/null || true)"
+if [ -z "$FORK" ]; then
+  go "Fork $UPREPO to your GitHub account?" || die "the branch needs a fork to live in"
+  gh repo fork "$UPREPO" --clone=false >"$WORK/fork.log" 2>&1 || { cat "$WORK/fork.log"; die "couldn't fork $UPREPO"; }
+  FORK="$(grep -oE "$GH_USER/[A-Za-z0-9._-]+" "$WORK/fork.log" | head -1 | cut -d/ -f2)"; FORK="${FORK:-${UPREPO#*/}}"
+  for _ in $(seq 1 40); do gh api "repos/$GH_USER/$FORK" >/dev/null 2>&1 && break; sleep 3; done
+fi
+ok "fork: https://github.com/$GH_USER/$FORK"
+PRDIR="$CACHE/flathub/pr-${UPREPO#*/}-$APP_ID"
+rm -rf "$PRDIR"
+run_logged "$WORK/prclone.log" "fetching $UPREPO ($BASE)" \
+  git clone -q --single-branch --branch "$BASE" -o upstream "https://github.com/$UPREPO.git" "$PRDIR" \
+  || die "couldn't fetch $UPREPO"
+git -C "$PRDIR" checkout -q -b "$BRANCH"
+( cd "$WD" && printf '%s\n' "$PR_FILES" | while read -r f; do mkdir -p "$PRDIR/$(dirname "$f")"; cp "$f" "$PRDIR/$f"; done )
+git -C "$PRDIR" add -A
+git -C "$PRDIR" -c user.name="$MAINT_NAME" -c user.email="${MAINT_EMAIL:-$(git -C "$REPO" config user.email)}" commit -q -m "$TITLE"
+push_fork() {
+  git -C "$PRDIR" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+    push -f "https://github.com/$GH_USER/$FORK.git" "$BRANCH:$BRANCH"
+}
+go "Push the branch $BRANCH to $GH_USER/$FORK?" || { note "the files are in $PRDIR"; exit 0; }
+run_logged "$WORK/push.log" "pushing $BRANCH to your fork" push_fork || {
+  tail -n 4 "$WORK/push.log" | sed 's/^/     /'
+  grep -qiE "authentication|403|permission" "$WORK/push.log" && note "gh's login may have expired: gh auth status"
+  die "the push failed — the files are in $PRDIR"; }
+[ "$(git -C "$PRDIR" ls-remote "https://github.com/$GH_USER/$FORK.git" "refs/heads/$BRANCH" | cut -f1)" = "$(git -C "$PRDIR" rev-parse HEAD)" ] \
+  || die "your fork's $BRANCH doesn't match what was pushed"
+ok "pushed: https://github.com/$GH_USER/$FORK/tree/$BRANCH"
+
+# already an update PR from Flathub's bot for this version?
+if [ "$MODE" = update ]; then
+  BOTPR="$(gh pr list -R "$UPREPO" --state open --json number,title,url --jq ".[] | select(.title | contains(\"$VERSION\")) | .url" 2>/dev/null | head -1 || true)"
+  [ -n "$BOTPR" ] && { warn "there's already an open pull request for $VERSION: $BOTPR"; handoff_add "Check $BOTPR first — Flathub's update bot may have made one already; then you don't need a new one"; }
+fi
+
+ENC="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$TITLE")"
+PR_LINK="https://github.com/$UPREPO/compare/$BASE...$GH_USER:$FORK:$BRANCH?expand=1&title=$ENC"
+handoff_add "Open the pull request — the link below fills in the branch and the title ($TITLE)"
+if [ "$MODE" = new ]; then
+  handoff_add "In the pull request, fill in Flathub's checklist yourself"
+  handoff_add "Flathub's AI policy: say in the pull request whether AI-generated material is in your app or its packaging. This manifest was made by $( [ "$GENERATED_BY" = flatpak-flutter ] && echo "flatpak-flutter" || echo "store-submit.sh") (store-submit.sh was written with AI help) — state it as it is; reviewers decide (https://docs.flathub.org/docs/for-app-authors/requirements#generative-ai-policy)"
+  handoff_add "Answer the reviewers yourself; when they're done, comment \"bot, build\" for a test build"
+  handoff_add "Turn on two-factor authentication on GitHub: after the merge you get an invite to flathub/$APP_ID — accept it within a week"
+  case "$APP_ID" in io.github.*|io.gitlab.*) handoff_add "Once it's live: flathub.org → Developer Portal → your app → Verification (log in with ${HOST%%.*})" ;; esac
+else
+  handoff_add "Install the test build from the bot's comment on the pull request, try it, then merge it"
+fi
+handoff_show "Your turn — Flathub wants a person to open this pull request" "$PR_LINK"
+}
+
+# ##########################################################################
 #   store-submit.sh <store> [options] — that store's wizard, directly
 # ##########################################################################
 case "${1-}" in
-  fdroid|play|nix) WIZARD="$1"; shift; "wizard_$WIZARD" "$@"; exit ;;
+  fdroid|play|linux|nix|aur|flathub) WIZARD="$1"; shift; "wizard_$WIZARD" "$@"; exit ;;
 esac
 
 # ##########################################################################
@@ -3861,6 +5730,7 @@ ASSUME_YES=0
 DRYRUN=0
 NOSAVE=0
 STORE_ARG=""
+DISTRO_ARG=""
 REPO_ARG=""
 CHECK_ONLY=0
 PASS=()        # everything after `--`, handed to the store's wizard verbatim
@@ -3872,8 +5742,7 @@ HERE="$(dirname "$SELF")"
 # id|name|wizard function (blank = not written yet)|one-line description
 STORES="fdroid|F-Droid|wizard_fdroid|free and open source Android apps, built from source by F-Droid
 play|Google Play|wizard_play|Android releases through the Play Developer API
-nix|Nixpkgs (Nix store)|wizard_nix|packages for Nix and NixOS, built from source by nixpkgs
-aur|AUR (Arch User Repository)||PKGBUILDs for Arch Linux — checks only, no wizard yet"
+linux|Linux (NixOS, Arch)|wizard_linux|Linux distributions — pick several, answer once"
 
 usage() {
   cat <<'USAGE'
@@ -3881,13 +5750,16 @@ store-submit.sh — pick a store, check the app and this machine, then run that
 store's wizard.
 
   store-submit.sh [options]             the store picker (options below)
-  store-submit.sh fdroid|play|nix ...   one store's wizard directly, e.g.
+  store-submit.sh fdroid|play|linux ... one store's wizard directly, e.g.
                                           store-submit.sh fdroid --yes
+  store-submit.sh nix|aur|flathub ...   one Linux distro's wizard directly
                                         (store-submit.sh <store> --help)
 
   -h, --help          show this text
   -s, --store LIST    store(s) to publish to, skipping the question:
-                      fdroid, play, nix, aur — comma-separated, or "all"
+                      fdroid, play, linux — comma-separated, or "all"
+                      (nix or aur here means linux with that distro)
+  -d, --distros LIST  for linux: the distros, skipping the question (nix, aur)
       --repo PATH     the app's checkout (default: the git repo you run it in)
   -c, --check         only run the checks; don't start any wizard
   -y, --yes           passed to the wizard(s); needs --store
@@ -3906,6 +5778,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help)    usage; exit 0 ;;
     -s|--store)   STORE_ARG="${2-}"; shift ;;
+    -d|--distros) DISTRO_ARG="${2-}"; shift ;;
     --repo)       REPO_ARG="${2-}"; shift ;;
     -c|--check)   CHECK_ONLY=1 ;;
     -y|--yes)     ASSUME_YES=1 ;;
@@ -3992,6 +5865,10 @@ parse_stores() {
       CHOSEN=(); for id in $(store_ids); do CHOSEN+=("$id"); done; return 0
     fi
     id=""
+    # a Linux distro's id stands for "linux, with that distro"
+    if [ -n "$(distro_field "$tok" 3)" ]; then
+      id=linux; DISTRO_ARG="$DISTRO_ARG${DISTRO_ARG:+,}$tok"
+    fi
     case "$tok" in
       *[!0-9]*) [ -n "$(store_field "$tok" 1)" ] && id="$tok" ;;
       *)        n=0; for i in $(store_ids); do n=$((n+1)); [ "$n" = "$tok" ] && id="$i"; done ;;
@@ -4025,6 +5902,27 @@ EOF
   done
 fi
 for id in "${CHOSEN[@]}"; do ok "$(store_field "$id" 2)"; done
+
+# --- Linux: which distributions (one set of answers serves all of them)
+LINUX_DISTROS=""
+case " ${CHOSEN[*]} " in
+  *" linux "*)
+    PRE_REPO="${REPO_ARG:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+    PRESET="$(sed -nE 's/^[[:space:]]*distros[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$PRE_REPO/.store-submit.conf" 2>/dev/null | tail -1)"
+    if [ -n "$DISTRO_ARG" ]; then
+      for d in $(printf '%s' "$DISTRO_ARG" | tr ',' ' '); do
+        [ -n "$(distro_field "$d" 3)" ] || die "no Linux distro '$d' with a wizard (one of: $(printf '%s\n' "$DISTROS" | awk -F'|' '$3 != "" { printf "%s ", $1 }'))"
+        case " $LINUX_DISTROS " in *" $d "*) ;; *) LINUX_DISTROS="$LINUX_DISTROS${LINUX_DISTROS:+ }$d" ;; esac
+      done
+    elif [ "$ASSUME_YES" = 1 ]; then
+      [ -n "$PRESET" ] || die "--yes with linux needs --distros (or a .store-submit.conf that names them)"
+      LINUX_DISTROS="$PRESET"
+    else
+      say "Linux: which distributions? One set of answers is used for all of them."
+      multi_select LINUX_DISTROS "$(distro_items)" "$PRESET"
+    fi
+    for d in $LINUX_DISTROS; do ok "  $(distro_field "$d" 2)"; done ;;
+esac
 if [ "${#PASS[@]}" -gt 0 ] && [ "${#CHOSEN[@]}" -gt 1 ]; then
   die "arguments after -- belong to one wizard; pick a single store to use them"
 fi
@@ -4231,36 +6129,61 @@ needs_play() {
   fi
 }
 
-needs_nix() {
+linux_needs() {  # what every Linux distro needs from the app
   common_git
-  [ -n "$ORIGIN" ] || need_fail "no 'origin' remote — nixpkgs builds from a public repository"
-  # nixpkgs packages Linux (and macOS) software: a Flutter app goes in as its
-  # Linux desktop build; a plain Android app can't go in at all.
+  [ -n "$ORIGIN" ] || need_fail "no 'origin' remote — Linux distributions build from a public repository"
+  # distros package Linux software: a Flutter app goes in as its Linux
+  # desktop build; a plain Android app can't go in at all.
   if [ -n "$FLUTTER_ANY" ]; then
     local where="in ${FLUTTER_ANY}/"; [ "$FLUTTER_ANY" = . ] && where="in the project root"
-    if [ -f "$REPO/$FLUTTER_ANY/linux/CMakeLists.txt" ]; then need_ok "Flutter Linux desktop target (what nixpkgs builds)"
+    if [ -f "$REPO/$FLUTTER_ANY/linux/CMakeLists.txt" ]; then need_ok "Flutter Linux desktop target (what the distros build)"
     else need_fail "no Linux desktop target — run 'flutter create --platforms=linux .' $where and commit it"; fi
-    [ -f "$REPO/$FLUTTER_ANY/pubspec.lock" ] && need_ok "pubspec.lock" || need_fail "no pubspec.lock — nixpkgs pins the Dart packages from it"
+    [ -f "$REPO/$FLUTTER_ANY/pubspec.lock" ] && need_ok "pubspec.lock" || need_fail "no pubspec.lock — the builds pin the Dart packages from it"
   elif is_android; then
-    need_fail "this is an Android app — nixpkgs packages software for Linux and macOS"
+    need_fail "this is an Android app — Linux distributions package software for Linux"
   fi
   [ -n "$LAST_TAG" ] || note "no tags yet — the wizard creates and pushes v<version>"
-  [ -n "$LICENSE_FILE" ] || need_warn "no LICENSE — nixpkgs treats software without one as unfree"
-  has_kind "Rust"    && { [ -f "$REPO/Cargo.lock" ] && need_ok "Cargo.lock" || need_fail "no Cargo.lock — buildRustPackage needs it committed"; }
+  [ -n "$LICENSE_FILE" ] || need_warn "no LICENSE — distros treat software without one as unfree"
+  has_kind "Rust"    && { [ -f "$REPO/Cargo.lock" ] && need_ok "Cargo.lock" || need_fail "no Cargo.lock — the builds need it committed"; }
   has_kind "Go"      && { [ -f "$REPO/go.sum" ] && need_ok "go.sum" || note "no go.sum — fine if it has no dependencies"; }
   has_kind "Node.js" && { [ -f "$REPO/package-lock.json" ] && need_ok "package-lock.json" \
-                          || need_fail "no package-lock.json — the wizard packages npm projects from it"; }
+                          || need_fail "no package-lock.json — the wizards package npm projects from it"; }
   has_kind "Python"  && { [ -f "$REPO/pyproject.toml" ] && need_ok "pyproject.toml" \
-                          || need_fail "no pyproject.toml — nixpkgs builds Python apps with pyproject = true"; }
+                          || need_fail "no pyproject.toml — the Python builds need it"; }
+  if [ -f "$REPO/.store-submit.conf" ]; then need_ok ".store-submit.conf: the answers from last time"
+  else note "no .store-submit.conf yet — the questions about the app are asked once, then kept there"; fi
   return 0
 }
+needs_nix() { note "nothing beyond the above — the wizard handles the rest"; }
+needs_linux() {
+  linux_needs
+  local d
+  for d in $LINUX_DISTROS; do
+    printf '   %sfor %s:%s\n' "$DIM" "$(distro_field "$d" 2)" "$R"
+    "needs_$d"
+  done
+}
 
+needs_flathub() {
+  # the metadata Flathub wants in the app itself (the wizard can write it)
+  local id m
+  id="$(sed -nE 's/^[[:space:]]*flathub-id[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$REPO/.store-submit.conf" 2>/dev/null | tail -1)"
+  [ -n "$id" ] && need_ok "Flathub app ID: $id" || note "the Flathub app ID is worked out and asked once (it's permanent there)"
+  m="$(git -C "$REPO" ls-files 2>/dev/null | grep -E '\.(metainfo|appdata)\.xml(\.in)?$' | head -1 || true)"
+  [ -n "$m" ] && need_ok "metainfo: $m" || note "no metainfo file yet — the wizard writes one for you to check and release"
+  note "you open the pull request yourself (Flathub's policy); the wizard ends with the link"
+  return 0
+}
 needs_aur() {
-  common_git
-  is_android && need_warn "the AUR is for Arch Linux packages — this looks like an Android app"
-  [ -n "$LAST_TAG" ] || need_warn "no tags — a PKGBUILD points at a release (or use a -git package)"
-  [ -n "$LICENSE_FILE" ] || need_warn "a PKGBUILD needs a license=() entry"
-  [ -f "$REPO/PKGBUILD" ] && need_ok "PKGBUILD in the repo"
+  # the AUR's first rule: nothing Arch already ships in its official repos
+  local name
+  name="$(sed -nE 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1/p' "$REPO/.store-submit.conf" 2>/dev/null | tail -1)"
+  name="${name:-$(basename "$REPO" | tr 'A-Z' 'a-z')}"
+  if curl -sf --max-time 15 "https://archlinux.org/packages/search/json/?name=$name" | grep -q '"pkgname"'; then
+    need_fail "Arch already ships '$name' in its official repos — the AUR doesn't take duplicates (pick another name)"
+  else
+    need_ok "'$name' isn't in Arch's official repos"
+  fi
   return 0
 }
 
@@ -4440,10 +6363,34 @@ tools_nix() {
   else note "  no nixpkgs checkout yet — the wizard asks where to put one (default $np; ~200 MB)"; fi
 }
 tools_aur() {
-  need makepkg "building the package and generating .SRCINFO"
-  need git     "pushing to the AUR"
-  need ssh     "the AUR only accepts pushes over SSH (register your key on aur.archlinux.org)"
-  want namcap  "linting the PKGBUILD and the built package"
+  need git       "the AUR repository"
+  need ssh       "the AUR only takes pushes over SSH"
+  need curl      "the source tarball and the AUR's package information"
+  need sha256sum "the source checksum"
+  local r="" key
+  for key in podman docker; do have "$key" && "$key" info >/dev/null 2>&1 && { r="$key"; break; }; done
+  if [ -n "$r" ]; then ok "$r — a clean test build in an Arch container, with namcap"
+  elif have makepkg; then ok "makepkg — test builds on this Arch system"
+  else warn "podman — optional, for a clean test build in an Arch container before publishing"; note "  $(install_hint podman)"; fi
+  key="$(sed -n "s/^SAVED_AUR_KEY=//p" "${XDG_CONFIG_HOME:-$HOME/.config}/aur-submit/last.conf" 2>/dev/null | tr -d "'\"")"
+  [ -n "$key" ] || { [ -f "$HOME/.ssh/aur" ] && key="$HOME/.ssh/aur"; }
+  if ssh ${key:+-i "$key" -o IdentitiesOnly=yes} -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+       aur@aur.archlinux.org list-repos >/dev/null 2>&1; then
+    ok "the AUR accepts your SSH key${key:+ ($key)}"
+  else
+    note "  the AUR doesn't know an SSH key of yours yet — the wizard walks you through it"
+  fi
+}
+tools_flathub() {
+  need flatpak "Flathub's builder and linter run as a Flatpak (NixOS: services.flatpak.enable = true)"
+  need python3 "Flathub's generators (flatpak-flutter, cargo)"
+  need gh      "your fork of the Flathub repository"
+  if have flatpak && flatpak info org.flatpak.Builder >/dev/null 2>&1; then ok "org.flatpak.Builder (Flathub's builder and linter)"
+  else note "  org.flatpak.Builder isn't installed — the wizard installs it (for your user)"; fi
+}
+tools_linux() {
+  local d
+  for d in $LINUX_DISTROS; do "tools_$d"; done
 }
 
 check_tools() {
@@ -4496,7 +6443,8 @@ for id in "${TODO[@]}"; do
   ARGS=("${FWD[@]+"${FWD[@]}"}")
   # the F-Droid and nixpkgs wizards take the checkout as --repo; the Play one
   # asks, offering the directory it runs in.
-  case "$id" in fdroid|nix) ARGS+=(--repo "$REPO") ;; esac
+  case "$id" in fdroid) ARGS+=(--repo "$REPO") ;; esac
+  [ "$id" = linux ] && ARGS+=(--repo "$REPO" --distros "$(printf '%s' "$LINUX_DISTROS" | tr ' ' ',')")
   ARGS+=("${PASS[@]+"${PASS[@]}"}")
   printf '\n%s━━ %s (%d/%d): store-submit.sh %s %s%s\n' "$B$CYN" "$name" "$n" "${#TODO[@]}" "$id" "${ARGS[*]-}" "$R"
   # its own process: the wizard's traps, exits and variables stay its own
