@@ -1,18 +1,18 @@
 # store-submit.sh
 
 One script for publishing an app: to F-Droid and Google Play for Android, and
-to Linux distributions — NixOS (nixpkgs), Arch (AUR) and Flathub — from one
+to Linux — NixOS (nixpkgs), Arch (AUR), Flathub and the Snap Store — from one
 set of answers.
 
 - `store-submit.sh` — asks which store(s), checks what each needs from the
   app and what this machine has, then runs that store's wizard
 - `store-submit.sh fdroid|play|linux [options]` — one store's wizard directly
-- `store-submit.sh nix|aur|flathub [options]` — one Linux distro's wizard directly
+- `store-submit.sh nix|aur|flathub|snap [options]` — one Linux distro's wizard directly
   (each takes `--help`)
 
 Each wizard runs in a process of its own, so running one directly or from the
 picker behaves the same. Remembered answers stay in
-`~/.config/{store-submit,fdroid-submit,play-submit,nixpkgs-submit,aur-submit}/last.conf`;
+`~/.config/{store-submit,fdroid-submit,play-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit}/`;
 what the Linux packages say about the app is in `.store-submit.conf` in the
 app's own repository.
 
@@ -28,7 +28,7 @@ cd ~/path/to/your-app
 | flag | effect |
 | --- | --- |
 | `-s`, `--store LIST` | `fdroid`, `play`, `linux`, comma-separated, or `all` (`nix` or `aur` = `linux` with that distro) |
-| `-d`, `--distros LIST` | for `linux`: the distros (`nix`, `aur`, `flathub`), skipping the checkbox list |
+| `-d`, `--distros LIST` | for `linux`: the distros (`nix`, `aur`, `flathub`, `snap`), skipping the checkbox list |
 | `--repo PATH` | the app's checkout (default: the git repo you run it in) |
 | `-c`, `--check` | run the checks, start no wizard |
 | `-y`, `-n`, `--no-save` | passed on to the wizard(s); `--yes` needs `--store` |
@@ -326,8 +326,9 @@ Publishes one app to several Linux distributions in one go:
    and lists everything left for you to do (like opening Flathub's pull
    request)
 
-With Flathub among the distros, its two questions — the app ID and whether
-the app uses the internet — are part of step 2 too.
+With Flathub or the Snap Store among the distros, their questions — the
+Flathub app ID, the snap name, and whether the app uses the internet (asked
+once for both) — are part of step 2 too.
 
 The answers go into `.store-submit.conf` in the app's repository — a plain
 `key = value` file, read (never executed), yours to edit and commit:
@@ -593,3 +594,52 @@ Any store that wants a person to open the pull request can end the same way:
 
 - Flatpak (NixOS: `services.flatpak.enable = true;`), `git`, `python3`, `gh`
 - a GitHub account with two-factor authentication (for the maintainer invite)
+
+## Snap Store: `store-submit.sh snap`
+
+Publishes an app to the [Snap Store](https://snapcraft.io), or a new version,
+following [Snapcraft's documentation](https://ubuntu.com/docs/snapcraft/stable/how-to/publishing/).
+The Snap Store has no rule against automated uploads; instead it reviews
+every new snap and revision before it's public, so the wizard publishes by
+itself and tells you when a release waits for that review.
+
+```bash
+~/path/to/store-submit.sh snap            # new snap or update
+~/path/to/store-submit.sh snap --dry-run  # build it; register and upload nothing
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing (the first login still needs you) |
+| `--ask` | ask every question again |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--channel NAME` | `stable`, `candidate`, `beta` or `edge` (remembered) |
+| `-n`, `--dry-run` | build the snap; don't register or upload |
+| `--forget` | forget the remembered answers and the saved login |
+
+- **no snapcraft to install:** it runs in Canonical's own container image
+  (`ghcr.io/canonical/snapcraft:8_core24`) with podman or docker — so it works
+  on NixOS and any other distro. Files the container writes are handed back
+  to you
+- **login, once:** snapcraft asks for your Ubuntu One email, password and 2FA
+  itself; the exported login is kept in `~/.config/snap-submit/credentials`
+  (readable only by you), checked with `snapcraft whoami` each run, and
+  passed to the container as an environment variable, never on a command line
+- **snap name:** from your package name, checked against the store's rules
+  (≤ 40 characters, lowercase, digits, hyphens), asked once — it's unique
+  store-wide and permanent
+- **snapcraft.yaml:** yours if the repo has one (built from the release tag);
+  otherwise written for your build system — Flutter (the `flutter` plugin,
+  subdirectories included), Rust, Go, Python, npm, Meson, CMake, Make — on
+  `core24`, strict confinement, the `gnome` extension for graphical apps,
+  `network` only if the app uses it, your icon, and the source pinned to your
+  release tag
+- **build:** `snapcraft pack`, with its linter's remarks passed on; a failure
+  shows the log and offers edit / read the log / rebuild / quit
+- **register** the name (first time; a taken name is explained), **upload**
+  to your channel and show the store's status for it
+
+### What you need
+
+- podman or docker (NixOS: `virtualisation.podman.enable = true;`)
+- a free [Snapcraft developer account](https://snapcraft.io/account) (Ubuntu One)
