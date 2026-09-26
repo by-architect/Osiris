@@ -303,6 +303,7 @@ fdroid_checkout_runs() {  # fdroid_checkout_runs <dir>
 
 find_fdroid() {  # sets RUNNER; false if nothing usable was found
   local d ver
+  make_git_shim
   if have fdroid; then
     ver="$(fdroid --version 2>/dev/null | tail -1)"
     RUNNER=path; ok "fdroid ${ver:+$ver }on PATH ($(command -v fdroid))"
@@ -326,6 +327,7 @@ find_fdroid() {  # sets RUNNER; false if nothing usable was found
 }
 
 detect_runner() {
+  make_git_shim
   find_fdroid && return 0
   warn "fdroidserver is not installed (or not in the places this wizard looks)"
   say "It validates the metadata before you open the merge request. Install it"
@@ -349,11 +351,84 @@ detect_runner() {
   done
 }
 
+# Two things about this machine can stop fdroidserver's git calls dead, and
+# neither shows up until something tries to clone (checkupdates, build):
+#
+#  * /bin/true and /bin/false may not exist — they do not on NixOS, nor in slim
+#    containers. fdroidserver hardcodes both, to keep git from prompting and to
+#    block ssh URLs (CVE-2017-1000117), as -c options *and* as GIT_ASKPASS,
+#    SSH_ASKPASS and GIT_SSH (its common.py, VCSgit.git()). Nothing from outside
+#    can override all of those, and git dies with "cannot exec '/bin/false'".
+#
+#  * a personal `url.ssh://git@github.com/.insteadOf = https://github.com/` in
+#    ~/.gitconfig or ~/.config/git/config — a common convenience — turns every
+#    https clone into an ssh one, and fdroidserver blocks ssh on purpose. Its CI
+#    has no such rewrite, so this fails only on your machine.
+#
+# A git shim first on PATH fixes both for fdroid's calls alone: real binaries in
+# place of the missing ones, keeping fdroidserver's intent (an askpass that says
+# nothing, an ssh that refuses), and global git config out of the way when it
+# would reroute https to ssh.
+GIT_SHIM=""
+git_rewrites_https() {  # true if git turns an https forge URL into something else
+  local host out
+  for host in github.com gitlab.com codeberg.org; do
+    out="$(git ls-remote --get-url "https://$host/owner/repo.git" 2>/dev/null || true)"
+    case "$out" in
+      ''|https://*) ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
+}
+make_git_shim() {
+  [ -z "$GIT_SHIM" ] || return 0
+  local t f g need=0 drop_global=""
+  { [ -x /bin/true ] && [ -x /bin/false ]; } || need=1
+  if git_rewrites_https; then
+    need=1
+    drop_global="export GIT_CONFIG_GLOBAL=/dev/null"
+  fi
+  [ "$need" = 1 ] || return 0
+  t="$(type -P true || true)"; f="$(type -P false || true)"; g="$(type -P git || true)"
+  if [ -z "$t" ] || [ -z "$f" ] || [ -z "$g" ]; then
+    warn "no /bin/true, /bin/false or git replacement found — fdroid's clones may fail"
+    return 0
+  fi
+  GIT_SHIM="$WORK/gitshim"
+  mkdir -p "$GIT_SHIM"
+  cat > "$GIT_SHIM/git" <<SHIM
+#!/bin/sh
+# Written by store-submit.sh, for fdroid's git calls only. See the comment at
+# make_git_shim() for why each line is here.
+export GIT_ASKPASS='$t' SSH_ASKPASS='$t' GIT_SSH='$f' GIT_SSH_COMMAND='$f'
+$drop_global
+n=\$#
+while [ "\$n" -gt 0 ]; do
+  a=\$1; shift
+  case "\$a" in
+    core.askpass=/bin/true)     a='core.askpass=$t' ;;
+    core.sshCommand=/bin/false) a='core.sshCommand=$f' ;;
+  esac
+  set -- "\$@" "\$a"
+  n=\$((n - 1))
+done
+exec '$g' "\$@"
+SHIM
+  chmod +x "$GIT_SHIM/git"
+  { [ -x /bin/true ] && [ -x /bin/false ]; } \
+    || note "no /bin/true or /bin/false here — fdroid gets a git shim with the real ones"
+  if [ -n "$drop_global" ]; then
+    note "your git config rewrites https forge URLs to ssh, which fdroidserver blocks:"
+    note "fdroid's own git calls will ignore it (your config is untouched)"
+  fi
+}
+
 frun() {  # frun <fdroid args...>   — run inside $FDROIDDATA
   case "$RUNNER" in
-    path)     ( cd "$FDROIDDATA" && fdroid "$@" ) ;;
+    path)     ( cd "$FDROIDDATA" && PATH="${GIT_SHIM:+$GIT_SHIM:}$PATH" fdroid "$@" ) ;;
     checkout) ( cd "$FDROIDDATA" && \
-                PATH="$FDROIDSERVER_DIR:$PATH" \
+                PATH="${GIT_SHIM:+$GIT_SHIM:}$FDROIDSERVER_DIR:$PATH" \
                 PYTHONPATH="$FDROIDSERVER_DIR${PYTHONPATH:+:$PYTHONPATH}" \
                 "$FDROIDSERVER_DIR/fdroid" "$@" ) ;;
     none)     warn "skipped: fdroid $*"; return 0 ;;
