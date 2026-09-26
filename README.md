@@ -4,46 +4,81 @@ Two release wizards for the same Android app: one for F-Droid, one for Google Pl
 
 ## fdroid-submit.sh
 
-Interactive wizard for submitting an Android app to F-Droid — it produces the
-`metadata/<applicationId>.yml` entry and pushes a branch to your `fdroiddata`
-fork, ready for a merge request.
+Gets an Android app into F-Droid, or a new version of it: writes the
+`metadata/<applicationId>.yml` entry, validates it, pushes a branch to your
+`fdroiddata` fork and — with `glab` logged in — opens the merge request.
 
 ```bash
-./fdroid-submit.sh            # the wizard
-./fdroid-submit.sh --dry-run  # everything except the final push
-./fdroid-submit.sh --help
+cd ~/path/to/your-app
+~/path/to/fdroid-submit.sh            # first time: a few questions
+~/path/to/fdroid-submit.sh --yes      # every release after: one command
 ```
 
 | flag | effect |
 | --- | --- |
-| `-n`, `--dry-run` | stops short of `git commit` / `git push` |
+| `-y`, `--yes` | use everything detected, ask nothing; stops only on problems |
+| `--ask` | ask every question, including the ones it can answer itself |
+| `--repo PATH` | the app's checkout (default: the git repo you run it in) |
+| `--build` | also run the full `fdroid build` (slow) |
+| `--rfp` | also open a Request For Packaging issue (new apps) |
+| `-n`, `--dry-run` | no tagging, pushing, issues or merge requests |
 | `--no-save` | don't remember the answers |
 | `--forget` | delete the remembered answers and exit |
 
-It asks about everything it cannot work out for itself, and auto-detects:
-application ID, versionName, versionCode, the Gradle module, product flavours,
-the latest tag, the license, and the project URLs from the git remote. Answers
-that stay the same between runs (fork URL, GitLab user, license, categories…)
-are remembered in `~/.config/fdroid-submit/last.conf` and offered as defaults.
+### What it works out by itself
 
-Five stages: app repo → fdroiddata fork → metadata → validate → push.
-Nothing is pushed without confirming first.
+Detected values are shown as `✓` lines instead of questions:
+
+- **the app:** the repo you run it in, the Gradle module, application ID,
+  versionName and versionCode (from `pubspec.yaml` for Flutter)
+- **the release tag** `v<version>`: created on HEAD and pushed if missing,
+  pushed if only local, and checked to hold exactly this ID and version; a
+  stale tag can be moved (asked, never automatic)
+- **new app or update**, from upstream fdroiddata
+- **GitLab:** your username from `glab`, the fork (created if missing), the clone
+- **the metadata:** license from `LICENSE`, source/issue/changelog URLs from
+  the git remote, AuthorName/Email from git config, the Flutter version from
+  `.fvmrc`, no anti-features unless the pitfall check found proprietary bits
+- **validation:** `readmeta`, `rewritemeta` and `lint` run on their own; a
+  failure stops the run before anything is pushed
+- **the merge request:** title in fdroiddata's format (`New app: <name>`,
+  `Update <name> to <version>`), fdroiddata's own template as the description
+  with the checklist items it verified ticked, opened with `glab`
+
+What it asks: the **categories** (the first time for each app — remembered
+after), "Looks right?" for the metadata, and before each action that leaves
+your machine (tag push, branch push, merge request). `--yes` answers those;
+it never force-pushes and stops where only a person can decide (categories
+for a new app, a missing store listing, failing validation).
+
+### fdroiddata's rules it follows
+
+Taken from fdroiddata's merge request checklist and `templates/`:
+
+- `commit:` is the tag's **full commit hash**, not the tag name
+- an **AuthorName** is always set
+- Flutter apps get **one APK per CPU type** (armeabi-v7a, arm64-v8a, x86_64)
+  with Flutter's own versionCodes (1000/2000/4000 + code) and a matching
+  `VercodeOperation`, so auto-updates keep working
+- the Flutter version is read from the app's `.fvmrc` at build time
+  (`flutter@stable` + checkout), `pub get --enforce-lockfile`, and unused
+  platform folders (`ios`, `web`…) are removed before the build
+- `AutoUpdateMode` and `UpdateCheckData` are set so F-Droid picks up new tags
 
 ### New app or update
 
 The wizard looks up `metadata/<appid>.yml` on current upstream master and picks
 the right mode by itself:
 
-- **new app** — asks for license, categories, URLs, author, anti-features and the
-  publishing mode, and writes the whole file.
-- **update** — keeps the upstream file untouched apart from appending one
-  `Builds:` entry and bumping `CurrentVersion`/`CurrentVersionCode`. It refuses
-  if that versionCode is already there, and shows you the diff rather than the
-  whole file.
+- **new app** — writes the whole file.
+- **update** — keeps the upstream file untouched apart from appending this
+  release's `Builds:` entries and bumping `CurrentVersion`/`CurrentVersionCode`.
+  It refuses if those versionCodes are already there, and shows you the diff.
 
 The branch is always cut from `upstream/master` (`<appid>` for a new app,
 `<appid>-<versionCode>` for an update), so the merge request is a single-file
-change no matter what state your fork was left in.
+change no matter what state your fork was left in. A leftover
+`metadata/<appid>.yml` from an earlier run is reset automatically.
 
 ### Pitfall check
 
@@ -72,11 +107,9 @@ depends on the Flutter SDK, with `android/app/` beside it) is recognised:
 - the Gradle module defaults to `<flutter dir>/android/app`
 - versionName and versionCode come from `pubspec.yaml` (`version: 1.2.3+45`),
   since the Gradle file only holds `flutter.versionName`/`flutter.versionCode`
-- the build entry is the fdroiddata Flutter recipe instead of `gradle: yes`:
-  `subdir` is the Flutter project, Flutter itself is a pinned `srclibs` checkout,
-  `prebuild` runs `flutter pub get`, `build` runs `flutter build apk --release`
-  (with `--flavor` if you pick one), `output` points at the APK, and the pub
-  cache is `scandelete`d
+- the build entries follow fdroiddata's Flutter template instead of
+  `gradle: yes` (see "fdroiddata's rules it follows" above); a flavour you
+  pick is passed as `--flavor`
 - the Flutter version is read from `.fvmrc`, `.fvm/fvm_config.json` or
   `.tool-versions`, else from the local `flutter --version`. A pre-release (a
   master/beta build) is offered as its commit hash, with a warning — F-Droid
@@ -86,15 +119,20 @@ depends on the Flutter SDK, with `android/app/` beside it) is recognised:
 
 ### What you need beforehand
 
-- a **GitLab account** with a fork of <https://gitlab.com/fdroid/fdroiddata>
+- a **GitLab account** with a fork of <https://gitlab.com/fdroid/fdroiddata> —
+  once per account, reused for every app and update (each submission is a
+  branch in it). If it's missing, the wizard creates it with `glab` (offering
+  `glab auth login` first) or GitLab's API with `$GITLAB_TOKEN`, then waits for
+  GitLab to finish copying; without either it links the fork page. It won't
+  fork into an account other than the one in the fork URL.
 - the release **tag pushed** to your app's repository
 
 ### RFP issue (optional)
 
 A Request For Packaging issue isn't required when you send the metadata
 yourself — F-Droid's quick start guide calls that merge request the best way
-in. For new apps the wizard offers to open one anyway, after the metadata is
-written, filled from F-Droid's RFP template with your answers (categories,
+in. For new apps, `--rfp` (or answering yes under `--ask`) opens one after the
+metadata is written, filled from F-Droid's RFP template with your answers (categories,
 license, URLs) plus the summary and description from your fastlane listing.
 It uses the first of these that works:
 
