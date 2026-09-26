@@ -286,14 +286,20 @@ for cand in "${SAVED_SUBDIR:-}" "${FLUTTER_ANDROID:-}" app mobile android .; do
     fi
   done
 done
-ask SUBDIR "Gradle module subdirectory (the one with applicationId)" "${SUBDIR_GUESS:-app}"
-SUBDIR="${SUBDIR#./}"; SUBDIR="${SUBDIR%/}"
-
 GRADLE_FILE=""
-for gf in build.gradle.kts build.gradle; do
-  [ -f "$REPO/$SUBDIR/$gf" ] && GRADLE_FILE="$REPO/$SUBDIR/$gf" && break
+while :; do
+  ask SUBDIR "Gradle module subdirectory (the one with applicationId)" "${SUBDIR_GUESS:-app}"
+  SUBDIR="${SUBDIR#./}"; SUBDIR="${SUBDIR%/}"
+  for gf in build.gradle.kts build.gradle; do
+    [ -f "$REPO/$SUBDIR/$gf" ] && GRADLE_FILE="$REPO/$SUBDIR/$gf" && break
+  done
+  [ -n "$GRADLE_FILE" ] && break
+  warn "no build.gradle(.kts) in $SUBDIR/"
+  # An easy slip: typing the application ID here (it is asked next).
+  if printf '%s' "$SUBDIR" | grep -qE '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'; then
+    note "that looks like an application ID — this asks for a folder; the ID comes next"
+  fi
 done
-[ -n "$GRADLE_FILE" ] || die "no build.gradle(.kts) found in $REPO/$SUBDIR"
 ok "gradle file: ${GRADLE_FILE#"$REPO"/}"
 
 # --- detect identity and version
@@ -340,6 +346,27 @@ ask TAG "Git tag holding that release" "$TAG_GUESS"
 ORIGIN="$(git -C "$REPO" remote get-url origin 2>/dev/null || echo "")"
 if git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
   ok "tag $TAG -> $(git -C "$REPO" rev-list -n1 "$TAG" | cut -c1-12)"
+  # F-Droid builds the tag, not your working tree: it must hold this ID and
+  # version, or the build fails (e.g. a tag made before the ID was changed).
+  GRADLE_REL="${GRADLE_FILE#"$REPO"/}"
+  TAG_APPID="$(git -C "$REPO" show "$TAG:$GRADLE_REL" 2>/dev/null | sed -e 's,//.*,,' \
+    | grep -Eo "(^|[^A-Za-z_.])applicationId[[:space:]]*(=[[:space:]]*)?[\"'][A-Za-z0-9_.]+" \
+    | sed -E "s/.*applicationId[[:space:]]*(=[[:space:]]*)?[\"']//" | sed -n 1p)"
+  if [ -n "$TAG_APPID" ] && [ "$TAG_APPID" != "$APPID" ]; then
+    warn "tag $TAG builds applicationId '$TAG_APPID', not '$APPID'"
+    note "move the tag onto the commit with the new ID:"
+    note "  git tag -f $TAG <commit> && git push -f origin $TAG"
+    confirm "Continue anyway?" n || exit 1
+  fi
+  if [ -n "$FLUTTER_DIR" ]; then
+    PUB_REL="pubspec.yaml"; [ "$FLUTTER_DIR" != "." ] && PUB_REL="$FLUTTER_DIR/pubspec.yaml"
+    TAG_VERSION="$(git -C "$REPO" show "$TAG:$PUB_REL" 2>/dev/null \
+      | sed -nE "s/^version:[[:space:]]*[\"']?([^\"'[:space:]]+).*/\\1/p" | sed -n 1p)"
+    if [ -n "$TAG_VERSION" ] && [ "$TAG_VERSION" != "$VNAME+$VCODE" ]; then
+      warn "tag $TAG has version $TAG_VERSION in pubspec.yaml, not $VNAME+$VCODE"
+      confirm "Continue anyway?" n || exit 1
+    fi
+  fi
 else
   warn "tag '$TAG' does not exist locally"
 fi

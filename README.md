@@ -51,6 +51,8 @@ Before anything is written, the app repo is checked for the things that most
 often stall a merge request:
 
 - the release tag missing from the **remote** (F-Droid builds the published tag)
+- a tag that doesn't hold the **application ID and version** being submitted
+  (e.g. tagged before the ID was changed) — F-Droid would build the wrong thing
 - prebuilt binaries tracked in git (`.jar`, `.aar`, `.so`, `.apk`, `.keystore`…)
 - proprietary dependencies (Play Services, Firebase, Crashlytics, billing…),
   and for Flutter apps the plugins that pull them in (`firebase_*`,
