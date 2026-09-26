@@ -51,8 +51,11 @@ ASK_ALL=0      # --ask: ask every question, even the ones it can answer itself
 RUN_BUILD=0    # --build: run the full `fdroid build` as part of validation
 WANT_RFP=0     # --rfp: open an RFP issue without asking
 REPO_ARG=""
-CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/fdroid-submit"
-CONF="$CONF_DIR/last.conf"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/storepublisher"
+CONF="$CONF_DIR/last.conf"     # answers that carry across tasks (fork, clone, user)
+TASK_DIR="$CONF_DIR/tasks"     # one file per task: this store, this app, this version
+STORE_ID=fdroid
+PR_ONLY=0      # -p: pick a finished task and open its merge request
 
 usage() {
   cat <<'USAGE'
@@ -67,8 +70,11 @@ store-submit.sh fdroid — interactive wizard for getting an Android app into F-
       --rfp         open a Request For Packaging issue too (new apps)
   -n, --dry-run     do everything except pushing, tagging and opening issues/MRs
       --no-save     do not remember the answers for next time
-      --forget      delete the remembered answers and exit
-      --forget-app  forget one app: its answers and what was already pushed
+  -p, --pull-request  pick a task that pushed its branch and open its merge
+                    request — nothing else
+      --forget      delete every remembered answer and task, and exit
+      --forget-app  forget every task for one application id
+      --forget-task forget one task by name (as the task list shows it)
 
 Detects what it can from your app's git checkout and only asks for the rest,
 writes metadata/<applicationId>.yml into your fdroiddata fork, validates it,
@@ -86,11 +92,16 @@ while [ $# -gt 0 ]; do
     --build)      RUN_BUILD=1 ;;
     --rfp)        WANT_RFP=1 ;;
     --no-save)    SAVE=0 ;;
-    --forget)     rm -rf "$CONF" "$CONF_DIR/apps"; printf 'forgot %s and every app\n' "$CONF"; exit 0 ;;
+    --forget)     rm -rf "$CONF" "$TASK_DIR"; printf 'forgot %s and every task\n' "$CONF"; exit 0 ;;
+    -p|--pull-request) PR_ONLY=1 ;;
+    --forget-task) FORGET_TASK="${2-}"; shift
+                  [ -n "$FORGET_TASK" ] || { printf 'which task? --forget-task <name>\n' >&2; exit 2; }
+                  rm -f "$TASK_DIR/$FORGET_TASK.conf" "$TASK_DIR/$FORGET_TASK.mr.md"
+                  printf 'forgot task %s\n' "$FORGET_TASK"; exit 0 ;;
     --forget-app) FORGET_APP="${2-}"; shift
                   [ -n "$FORGET_APP" ] || { printf 'which app? --forget-app <applicationId>\n' >&2; exit 2; }
-                  rm -f "$CONF_DIR/apps/$FORGET_APP.conf"
-                  printf 'forgot %s\n' "$CONF_DIR/apps/$FORGET_APP.conf"; exit 0 ;;
+                  rm -f "$TASK_DIR/$STORE_ID-$FORGET_APP"-*.conf "$TASK_DIR/$STORE_ID-$FORGET_APP"-*.mr.md
+                  printf 'forgot every task for %s\n' "$FORGET_APP"; exit 0 ;;
     *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
@@ -302,33 +313,134 @@ save_answers() {
 # they check each other — but every question comes back with last time's answer
 # as its default, and every finished step is recognised instead of redone.
 declare -A MEM=()
-APP_STATE=""
-state_load() {  # state_load <appid>
-  local f="$CONF_DIR/apps/$1.conf" k
-  APP_STATE="$f"
-  [ -f "$f" ] || return 0
+TASK_FILE=""
+task_id() { printf '%s-%s-%s' "$STORE_ID" "${APPID:-unknown}" "${VCODE:-0}"; }
+
+read_task() {  # read_task <file> — merge its answers in, without overwriting this run's
+  local k
+  [ -f "$1" ] || return 0
   declare -A REM=()
   # shellcheck disable=SC1090
-  . "$f" || { warn "could not read $f"; return 0; }
-  # anything already answered in this run wins over the file
+  . "$1" || { warn "could not read $1"; return 0; }
   for k in "${!REM[@]}"; do
     [ -v "MEM[$k]" ] || MEM["$k"]="${REM[$k]}"
   done
 }
+state_load() {  # settle which task file this run belongs to, and load it
+  TASK_FILE="$TASK_DIR/$(task_id).conf"
+  read_task "$TASK_FILE"
+  remember ST_STORE "$STORE_ID"
+  remember ST_APPID "$APPID"
+  [ -n "$(recall ST_STATUS)" ] || remember ST_STATUS started
+}
 state_save() {
-  { [ "$SAVE" = 1 ] && [ -n "$APP_STATE" ]; } || return 0
+  { [ "$SAVE" = 1 ] && [ -n "$TASK_FILE" ]; } || return 0
   local k
-  mkdir -p "${APP_STATE%/*}"
+  mkdir -p "${TASK_FILE%/*}"
   {
-    printf '# store-submit.sh fdroid — remembered for %s\n' "${APPID:-?}"
-    printf '# delete this file, or run --forget-app, to start the app afresh\n'
+    printf '# store-submit.sh — task %s\n' "$(basename "${TASK_FILE%.conf}")"
+    printf '# delete this file, or run --forget-task, to start it afresh\n'
     for k in "${!MEM[@]}"; do printf 'REM[%s]=%q\n' "$k" "${MEM[$k]}"; done
-  } > "$APP_STATE.tmp" && mv "$APP_STATE.tmp" "$APP_STATE"
-  chmod 600 "$APP_STATE" 2>/dev/null || true
+  } > "$TASK_FILE.tmp" && mv "$TASK_FILE.tmp" "$TASK_FILE"
+  chmod 600 "$TASK_FILE" 2>/dev/null || true
 }
 remember() { MEM["$1"]="$2"; state_save; }
 recall()   { printf '%s' "${MEM[$1]:-}"; }
 done_with() { [ -n "${MEM[ST_$1]:-}" ]; }
+
+# The task files used to be one per app under ~/.config/fdroid-submit/apps.
+# Carry them over once so remembered answers survive the move.
+migrate_tasks() {
+  local old="${XDG_CONFIG_HOME:-$HOME/.config}/fdroid-submit" f appid
+  [ -d "$old" ] || return 0
+  [ -f "$CONF_DIR/.migrated" ] && return 0
+  mkdir -p "$TASK_DIR"
+  if [ -f "$old/last.conf" ] && [ ! -f "$CONF" ]; then cp "$old/last.conf" "$CONF"; fi
+  for f in "$old"/apps/*.conf; do
+    [ -f "$f" ] || continue
+    appid="$(basename "$f" .conf)"
+    (
+      declare -A REM=()
+      # shellcheck disable=SC1090
+      . "$f" 2>/dev/null || exit 0
+      local_status=started
+      [ -n "${REM[ST_BRANCH]:-}" ] && local_status=pushed
+      [ -n "${REM[ST_MR]:-}" ] && local_status=submitted
+      t="$TASK_DIR/$STORE_ID-$appid-${REM[VCODE]:-0}.conf"
+      [ -f "$t" ] && exit 0
+      {
+        printf '# migrated from %s\n' "$f"
+        for k in "${!REM[@]}"; do printf 'REM[%s]=%q\n' "$k" "${REM[$k]}"; done
+        printf 'REM[ST_STORE]=%q\n' "$STORE_ID"
+        printf 'REM[ST_APPID]=%q\n' "$appid"
+        printf 'REM[ST_STATUS]=%q\n' "$local_status"
+      } > "$t"
+      chmod 600 "$t" 2>/dev/null || true
+    )
+  done
+  mkdir -p "$CONF_DIR"
+  : > "$CONF_DIR/.migrated"
+}
+
+# task_rows — one line per task of this store, newest first:
+#   <file>TAB<appid>TAB<version>TAB<status>TAB<when>
+task_rows() {
+  local f
+  for f in $(ls -t "$TASK_DIR/$STORE_ID"-*.conf 2>/dev/null || true); do
+    [ -f "$f" ] || continue
+    (
+      declare -A REM=()
+      # shellcheck disable=SC1090
+      . "$f" 2>/dev/null || exit 0
+      printf '%s\t%s\t%s\t%s\t%s\n' "$f" \
+        "${REM[ST_APPID]:-${REM[APPID]:-?}}" \
+        "${REM[VNAME]:-?}+${REM[VCODE]:-?}" \
+        "${REM[ST_STATUS]:-started}" \
+        "${REM[ST_RUN]:-}"
+    )
+  done
+}
+
+# pick_task [status-filter] — show this store's tasks and load the chosen one.
+# Selecting one makes its answers the defaults for this run; with a filter, only
+# tasks in that state are offered. Returns 1 when nothing was picked.
+pick_task() {
+  local want="${1-}" rows=() row n=0 f appid ver st when choice
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    st="$(printf '%s' "$row" | cut -f4)"
+    [ -z "$want" ] || [ "$st" = "$want" ] || continue
+    rows+=("$row")
+  done <<EOF
+$(task_rows)
+EOF
+  [ "${#rows[@]}" -gt 0 ] || return 1
+  step "Tasks"
+  for row in "${rows[@]}"; do
+    n=$((n + 1))
+    appid="$(printf '%s' "$row" | cut -f2)"
+    ver="$(printf '%s' "$row" | cut -f3)"
+    st="$(printf '%s' "$row" | cut -f4)"
+    when="$(printf '%s' "$row" | cut -f5)"
+    printf '     %2d) %-34s %-12s %-10s %s\n' "$n" "$appid" "$ver" "$st" "$when"
+  done
+  [ -z "$want" ] && printf '     %2s) %s\n' "n" "start a new task"
+  if [ "$ASSUME_YES" = 1 ]; then choice=1; else
+    printf '   %sContinue%s [1]: ' "$B" "$R" >&2
+    readline choice
+    choice="${choice:-1}"
+  fi
+  case "$choice" in
+    n|N*) [ -z "$want" ] && return 1 ;;
+    *[!0-9]*|'') warn "not a number — starting fresh"; return 1 ;;
+  esac
+  [ "$choice" -ge 1 ] && [ "$choice" -le "${#rows[@]}" ] || { warn "no task $choice"; return 1; }
+  f="$(printf '%s' "${rows[$((choice - 1))]}" | cut -f1)"
+  read_task "$f"
+  TASK_FILE="$f"
+  ok "continuing $(basename "${f%.conf}")"
+  return 0
+}
 
 # ------------------------------------------------------------------- fdroid CLI
 # The wizard never installs fdroidserver itself. It uses the one you have:
@@ -477,6 +589,123 @@ frun() {  # frun <fdroid args...>   — run inside $FDROIDDATA
   esac
 }
 
+# ------------------------------------------------------- GitLab, and the fork
+# Definitions only, kept up here because `-p` below needs them before the main
+# flow has run: where the fork lives, how to ask GitLab things, and how to see
+# whether a branch already has a merge request.
+GL_API="${GITLAB_API_ROOT:-https://gitlab.com/api/v4}"
+FDROIDDATA_UPSTREAM="${FDROIDDATA_UPSTREAM:-https://gitlab.com/fdroid/fdroiddata.git}"
+glab_ready() { have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1; }
+
+glab_fd() {
+  if [ -d "${FDROIDDATA:-}/.git" ]; then
+    ( cd "$FDROIDDATA" && glab "$@" )
+  else
+    glab "$@"
+  fi
+}
+
+gitlab_get() {  # gitlab_get <api path> — authenticated GET, JSON on stdout
+  if glab_ready; then glab api "$1" 2>/dev/null || true
+  elif [ -n "${GITLAB_TOKEN:-}" ]; then
+    curl -s --max-time 20 -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$GL_API/$1" || true
+  fi
+}
+
+json_str() {  # json_str <key> — first "key":"value" in the JSON on stdin
+  grep -Eo "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed -n 1p | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/'
+}
+
+fork_path() {  # namespace/project from a gitlab.com clone URL, or nothing
+  printf '%s' "$1" | sed -nE 's#^(git@gitlab\.com:|https://gitlab\.com/|ssh://git@gitlab\.com/)##p' \
+    | sed -E 's#\.git$##'
+}
+
+urlencode() {  # percent-encode every byte except RFC 3986 unreserved ones
+  local LC_ALL=C s="$1" out="" c hex i
+  for ((i = 0; i < ${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      # bytes above 0x7F can come back sign-extended (FFFF…E2); the last
+      # two hex digits are the byte either way
+      *) printf -v hex '%02X' "'$c"; out+="%${hex: -2}" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+existing_mr() {
+  gitlab_get "projects/fdroid%2Ffdroiddata/merge_requests?state=opened&source_branch=$(urlencode "$BRANCH")" \
+    | grep -Eo 'https://[^"]*/-/merge_requests/[0-9]+' | head -1
+}
+
+# ------------------------------------------------- -p: just the merge request
+# A task that pushed its branch but never opened the merge request (glab not
+# logged in, you said no, the run stopped) can be finished here on its own.
+open_mr_for_task() {
+  local body title head
+  APPID="$(recall ST_APPID)"
+  BRANCH="$(recall ST_BRANCH)"
+  FDROIDDATA="$(recall FDROIDDATA)"
+  FORKURL="$(recall FORKURL)"
+  GLUSER="$(recall GLUSER)"
+  UPBRANCH="$(recall ST_UPBRANCH)"; UPBRANCH="${UPBRANCH:-master}"
+  title="$(recall ST_COMMITMSG)"; title="${title:-New app: $APPID}"
+  [ -n "$BRANCH" ] || die "that task has no pushed branch"
+  ok "app: $APPID"
+  ok "branch: $BRANCH -> fdroid/fdroiddata ($UPBRANCH)"
+  ok "title: $title"
+
+  MR_URL="$(existing_mr || true)"
+  if [ -n "$MR_URL" ]; then
+    ok "a merge request from $BRANCH is already open: $MR_URL"
+    remember ST_MR "$MR_URL"; remember ST_STATUS submitted
+    return 0
+  fi
+  body="${TASK_FILE%.conf}.mr.md"
+  if [ ! -s "$body" ]; then
+    body="$WORK/mr.md"
+    printf '%s\n\n' "$title" > "$body"
+    [ -n "$(recall ST_RFP_REF)" ] && printf 'Closes %s\n' "$(recall ST_RFP_REF)" >> "$body"
+    note "no saved description for this task — sending a short one"
+  fi
+  head="$(fork_path "$FORKURL")"
+  if glab_ready && [ -n "$head" ]; then
+    if ! go "Open the merge request on fdroid/fdroiddata now?"; then
+      say "nothing opened"; return 0
+    fi
+    MR_OUT="$(glab_fd mr create -R fdroid/fdroiddata -H "$head" \
+                -s "$BRANCH" -b "$UPBRANCH" -t "$title" \
+                -d "$(cat "$body")" --allow-collaboration -y 2>&1 || true)"
+    MR_URL="$(printf '%s\n' "$MR_OUT" | grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' | tail -1 || true)"
+    if [ -n "$MR_URL" ]; then
+      ok "merge request: $MR_URL"
+      remember ST_MR "$MR_URL"; remember ST_STATUS submitted
+      return 0
+    fi
+    warn "glab did not open it:"
+    printf '%s\n' "$MR_OUT" | tail -5 | sed 's/^/       /'
+  else
+    note "glab is not logged in to gitlab.com — here is the link instead"
+  fi
+  say "${B}Open it here:${R} https://gitlab.com/${GLUSER:-<you>}/fdroiddata/-/merge_requests/new?merge_request%5Bsource_branch%5D=$BRANCH&merge_request%5Btarget_branch%5D=$UPBRANCH"
+  note "target fdroid/fdroiddata, branch $UPBRANCH, title \"$title\""
+  note "the description is in $body"
+}
+
+if [ "$PR_ONLY" = 1 ]; then
+  migrate_tasks
+  step "Finished tasks waiting for a merge request"
+  if ! pick_task pushed; then
+    say "no task has a pushed branch without a merge request."
+    note "tasks live in $TASK_DIR"
+    exit 0
+  fi
+  open_mr_for_task
+  exit 0
+fi
+
 # =============================================================== 0. orientation
 cat <<BANNER
 
@@ -495,6 +724,13 @@ BANNER
 [ "$ASSUME_YES" = 1 ] && note "--yes: using everything detected; stopping only on problems"
 # New app or version update is decided later, from upstream fdroiddata itself.
 IS_UPDATE=0
+
+migrate_tasks
+# Pick up an earlier task, if there is one: its answers become this run's
+# defaults, so continuing where you stopped needs no retyping.
+if [ "$PR_ONLY" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -d "$TASK_DIR" ]; then
+  pick_task || true
+fi
 
 detect_runner
 
@@ -597,10 +833,20 @@ while :; do
   warn "'$APPID' is not a valid application ID (e.g. com.example.app)"
   APPID_GUESS=""
 done
-# Everything from here on is answered per app, and remembered per app.
-state_load "$APPID"
+auto VNAME "versionName" "$VNAME_GUESS"
+while :; do
+  auto VCODE "versionCode" "$VCODE_GUESS"
+  case "$VCODE" in ''|*[!0-9]*) [ "$ASSUME_YES" = 1 ] && die "versionCode '$VCODE' is not a plain integer"
+                                warn "versionCode must be a plain integer"; VCODE_GUESS="" ;; *) break ;; esac
+done
+
+# A task is one store, one app, one version: from here on every answer and every
+# milestone belongs to it. It can only be named now, since the version is part of
+# the name — a new version is a new task, and a new branch in the fork.
+state_load
 if done_with TAG || done_with BRANCH || done_with MR || done_with RELEASE; then
   step "Where you left off"
+  note "task: $(basename "${TASK_FILE%.conf}")"
   if done_with RUN;     then note "last run: $(recall ST_RUN)"; fi
   if done_with TAG;     then ok "tag pushed: $(recall ST_TAG)"; fi
   if done_with BRANCH;  then ok "branch on your fork: $(recall ST_BRANCH)"; fi
@@ -610,13 +856,6 @@ if done_with TAG || done_with BRANCH || done_with MR || done_with RELEASE; then
   note "anything already done is checked, not repeated — and can be redone"
 fi
 remember ST_RUN "$(date '+%Y-%m-%d %H:%M')"
-
-auto VNAME "versionName" "$VNAME_GUESS"
-while :; do
-  auto VCODE "versionCode" "$VCODE_GUESS"
-  case "$VCODE" in ''|*[!0-9]*) [ "$ASSUME_YES" = 1 ] && die "versionCode '$VCODE' is not a plain integer"
-                                warn "versionCode must be a plain integer"; VCODE_GUESS="" ;; *) break ;; esac
-done
 
 # --- tag: F-Droid builds the tag — so it must exist, be pushed, and hold
 # exactly this application ID and version. The wizard sorts that out itself.
@@ -1085,10 +1324,6 @@ FDROIDDATA="${FDROIDDATA%/}"
 # The usual first-run failure is a fork that doesn't exist yet, which git only
 # reports as "project not found or no permission". Forks of fdroiddata are
 # public, so GitLab's API can tell us up front.
-fork_path() {  # namespace/project from a gitlab.com clone URL, or nothing
-  printf '%s' "$1" | sed -nE 's#^(git@gitlab\.com:|https://gitlab\.com/|ssh://git@gitlab\.com/)##p' \
-    | sed -E 's#\.git$##'
-}
 check_fork() {
   local p code
   p="$(fork_path "$FORKURL")"
@@ -1107,10 +1342,7 @@ check_fork() {
 
 # Creating the fork: with glab when it's logged in, else GitLab's API with
 # $GITLAB_TOKEN. GitLab copies the repo in the background, so wait for it.
-GL_API="${GITLAB_API_ROOT:-https://gitlab.com/api/v4}"
 # where upstream fdroiddata is cloned from (overridable for testing)
-FDROIDDATA_UPSTREAM="${FDROIDDATA_UPSTREAM:-https://gitlab.com/fdroid/fdroiddata.git}"
-glab_ready() { have glab && glab auth status --hostname gitlab.com >/dev/null 2>&1; }
 
 # glab works out which project it is acting on partly from the current
 # directory's git remotes, even when -R and -H name the projects. The wizard's
@@ -1119,24 +1351,8 @@ glab_ready() { have glab && glab auth status --hostname gitlab.com >/dev/null 2>
 # to a known GitLab host. Configured remotes: github.com". Run it from the
 # fdroiddata clone instead: both of its remotes are gitlab.com, and the branch
 # being proposed actually exists there.
-glab_fd() {
-  if [ -d "${FDROIDDATA:-}/.git" ]; then
-    ( cd "$FDROIDDATA" && glab "$@" )
-  else
-    glab "$@"
-  fi
-}
 
-gitlab_get() {  # gitlab_get <api path> — authenticated GET, JSON on stdout
-  if glab_ready; then glab api "$1" 2>/dev/null || true
-  elif [ -n "${GITLAB_TOKEN:-}" ]; then
-    curl -s --max-time 20 -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$GL_API/$1" || true
-  fi
-}
 
-json_str() {  # json_str <key> — first "key":"value" in the JSON on stdin
-  grep -Eo "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed -n 1p | sed -E 's/.*:[[:space:]]*"([^"]*)"$/\1/'
-}
 
 create_fork() {  # asks GitLab to fork fdroid/fdroiddata into your namespace
   local code
@@ -1884,19 +2100,6 @@ RFP_REF=""
 GITLAB_API_ROOT="${GITLAB_API_ROOT:-https://gitlab.com/api/v4}"
 RFP_PROJECT="fdroid/rfp"
 
-urlencode() {  # percent-encode every byte except RFC 3986 unreserved ones
-  local LC_ALL=C s="$1" out="" c hex i
-  for ((i = 0; i < ${#s}; i++)); do
-    c="${s:i:1}"
-    case "$c" in
-      [a-zA-Z0-9.~_-]) out+="$c" ;;
-      # bytes above 0x7F can come back sign-extended (FFFF…E2); the last
-      # two hex digits are the byte either way
-      *) printf -v hex '%02X' "'$c"; out+="%${hex: -2}" ;;
-    esac
-  done
-  printf '%s' "$out"
-}
 
 fastlane_text() {  # fastlane_text <file> — first match in the usual places
   local f
@@ -2138,22 +2341,28 @@ if ! git -C "$FDROIDDATA" push -f -u origin "$BRANCH"; then
   die "push failed"
 fi
 ok "pushed $BRANCH ($((SECONDS - PUSH_T0))s)"
+# Everything the merge request needs later, so `-p` can open it on its own —
+# including the description, which is built from things only this run knows.
 remember ST_BRANCH "$BRANCH"
+remember ST_STATUS pushed
+remember ST_UPBRANCH "$UPBRANCH"
+remember ST_COMMITMSG "$COMMITMSG"
+remember ST_APPNAME "$APPNAME"
+remember ST_RFP_REF "${RFP_REF:-}"
+if [ -n "$TASK_FILE" ]; then
+  mr_description > "${TASK_FILE%.conf}.mr.md" 2>/dev/null || true
+fi
 
 # A re-run pushes the same branch again, and GitLab updates any open merge
 # request from it by itself. Creating a second one is impossible and reporting
 # a failure would be wrong, so look first.
-existing_mr() {
-  gitlab_get "projects/fdroid%2Ffdroiddata/merge_requests?state=opened&source_branch=$(urlencode "$BRANCH")" \
-    | grep -Eo 'https://[^"]*/-/merge_requests/[0-9]+' | head -1
-}
 MR_URL=""
 MR_OPEN="$(existing_mr || true)"
 if [ -n "$MR_OPEN" ]; then
   MR_URL="$MR_OPEN"
   ok "a merge request from $BRANCH is already open — the push above updated it"
   ok "$MR_URL"
-  remember ST_MR "$MR_URL"
+  remember ST_MR "$MR_URL"; remember ST_STATUS submitted
   note "CI re-runs on the new commit; nothing else to do here"
 elif glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
   mr_description > "$WORK/mr.md"
@@ -2163,7 +2372,7 @@ elif glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
   MR_URL="$(printf '%s\n' "$MR_OUT" | grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' | tail -1 || true)"
   if [ -n "$MR_URL" ]; then
     ok "merge request: $MR_URL"
-    remember ST_MR "$MR_URL"
+    remember ST_MR "$MR_URL"; remember ST_STATUS submitted
   else
     warn "glab did not open the merge request:"
     printf '%s\n' "$MR_OUT" | tail -5 | sed 's/^/       /'

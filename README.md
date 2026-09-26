@@ -11,9 +11,11 @@ set of answers.
   (each takes `--help`)
 
 Each wizard runs in a process of its own, so running one directly or from the
-picker behaves the same. Remembered answers stay in
-`~/.config/storepublisher/playstore/` for Google Play and
-`~/.config/{store-submit,fdroid-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit}/`
+picker behaves the same. F-Droid keeps one file per **task** — one store, one
+app, one version — in `~/.config/storepublisher/tasks/`, plus the answers that
+carry across tasks in `~/.config/storepublisher/last.conf`. Remembered answers
+for the others stay in `~/.config/storepublisher/playstore/` for Google Play and
+`~/.config/{store-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit}/`
 for the rest;
 what the Linux packages say about the app is in `.store-submit.conf` in the
 app's own repository.
@@ -77,8 +79,37 @@ cd ~/path/to/your-app
 | `--build` | also run the full `fdroid build` (slow) |
 | `--rfp` | also open a Request For Packaging issue (new apps) |
 | `-n`, `--dry-run` | no tagging, pushing, issues or merge requests |
+| `-p`, `--pull-request` | pick a task that pushed its branch and open its merge request — nothing else |
 | `--no-save` | don't remember the answers |
-| `--forget` | delete the remembered answers and exit |
+| `--forget` | delete every remembered answer and task |
+| `--forget-app ID` | forget every task for one application id |
+| `--forget-task NAME` | forget one task, named as the task list shows it |
+
+### Tasks
+
+A task is one store, one app, one version, kept in its own file under
+`~/.config/storepublisher/tasks/` — for example
+`fdroid-com.example.app-1001.conf`. It holds every answer that app was given
+and how far the submission got: `started`, `pushed` (branch on your fork), or
+`submitted` (merge request open).
+
+On startup the wizard lists the tasks it knows, newest first, and offers to
+continue one — the chosen task's answers become this run's defaults:
+
+```
+━━ Tasks
+      1) com.example.app        1.0+1001     pushed      2026-09-26 20:10
+      2) com.example.other      2.3+7        submitted   2026-09-20 11:02
+       n) start a new task
+   Continue [1]:
+```
+
+Bumping the version makes a new task, inheriting the answers of the one you
+continued, because it is a new branch and a new merge request.
+
+`-p` skips the wizard entirely: it lists the tasks that pushed a branch but
+never opened a merge request, and opens it for the one you pick, using the
+description saved when the branch was pushed.
 
 ### What it works out by itself
 
