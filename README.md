@@ -331,7 +331,33 @@ and any run that fails part-way deletes its edit instead of leaving it open.
 - the app **already created in Play Console**, with its store listing filled in.
   The API cannot create an app or its listing — do the first release by hand,
   everything after that with this script
-- a **signed** `.aab`/`.apk` (the script warns if it finds no signature block)
+- an **App Bundle**. Play has required one for every app created since August
+  2021; an `.apk` is only still accepted for an app that was published before
+  then, and the wizard says so before uploading one.
+
+  You do not have to build it yourself. If nothing has been built — or only an
+  APK has — the wizard offers to build the bundle, and sets up signing first if
+  the project has none:
+
+  1. creates an upload keystore in `~/.config/storepublisher/playstore/`
+     (outside the repo, so it cannot be committed), RSA 2048, valid 10000 days,
+     with a generated 32-character password you never have to type
+  2. writes `key.properties` at the Gradle root, mode 600, and adds it,
+     `*.jks`, `*.keystore` and `*.store-submit.orig` to `.gitignore`
+  3. appends a release `signingConfigs` block to the module's Gradle file —
+     purely additive, with the original kept beside it as
+     `build.gradle.kts.store-submit.orig`. A build that succeeds deletes the
+     backup; a build that fails restores it and prints the block for you
+  4. prints the upload certificate's SHA-1 and SHA-256 — the fingerprint Play
+     App Signing, Firebase and the Maps API all ask for
+  5. runs `flutter build appbundle --release` or `./gradlew :<module>:bundleRelease`
+
+  Before uploading, the artifact's certificate is read with `keytool`: an
+  unsigned one, or one signed with the Android debug key (which Play rejects
+  with a message that never mentions signing), stops the upload.
+
+  Back up the keystore and `key.properties`. Losing them means asking Google to
+  reset your upload key.
 
 Release notes are read from the same layout F-Droid uses, so both scripts share
 one source of truth:
