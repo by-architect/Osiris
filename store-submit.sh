@@ -2410,9 +2410,11 @@ api_fail() {  # api_fail "what was being done"
     sed 's/^/       /' "$API_BODY" >&2 | head -20
   fi
   case "$API_STATUS" in
-    401|403) note "the service account needs to be invited in Play Console under" >&2
-             note "Users and permissions, with release access to this app" >&2 ;;
-    404)     note "check the package name — the app must already exist in Play Console" >&2 ;;
+    401|403) note "the service account needs release access to this app, granted under" >&2
+             note "Play Console → Users and permissions → the account → App permissions" >&2
+             note "https://play.google.com/console/users-and-permissions" >&2 ;;
+    404)     note "check the package name — the app must already exist in Play Console" >&2
+             note "https://play.google.com/console/developers" >&2 ;;
   esac
   exit 1
 }
@@ -2440,12 +2442,20 @@ done
 step "1/5  Credentials"
 if [ -z "$KEYFILE" ] && [ -f "${SAVED_KEYFILE:-/nonexistent}" ]; then KEYFILE="$SAVED_KEYFILE"; fi
 if [ -z "$KEYFILE" ]; then
-  say "A service account JSON key is needed. Once, in the console:"
-  note "1. Google Cloud: enable the 'Google Play Android Developer API'"
-  note "2. create a service account there and download a JSON key"
-  note "3. Play Console → Users and permissions → Invite user → the service"
-  note "   account's email → grant release access to this app"
-  note "4. give it a few minutes to propagate"
+  say "A service account JSON key is needed. Four one-time steps:"
+  echo
+  say "1. enable the Google Play Android Developer API for a Cloud project"
+  note "     https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com"
+  say "2. create a service account, then Keys → Add key → Create new key → JSON"
+  note "     https://console.cloud.google.com/iam-admin/serviceaccounts"
+  say "3. Play Console → Users and permissions → Invite new users: paste the"
+  say "   service account's email and grant it release access to this app"
+  note "     https://play.google.com/console/users-and-permissions"
+  say "4. give the grant a few minutes to propagate"
+  echo
+  note "the account then shows up under https://play.google.com/console/api-access"
+  note "Google's own walkthrough: https://developers.google.com/android-publisher/getting_started"
+  echo
   ask KEYFILE "Path to the service account JSON key" "$CONF_DIR/service-account.json"
 fi
 KEYFILE="${KEYFILE/#\~/$HOME}"

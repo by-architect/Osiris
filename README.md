@@ -282,10 +282,17 @@ and any run that fails part-way deletes its edit instead of leaving it open.
 
 ### What it needs
 
-- a **service account JSON key**: enable the *Google Play Android Developer API*
-  in Google Cloud, create a service account, download a JSON key, then invite
-  that account's email in Play Console under *Users and permissions* and grant
-  it release access to the app
+- a **service account JSON key**, set up once:
+  1. enable the *Google Play Android Developer API* for a Cloud project —
+     <https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com>
+  2. create a service account, then *Keys → Add key → Create new key → JSON* —
+     <https://console.cloud.google.com/iam-admin/serviceaccounts>
+  3. invite that account's email in Play Console under *Users and permissions*
+     and grant it release access to the app —
+     <https://play.google.com/console/users-and-permissions>
+     (it then appears under <https://play.google.com/console/api-access>)
+
+  Google's walkthrough: <https://developers.google.com/android-publisher/getting_started>
 - the app **already created in Play Console**, with its store listing filled in.
   The API cannot create an app or its listing — do the first release by hand,
   everything after that with this script
