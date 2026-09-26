@@ -68,6 +68,7 @@ store-submit.sh fdroid — interactive wizard for getting an Android app into F-
   -n, --dry-run     do everything except pushing, tagging and opening issues/MRs
       --no-save     do not remember the answers for next time
       --forget      delete the remembered answers and exit
+      --forget-app  forget one app: its answers and what was already pushed
 
 Detects what it can from your app's git checkout and only asks for the rest,
 writes metadata/<applicationId>.yml into your fdroiddata fork, validates it,
@@ -85,7 +86,11 @@ while [ $# -gt 0 ]; do
     --build)      RUN_BUILD=1 ;;
     --rfp)        WANT_RFP=1 ;;
     --no-save)    SAVE=0 ;;
-    --forget)     rm -f "$CONF"; printf 'forgot %s\n' "$CONF"; exit 0 ;;
+    --forget)     rm -rf "$CONF" "$CONF_DIR/apps"; printf 'forgot %s and every app\n' "$CONF"; exit 0 ;;
+    --forget-app) FORGET_APP="${2-}"; shift
+                  [ -n "$FORGET_APP" ] || { printf 'which app? --forget-app <applicationId>\n' >&2; exit 2; }
+                  rm -f "$CONF_DIR/apps/$FORGET_APP.conf"
+                  printf 'forgot %s\n' "$CONF_DIR/apps/$FORGET_APP.conf"; exit 0 ;;
     *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
@@ -118,6 +123,8 @@ readline() {  # readline VAR — false on EOF
 # ask VAR "question" "default"   — empty default means required
 ask() {
   local __var="$1" __q="$2" __def="${3-}" __in=""
+  # nothing detected? then what this app answered last time is the default
+  [ -n "$__def" ] || __def="$(recall "$__var")"
   if [ "$ASSUME_YES" = 1 ]; then
     [ -n "$__def" ] || die "--yes: nothing to answer \"$__q\" with — run once without --yes"
     printf -v "$__var" '%s' "$__def"; ok "$__q: $__def"; return 0
@@ -134,17 +141,20 @@ ask() {
     break
   done
   printf -v "$__var" '%s' "$__in"
+  remember "$__var" "$__in"
 }
 
 ask_opt() {  # like ask, but blank is allowed and means "omit this field";
              # with a default, Enter keeps it and "-" leaves the field out
   local __var="$1" __q="$2" __def="${3-}" __in=""
+  [ -n "$__def" ] || __def="$(recall "$__var")"
   if [ "$ASSUME_YES" = 1 ]; then printf -v "$__var" '%s' "$__def"; return 0; fi
   printf '   %s%s%s%s: ' "$B" "$__q" "$R" "${__def:+ [$__def, - for none]}" >&2
   readline __in
   [ -z "$__in" ] && __in="$__def"
   [ "$__in" = - ] && __in=""
   printf -v "$__var" '%s' "$__in"
+  remember "$__var" "$__in"
 }
 
 confirm() {  # confirm "question" [default y|n] — --yes takes the default
@@ -171,8 +181,9 @@ go() {
 # (shown as a ✓ line); ask only when nothing was detected, or with --ask.
 auto() {
   local __var="$1" __label="$2" __val="${3-}"
+  [ -n "$__val" ] || __val="$(recall "$__var")"
   if [ "$ASK_ALL" = 0 ] && [ -n "$__val" ]; then
-    printf -v "$__var" '%s' "$__val"; ok "$__label: $__val"
+    printf -v "$__var" '%s' "$__val"; ok "$__label: $__val"; remember "$__var" "$__val"
   else
     ask "$__var" "$__label" "$__val"
   fi
@@ -180,8 +191,10 @@ auto() {
 
 auto_opt() {  # like auto, for optional fields: blank is fine and not asked
   local __var="$1" __label="$2" __val="${3-}"
+  [ -n "$__val" ] || __val="$(recall "$__var")"
   if [ "$ASK_ALL" = 0 ]; then
-    printf -v "$__var" '%s' "$__val"; [ -n "$__val" ] && ok "$__label: $__val"
+    printf -v "$__var" '%s' "$__val"; remember "$__var" "$__val"
+    [ -n "$__val" ] && ok "$__label: $__val"
     return 0
   fi
   ask_opt "$__var" "$__label" "$__val"
@@ -239,6 +252,41 @@ save_answers() {
   } > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
   chmod 600 "$CONF" 2>/dev/null || true
 }
+
+# ------------------------------------------------- what this app answered last
+# $CONF_DIR/apps/<appid>.conf holds every answer this app has been given, plus
+# the milestones that leave your machine (tag pushed, branch pushed, merge
+# request, release). A re-run walks all five sections again — that is the point,
+# they check each other — but every question comes back with last time's answer
+# as its default, and every finished step is recognised instead of redone.
+declare -A MEM=()
+APP_STATE=""
+state_load() {  # state_load <appid>
+  local f="$CONF_DIR/apps/$1.conf" k
+  APP_STATE="$f"
+  [ -f "$f" ] || return 0
+  declare -A REM=()
+  # shellcheck disable=SC1090
+  . "$f" || { warn "could not read $f"; return 0; }
+  # anything already answered in this run wins over the file
+  for k in "${!REM[@]}"; do
+    [ -v "MEM[$k]" ] || MEM["$k"]="${REM[$k]}"
+  done
+}
+state_save() {
+  { [ "$SAVE" = 1 ] && [ -n "$APP_STATE" ]; } || return 0
+  local k
+  mkdir -p "${APP_STATE%/*}"
+  {
+    printf '# store-submit.sh fdroid — remembered for %s\n' "${APPID:-?}"
+    printf '# delete this file, or run --forget-app, to start the app afresh\n'
+    for k in "${!MEM[@]}"; do printf 'REM[%s]=%q\n' "$k" "${MEM[$k]}"; done
+  } > "$APP_STATE.tmp" && mv "$APP_STATE.tmp" "$APP_STATE"
+  chmod 600 "$APP_STATE" 2>/dev/null || true
+}
+remember() { MEM["$1"]="$2"; state_save; }
+recall()   { printf '%s' "${MEM[$1]:-}"; }
+done_with() { [ -n "${MEM[ST_$1]:-}" ]; }
 
 # ------------------------------------------------------------------- fdroid CLI
 # The wizard never installs fdroidserver itself. It uses the one you have:
@@ -432,6 +480,20 @@ while :; do
   warn "'$APPID' is not a valid application ID (e.g. com.example.app)"
   APPID_GUESS=""
 done
+# Everything from here on is answered per app, and remembered per app.
+state_load "$APPID"
+if done_with TAG || done_with BRANCH || done_with MR || done_with RELEASE; then
+  step "Where you left off"
+  if done_with RUN;     then note "last run: $(recall ST_RUN)"; fi
+  if done_with TAG;     then ok "tag pushed: $(recall ST_TAG)"; fi
+  if done_with BRANCH;  then ok "branch on your fork: $(recall ST_BRANCH)"; fi
+  if done_with MR;      then ok "merge request: $(recall ST_MR)"; fi
+  if done_with RELEASE; then ok "release published: $(recall ST_RELEASE)"; fi
+  note "each question below offers last time's answer; Enter keeps it"
+  note "anything already done is checked, not repeated — and can be redone"
+fi
+remember ST_RUN "$(date '+%Y-%m-%d %H:%M')"
+
 auto VNAME "versionName" "$VNAME_GUESS"
 while :; do
   auto VCODE "versionCode" "$VCODE_GUESS"
@@ -466,6 +528,10 @@ ref_matches() {  # ref_matches <ref> — true if it builds $APPID at $VNAME+$VCO
 }
 tag_on_remote() {
   [ -n "$ORIGIN" ] && git -C "$REPO" ls-remote --tags --exit-code origin "refs/tags/$1" >/dev/null 2>&1
+}
+remote_tag_sha() {  # what origin's copy of the tag points at (tag object, as local rev-parse gives)
+  [ -n "$ORIGIN" ] || return 0
+  git -C "$REPO" ls-remote origin "refs/tags/$1" 2>/dev/null | awk 'NR==1 {print $1}'
 }
 
 # --- the release itself
@@ -502,7 +568,7 @@ AHEAD=0
 if [ "$CUR_TAGGED" = 1 ] && [ "$AHEAD" -gt 0 ] && [ -n "$VER_FILE" ] && [ "$DRYRUN" = 0 ]; then
   warn "$AHEAD commit(s) since $LASTTAG, but ${VER_FILE#"$REPO"/} still says $VNAME+$VCODE"
   note "that version is already tagged, so those commits cannot be released as it"
-  if go "Bump the version and make the release commit?"; then
+  if confirm "Bump the version and make the release commit?" n; then
     ask NEW_VNAME "New versionName" "$(next_vname "$VNAME")"
     ask NEW_VCODE "New versionCode" "$((VCODE + 1))"
 
@@ -567,6 +633,7 @@ done
 auto TAG "Release tag" "$TAG_GUESS"
 
 HEAD_SHORT="$(git -C "$REPO" rev-parse --short HEAD)"
+TAG_MOVED=0
 if ! git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
   warn "there is no tag $TAG yet"
   if ! ref_matches HEAD; then
@@ -581,6 +648,7 @@ if ! git -C "$REPO" rev-parse -q --verify "refs/tags/$TAG" >/dev/null 2>&1; then
     git -C "$REPO" tag "$TAG" HEAD
     git -C "$REPO" push origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "tagged and pushed $TAG"
+    TAG_MOVED=1; remember ST_TAG "$TAG"
   else
     die "F-Droid needs the release tag — create and push $TAG, then re-run"
   fi
@@ -592,6 +660,7 @@ elif ! ref_matches "$TAG"; then
     git -C "$REPO" tag -f "$TAG" HEAD >/dev/null
     git -C "$REPO" push -f origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "moved $TAG to $HEAD_SHORT"
+    TAG_MOVED=1; remember ST_TAG "$TAG"
   else
     die "tag $TAG doesn't hold this release — move it or bump the version"
   fi
@@ -602,11 +671,29 @@ elif ! tag_on_remote "$TAG"; then
   elif go "Push tag $TAG to origin?"; then
     git -C "$REPO" push origin "refs/tags/$TAG" || die "could not push tag $TAG"
     ok "pushed $TAG"
+    remember ST_TAG "$TAG"
   else
     die "push the tag first: git push origin $TAG"
   fi
+elif [ -n "$(remote_tag_sha "$TAG")" ] \
+     && [ "$(remote_tag_sha "$TAG")" != "$(git -C "$REPO" rev-parse "$TAG" 2>/dev/null)" ]; then
+  # Your local tag was moved but origin still has the old one. F-Droid builds
+  # origin's copy, so this is the one that decides what gets built.
+  warn "origin's $TAG is not your $TAG"
+  note "origin: $(remote_tag_sha "$TAG" | cut -c1-12)   local: $(git -C "$REPO" rev-parse "$TAG" | cut -c1-12)"
+  if [ "$DRYRUN" = 1 ]; then
+    warn "dry run — would delete $TAG on origin and push yours"
+  elif go "Delete $TAG on origin and push yours in its place?"; then
+    git -C "$REPO" push origin ":refs/tags/$TAG" || die "could not delete $TAG on origin"
+    git -C "$REPO" push origin "refs/tags/$TAG"  || die "could not push $TAG"
+    ok "replaced $TAG on origin"
+    TAG_MOVED=1; remember ST_TAG "$TAG"
+  else
+    die "F-Droid would build origin's $TAG, which is not this release"
+  fi
 else
   ok "tag $TAG is pushed and holds $APPID $VNAME+$VCODE"
+  remember ST_TAG "$TAG"
 fi
 # fdroiddata wants the full commit hash in `commit:`, not the tag name.
 COMMIT="$(git -C "$REPO" rev-list -n1 "$TAG" 2>/dev/null || true)"
@@ -629,10 +716,33 @@ release_exists() {
   esac
 }
 if [ "$DRYRUN" = 0 ] && [ -n "$FORGE_CLI" ]; then
+  NEED_RELEASE=1
   if release_exists; then
-    ok "$FORGE already has a release for $TAG"
-  else
-    warn "$TAG is a tag, but $FORGE has no release for it"
+    remember ST_RELEASE "$TAG"
+    if [ "$TAG_MOVED" = 1 ]; then
+      # the release still names the tag, but the tag is a different commit now
+      warn "$FORGE has a release for $TAG, and the tag moved in this run"
+      if go "Delete that release and publish it again from the new tag?"; then
+        case "$FORGE_CLI" in
+          gh)   ( cd "$REPO" && gh release delete "$TAG" --yes ) >/dev/null 2>&1 || warn "could not delete the release" ;;
+          glab) ( cd "$REPO" && glab release delete "$TAG" --yes ) >/dev/null 2>&1 || warn "could not delete the release" ;;
+        esac
+        if release_exists; then
+          warn "the old release is still there — publish by hand"
+          NEED_RELEASE=0
+        fi
+      else
+        NEED_RELEASE=0
+      fi
+    else
+      ok "$FORGE already has a release for $TAG"
+      NEED_RELEASE=0
+    fi
+  fi
+  if [ "$NEED_RELEASE" = 1 ]; then
+    if ! release_exists; then
+      warn "$TAG is a tag, but $FORGE has no release for it"
+    fi
     note "your Changelog: URL points at the releases page, which is empty until one exists"
     if go "Publish a release for $TAG on $FORGE?"; then
       RELNOTES="$WORK/forge-notes.txt"
@@ -658,6 +768,7 @@ if [ "$DRYRUN" = 0 ] && [ -n "$FORGE_CLI" ]; then
       esac
       if release_exists; then
         ok "release published: ${WEB_GUESS:+$WEB_GUESS/releases/tag/$TAG}"
+        remember ST_RELEASE "$TAG"
       else
         warn "$FORGE_CLI did not publish the release:"
         printf '%s\n' "$REL_OUT" | tail -5 | sed 's/^/       /'
@@ -800,7 +911,9 @@ case "${SAVED_FORKURL:-}" in *[:/]"$GLUSER"/*) FORK_GUESS="$SAVED_FORKURL" ;; es
 auto FORKURL "Fork" "$FORK_GUESS"
 # Always asked (Enter takes the default): the clone is large, so where it goes
 # is yours to pick. --yes takes the default.
-ask FDROIDDATA "Local clone of fdroiddata" "${SAVED_FDROIDDATA:-$HOME/fdroiddata}"
+# what this app used last time beats a guess at where the clone might live
+FD_DEF="${SAVED_FDROIDDATA:-$(recall FDROIDDATA)}"
+ask FDROIDDATA "Local clone of fdroiddata" "${FD_DEF:-$HOME/fdroiddata}"
 FDROIDDATA="${FDROIDDATA/#\~/$HOME}"
 case "$FDROIDDATA" in /*) ;; *) FDROIDDATA="$PWD/$FDROIDDATA" ;; esac
 FDROIDDATA="${FDROIDDATA%/}"
@@ -980,6 +1093,28 @@ fi
 # merge request to a single file change.
 BRANCH="$APPID"
 [ "$IS_UPDATE" = 1 ] && BRANCH="$APPID-$VCODE"
+# Earlier attempts leave branches behind on the fork — a different versionCode,
+# an abandoned try, a rejected merge request. They confuse nobody but you, and
+# GitLab keeps offering to open merge requests from them.
+if [ "$DRYRUN" = 0 ]; then
+  STALE="$(git -C "$FDROIDDATA" ls-remote --heads origin "$APPID*" 2>/dev/null \
+            | sed -n 's,.*refs/heads/,,p' | grep -vx "$BRANCH" || true)"
+  if [ -n "$STALE" ]; then
+    warn "older branches for this app on your fork:"
+    printf '%s\n' "$STALE" | sed 's/^/       /'
+    note "delete them only once their merge requests are closed or merged"
+    if confirm "Delete them from your fork?" n; then
+      for b in $STALE; do
+        if git -C "$FDROIDDATA" push origin --delete "$b" >/dev/null 2>&1; then
+          ok "deleted $b"
+        else
+          warn "could not delete $b"
+        fi
+      done
+    fi
+  fi
+fi
+
 git -C "$FDROIDDATA" checkout -q -B "$BRANCH" "$BASE" || die "could not create branch $BRANCH"
 ok "branch: $BRANCH (off $BASE)"
 
@@ -1709,9 +1844,24 @@ if ! git -C "$FDROIDDATA" push -f -u origin "$BRANCH"; then
   die "push failed"
 fi
 ok "pushed $BRANCH ($((SECONDS - PUSH_T0))s)"
+remember ST_BRANCH "$BRANCH"
 
+# A re-run pushes the same branch again, and GitLab updates any open merge
+# request from it by itself. Creating a second one is impossible and reporting
+# a failure would be wrong, so look first.
+existing_mr() {
+  gitlab_get "projects/fdroid%2Ffdroiddata/merge_requests?state=opened&source_branch=$(urlencode "$BRANCH")" \
+    | grep -Eo 'https://[^"]*/-/merge_requests/[0-9]+' | head -1
+}
 MR_URL=""
-if glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
+MR_OPEN="$(existing_mr || true)"
+if [ -n "$MR_OPEN" ]; then
+  MR_URL="$MR_OPEN"
+  ok "a merge request from $BRANCH is already open — the push above updated it"
+  ok "$MR_URL"
+  remember ST_MR "$MR_URL"
+  note "CI re-runs on the new commit; nothing else to do here"
+elif glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
   mr_description > "$WORK/mr.md"
   MR_OUT="$(glab_fd mr create -R fdroid/fdroiddata -H "$(fork_path "$FORKURL")" \
               -s "$BRANCH" -b "$UPBRANCH" -t "$COMMITMSG" \
@@ -1719,6 +1869,7 @@ if glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
   MR_URL="$(printf '%s\n' "$MR_OUT" | grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' | tail -1 || true)"
   if [ -n "$MR_URL" ]; then
     ok "merge request: $MR_URL"
+    remember ST_MR "$MR_URL"
   else
     warn "glab did not open the merge request:"
     printf '%s\n' "$MR_OUT" | tail -5 | sed 's/^/       /'
