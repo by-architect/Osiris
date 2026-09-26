@@ -1238,7 +1238,29 @@ if [ "$RUNNER" = none ]; then
   warn "the maintainers' CI will run these anyway, so expect to fix what it reports"
 else
   VALID_FAIL=""
-  say "fdroid readmeta";           frun readmeta             || VALID_FAIL="$VALID_FAIL readmeta"
+  # fdroidserver complains about this on every single command it runs.
+  if [ -f "$FDROIDDATA/config.yml" ]; then
+    case "$(stat -c '%a' "$FDROIDDATA/config.yml" 2>/dev/null || echo 600)" in
+      *00) ;;
+      *) chmod 600 "$FDROIDDATA/config.yml" && note "chmod 600 config.yml (fdroidserver insists)" ;;
+    esac
+  fi
+
+  # readmeta takes no app argument: it parses every metadata/*.yml in the clone.
+  # So an unrelated upstream entry — typically one written for a newer
+  # fdroidserver than the one installed here — fails it, which says nothing
+  # about our file. Only count it when the complaint names our app.
+  say "fdroid readmeta"
+  if ! frun readmeta > "$WORK/readmeta.log" 2>&1; then
+    sed 's/^/     /' "$WORK/readmeta.log"
+    if grep -Fq "$APPID" "$WORK/readmeta.log"; then
+      VALID_FAIL="$VALID_FAIL readmeta"
+    else
+      warn "readmeta tripped over another app in fdroiddata, not $APPID"
+      note "an upstream entry your fdroidserver is too old to parse — not your problem"
+      note "rewritemeta and lint below only look at your app, so trust those"
+    fi
+  fi
   say "fdroid rewritemeta $APPID"; frun rewritemeta "$APPID" || VALID_FAIL="$VALID_FAIL rewritemeta"
   say "fdroid lint $APPID";        frun lint "$APPID"        || VALID_FAIL="$VALID_FAIL lint"
   if [ "$YMLSUM" != "$(cksum < "$FDROIDDATA/metadata/$APPID.yml")" ]; then
