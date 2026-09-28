@@ -409,7 +409,11 @@ pick_task() {
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     st="$(printf '%s' "$row" | cut -f4)"
-    [ -z "$want" ] || [ "$st" = "$want" ] || continue
+    case "$want" in
+      '') ;;
+      pushed-or-submitted) case "$st" in pushed|submitted) ;; *) continue ;; esac ;;
+      *) [ "$st" = "$want" ] || continue ;;
+    esac
     rows+=("$row")
   done <<EOF
 $(task_rows)
@@ -640,6 +644,25 @@ existing_mr() {
     | grep -Eo 'https://[^"]*/-/merge_requests/[0-9]+' | head -1
 }
 
+# sync_mr_description <mr url> <body file> — put the App Inclusion template,
+# with the boxes this run could tick, into a merge request that already exists.
+# One opened from the plain web link has none of it, and reviewers ask for it.
+sync_mr_description() {
+  local url="$1" body="$2"
+  [ -s "$body" ] || { note "no saved description to put in the merge request"; return 0; }
+  if ! glab_ready; then
+    note "glab is not logged in — paste $body into the merge request yourself"
+    return 0
+  fi
+  go "Replace the merge request description with the filled-in template?" || return 0
+  if glab_fd mr update "${url##*/}" -R fdroid/fdroiddata \
+       --description "$(cat "$body")" >/dev/null 2>&1; then
+    ok "description updated"
+  else
+    warn "glab could not update it — paste it yourself from $body"
+  fi
+}
+
 # ------------------------------------------------- -p: just the merge request
 # A task that pushed its branch but never opened the merge request (glab not
 # logged in, you said no, the run stopped) can be finished here on its own.
@@ -657,13 +680,19 @@ open_mr_for_task() {
   ok "branch: $BRANCH -> fdroid/fdroiddata ($UPBRANCH)"
   ok "title: $title"
 
+  body="${TASK_FILE%.conf}.mr.md"
   MR_URL="$(existing_mr || true)"
+  [ -n "$MR_URL" ] || MR_URL="$(recall ST_MR)"
   if [ -n "$MR_URL" ]; then
     ok "a merge request from $BRANCH is already open: $MR_URL"
     remember ST_MR "$MR_URL"; remember ST_STATUS submitted
+    # Reviewers ask for the App Inclusion template with its boxes ticked, which
+    # is exactly what was saved when the branch was pushed. An MR opened from
+    # the plain web link has none of it, so offer to put it in place.
+    [ -s "$body" ] && { printf '%s' "$DIM"; sed 's/^/   | /' "$body" | head -20; printf '%s' "$R"; }
+    sync_mr_description "$MR_URL" "$body"
     return 0
   fi
-  body="${TASK_FILE%.conf}.mr.md"
   if [ ! -s "$body" ]; then
     body="$WORK/mr.md"
     printf '%s\n\n' "$title" > "$body"
@@ -696,9 +725,10 @@ open_mr_for_task() {
 
 if [ "$PR_ONLY" = 1 ]; then
   migrate_tasks
-  step "Finished tasks waiting for a merge request"
-  if ! pick_task pushed; then
-    say "nothing opened: no task with a pushed branch and no merge request was picked."
+  step "Tasks with a branch on your fork"
+  note "pushed: no merge request yet — submitted: one is open and can be re-described"
+  if ! pick_task pushed-or-submitted; then
+    say "nothing opened: no task with a pushed branch was picked."
     note "tasks live in $TASK_DIR"
     exit 0
   fi
@@ -1521,23 +1551,21 @@ ok "branch: $BRANCH (off $BASE)"
 step "3/5  Metadata"
 
 # --- the build entry, needed in both modes -----------------------------------
-# F-Droid builds in a clean container; extra setup goes in 'sudo:' lines.
-# 21, not 17: F-Droid's buildserver is Debian trixie now, and trixie has no
-# openjdk-17 at all — a pinned 17 fails with "Unable to locate package".
+# No `sudo:` lines by default. F-Droid's buildserver already carries the JDKs,
+# reviewers ask for sudo to be removed when they see it, and a pinned version
+# rots: the move to Debian trixie dropped openjdk-17 and broke every entry that
+# named it. Only --ask offers one, and only an explicit answer emits it.
 if [ "$ASK_ALL" = 1 ]; then
-  ask_opt JDK "JDK for the build container (21 on today's Debian trixie; blank = image default)" "${SAVED_JDK:-21}"
+  note "the build container already has JDKs — leave this blank unless a build needs a specific one"
+  ask_opt JDK "JDK to apt-get in the build container (blank = none, what reviewers prefer)" ""
 else
-  JDK="${SAVED_JDK:-21}"
-fi
-# A 17 remembered from an earlier run is a pin that cannot resolve on trixie at
-# all, so move it on rather than emitting an install line that only survives
-# because of its fallback.
-if [ "$JDK" = 17 ]; then
-  JDK=21
-  note "remembered JDK 17, but Debian trixie has none — using 21"
+  JDK=""
 fi
 case "$JDK" in ''|*[!0-9]*) JDK="" ;; esac
-[ -n "$JDK" ] && ok "build container JDK: $JDK"
+if [ -n "$JDK" ]; then
+  ok "build container JDK: $JDK"
+  warn "that adds sudo: lines, which F-Droid reviewers usually ask you to remove"
+fi
 
 # Offer the product flavours declared in the gradle file, if any.
 # (plain POSIX awk — no gawk-only 3-argument match(), Debian's awk is mawk)
@@ -2419,7 +2447,11 @@ if [ -n "$MR_OPEN" ]; then
   ok "a merge request from $BRANCH is already open — the push above updated it"
   ok "$MR_URL"
   remember ST_MR "$MR_URL"; remember ST_STATUS submitted
-  note "CI re-runs on the new commit; nothing else to do here"
+  note "CI re-runs on the new commit"
+  if [ -n "$TASK_FILE" ]; then
+    mr_description > "${TASK_FILE%.conf}.mr.md" 2>/dev/null || true
+    sync_mr_description "$MR_URL" "${TASK_FILE%.conf}.mr.md"
+  fi
 elif glab_ready && go "Open the merge request on fdroid/fdroiddata?"; then
   mr_description > "$WORK/mr.md"
   MR_OUT="$(glab_fd mr create -R fdroid/fdroiddata -H "$(fork_path "$FORKURL")" \
