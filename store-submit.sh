@@ -2974,6 +2974,7 @@ fi
 # the upload — after the whole bundle has gone over the wire. The source files
 # say what the build will be numbered, so the clash can be caught here instead.
 VER_FILE=""; VER_KIND=""; LOCAL_VNAME=""; LOCAL_VCODE=""; FORCE_BUILD=0
+SKIP_UPLOAD=0   # release a versionCode Play already holds, rather than uploading
 PUBSPEC=""
 if [ -n "$FLUTTER_DIR" ]; then
   PUBSPEC="$REPO/$FLUTTER_DIR/pubspec.yaml"
@@ -2992,39 +2993,65 @@ fi
 case "$LOCAL_VCODE" in ''|*[!0-9]*) LOCAL_VCODE="" ;; esac
 [ -n "$PLAY_MAX_VCODE" ] && note "highest versionCode Play has for $PKG: $PLAY_MAX_VCODE"
 
+bump_version() {  # bump_version <new code> — rewrite the source version in place
+  case "$VER_KIND" in
+    pubspec)
+      awk -v v="$LOCAL_VNAME+$1" 'BEGIN{done=0}
+        !done && /^version:[[:space:]]/ { print "version: " v; done=1; next } { print }' \
+        "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
+    gradle)
+      awk -v c="$1" 'BEGIN{dc=0}
+        !dc && sub(/versionCode[[:space:]]*=?[[:space:]]*[0-9]+/, "versionCode = " c) { dc=1 }
+        { print }' "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
+    *) return 1 ;;
+  esac
+  ok "${VER_FILE#"$REPO"/}: versionCode $LOCAL_VCODE -> $1"
+  note "that edit is uncommitted — commit it with the release"
+  LOCAL_VCODE="$1"
+  FORCE_BUILD=1   # whatever is already built still carries the old code
+  [ -f "$REPO/fastlane/metadata/android/en-US/changelogs/$1.txt" ] \
+    || note "What's new goes in fastlane/metadata/android/en-US/changelogs/$1.txt"
+}
+
 if [ -n "$LOCAL_VCODE" ] && [ -n "$PLAY_MAX_VCODE" ] && [ "$LOCAL_VCODE" -le "$PLAY_MAX_VCODE" ]; then
+  LOCAL_ON_PLAY=0
+  case " $PLAY_VCODES " in *" $LOCAL_VCODE "*) LOCAL_ON_PLAY=1 ;; esac
   echo
-  warn "${VER_FILE#"$REPO"/} says versionCode $LOCAL_VCODE, which Play already has"
-  say "Play never accepts a versionCode twice, so this build cannot go up as it is."
-  if [ "$ASSUME_YES" = 0 ] && confirm "Bump it now?" y; then
-    while :; do
-      ask NEW_VCODE "New versionCode" "$((PLAY_MAX_VCODE + 1))"
-      case "$NEW_VCODE" in ''|*[!0-9]*) warn "versionCode must be a plain integer"; continue ;; esac
-      [ "$NEW_VCODE" -gt "$PLAY_MAX_VCODE" ] && break
-      warn "$NEW_VCODE is not above $PLAY_MAX_VCODE, so Play would reject it too"
-    done
-    case "$VER_KIND" in
-      pubspec)
-        awk -v v="$LOCAL_VNAME+$NEW_VCODE" 'BEGIN{done=0}
-          !done && /^version:[[:space:]]/ { print "version: " v; done=1; next } { print }' \
-          "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
-      gradle)
-        awk -v c="$NEW_VCODE" 'BEGIN{dc=0}
-          !dc && sub(/versionCode[[:space:]]*=?[[:space:]]*[0-9]+/, "versionCode = " c) { dc=1 }
-          { print }' "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
-    esac
-    ok "${VER_FILE#"$REPO"/}: versionCode $LOCAL_VCODE -> $NEW_VCODE"
-    note "that edit is uncommitted — commit it with the release"
-    LOCAL_VCODE="$NEW_VCODE"
-    FORCE_BUILD=1   # whatever is already built still carries the old code
-    CL="$REPO/fastlane/metadata/android/en-US/changelogs/$NEW_VCODE.txt"
-    [ -f "$CL" ] || note "What's new goes in fastlane/metadata/android/en-US/changelogs/$NEW_VCODE.txt"
+  if [ "$LOCAL_ON_PLAY" = 1 ]; then
+    warn "Play already has versionCode $LOCAL_VCODE, and that is what ${VER_FILE#"$REPO"/} says"
   else
-    warn "no bump — Play will reject the upload unless the bundle you pick"
-    warn "already carries a code above $PLAY_MAX_VCODE"
-    [ "$ASSUME_YES" = 1 ] && die "versionCode $LOCAL_VCODE is already on Play"
-    confirm "Carry on anyway?" n || exit 1
+    warn "${VER_FILE#"$REPO"/} says versionCode $LOCAL_VCODE, under the $PLAY_MAX_VCODE Play has"
   fi
+  say "A versionCode is spent once and for good: Play cannot free one, and an"
+  say "uploaded bundle cannot be deleted — only replaced by a higher code."
+  echo
+  say "  ${B}1)${R} bump to $((PLAY_MAX_VCODE + 1)), build a fresh bundle and upload that"
+  if [ "$LOCAL_ON_PLAY" = 1 ]; then
+    say "  ${B}2)${R} keep versionCode $LOCAL_VCODE and work with the bundle Play already holds:"
+    say "     no build, no upload — straight on to the track, release notes and rollout"
+  fi
+  say "  ${B}3)${R} stop here"
+  echo
+  [ "$ASSUME_YES" = 1 ] && die "versionCode $LOCAL_VCODE is already on Play — bump it, or re-run without --yes to release the copy Play holds"
+  while :; do
+    ask CHOICE "Which?" 1
+    case "$CHOICE" in
+      1) while :; do
+           ask NEW_VCODE "New versionCode" "$((PLAY_MAX_VCODE + 1))"
+           case "$NEW_VCODE" in ''|*[!0-9]*) warn "versionCode must be a plain integer"; continue ;; esac
+           [ "$NEW_VCODE" -gt "$PLAY_MAX_VCODE" ] && break
+           warn "$NEW_VCODE is not above $PLAY_MAX_VCODE, so Play would reject it too"
+         done
+         bump_version "$NEW_VCODE" || die "cannot edit the version in ${VER_FILE:-the build files} — change it by hand"
+         break ;;
+      2) if [ "$LOCAL_ON_PLAY" = 0 ]; then warn "Play has no versionCode $LOCAL_VCODE to work with"; continue; fi
+         SKIP_UPLOAD=1
+         ok "keeping versionCode $LOCAL_VCODE — the bundle Play already has"
+         break ;;
+      3) say "Nothing done."; exit 0 ;;
+      *) warn "answer 1, 2 or 3" ;;
+    esac
+  done
 fi
 
 # ------------------------------------------------ build a signed release bundle
@@ -3306,7 +3333,7 @@ build_bundle() {  # build a release .aab; 0 and one exists, or 1 and we said why
 }
 
 # --- artifact: an App Bundle, built here if the project has not built one
-if [ -z "$ARTIFACT" ]; then
+if [ "$SKIP_UPLOAD" = 0 ] && [ -z "$ARTIFACT" ]; then
   find_artifact
   NEED_BUILD=0
   if [ -z "$ART_GUESS" ]; then
@@ -3339,21 +3366,24 @@ if [ -z "$ARTIFACT" ]; then
   fi
   ask ARTIFACT "Path to the .aab or .apk to upload" "$ART_GUESS"
 fi
-ARTIFACT="${ARTIFACT/#\~/$HOME}"
-[ -f "$ARTIFACT" ] || die "no such file: $ARTIFACT"
-case "$ARTIFACT" in
-  *.aab) KIND=bundles ;;
-  *.apk) KIND=apks
-         warn "uploading an APK — Play only accepts this for an app first published"
-         warn "before August 2021; anything newer needs the .aab"
-         confirm "Carry on with the APK?" n || exit 1 ;;
-  *) die "expected a .aab or .apk, got $(basename "$ARTIFACT")" ;;
-esac
-ok "artifact: $(basename "$ARTIFACT") ($(du -h "$ARTIFACT" | cut -f1))"
+KIND=bundles
+if [ "$SKIP_UPLOAD" = 0 ]; then
+  ARTIFACT="${ARTIFACT/#\~/$HOME}"
+  [ -f "$ARTIFACT" ] || die "no such file: $ARTIFACT"
+  case "$ARTIFACT" in
+    *.aab) KIND=bundles ;;
+    *.apk) KIND=apks
+           warn "uploading an APK — Play only accepts this for an app first published"
+           warn "before August 2021; anything newer needs the .aab"
+           confirm "Carry on with the APK?" n || exit 1 ;;
+    *) die "expected a .aab or .apk, got $(basename "$ARTIFACT")" ;;
+  esac
+  ok "artifact: $(basename "$ARTIFACT") ($(du -h "$ARTIFACT" | cut -f1))"
+fi
 
 # Play rejects a debug signature outright and an unsigned upload with a message
 # that does not mention signing, so read the certificate before uploading.
-if have keytool; then
+if [ "$SKIP_UPLOAD" = 0 ] && have keytool; then
   OWNER="$(cert_owner "$ARTIFACT")"
   case "$OWNER" in
     '')
@@ -3367,7 +3397,7 @@ if have keytool; then
       ok "signed by $OWNER"
       note "certificate SHA-256: $(cert_sha256 "$ARTIFACT")" ;;
   esac
-elif have unzip; then
+elif [ "$SKIP_UPLOAD" = 0 ] && have unzip; then
   if ! unzip -l "$ARTIFACT" 2>/dev/null | grep -qE 'META-INF/.*\.(RSA|DSA|EC|SF)$'; then
     warn "no signature block found — Play only accepts artifacts signed with your upload key"
     confirm "Upload it anyway?" n || exit 1
@@ -3396,7 +3426,7 @@ fi
 [ -n "$STATUS" ] || STATUS=completed
 
 # ==================================================================== 3. edit
-step "3/5  Uploading"
+if [ "$SKIP_UPLOAD" = 1 ]; then step "3/5  The edit"; else step "3/5  Uploading"; fi
 
 printf '{}' > "$WORK/empty.json"
 api POST "/androidpublisher/v3/applications/$PKG/edits" "$WORK/empty.json" || api_fail "could not open an edit"
@@ -3404,23 +3434,29 @@ EDIT_ID="$(jget "$API_BODY" id)"
 [ -n "$EDIT_ID" ] || die "the API returned no edit id"
 ok "edit $EDIT_ID opened"
 
-say "uploading $(basename "$ARTIFACT")…"
-UP_STATUS="$(curl --progress-bar -o "$WORK/upload.json" -w '%{http_code}' \
-  -X POST -T "$ARTIFACT" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/octet-stream' \
-  "$API_ROOT/upload/androidpublisher/v3/applications/$PKG/edits/$EDIT_ID/$KIND?uploadType=media")"
-printf '\n' >&2
-case "$UP_STATUS" in
-  2*) ;;
-  *) API_STATUS="$UP_STATUS"; API_BODY="$WORK/upload.json"; api_fail "upload failed" ;;
-esac
-VCODE="$(jget "$WORK/upload.json" versionCode)"
-[ -n "$VCODE" ] || die "the API accepted the upload but returned no versionCode"
-ok "uploaded — versionCode $VCODE"
+if [ "$SKIP_UPLOAD" = 1 ]; then
+  # Play holds this bundle already; the edit only has to point a track at it.
+  VCODE="$LOCAL_VCODE"
+  ok "no upload — releasing versionCode $VCODE, which Play already has"
+else
+  say "uploading $(basename "$ARTIFACT")…"
+  UP_STATUS="$(curl --progress-bar -o "$WORK/upload.json" -w '%{http_code}' \
+    -X POST -T "$ARTIFACT" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/octet-stream' \
+    "$API_ROOT/upload/androidpublisher/v3/applications/$PKG/edits/$EDIT_ID/$KIND?uploadType=media")"
+  printf '\n' >&2
+  case "$UP_STATUS" in
+    2*) ;;
+    *) API_STATUS="$UP_STATUS"; API_BODY="$WORK/upload.json"; api_fail "upload failed" ;;
+  esac
+  VCODE="$(jget "$WORK/upload.json" versionCode)"
+  [ -n "$VCODE" ] || die "the API accepted the upload but returned no versionCode"
+  ok "uploaded — versionCode $VCODE"
+fi
 
 # --- mapping file, so crashes are readable in Play Console
-if [ -z "$MAPPING" ]; then
+if [ -z "$MAPPING" ] && [ "$SKIP_UPLOAD" = 0 ]; then
   for m in "$REPO/$SUBDIR/build/outputs/mapping/release/mapping.txt" \
            "$REPO/$SUBDIR/build/outputs/mapping/releaseRelease/mapping.txt" \
            ${FLUTTER_DIR:+"$REPO/$FLUTTER_DIR/build/app/outputs/mapping/release/mapping.txt"}; do
@@ -3430,7 +3466,7 @@ if [ -z "$MAPPING" ]; then
     confirm "Attach $(basename "$(dirname "$MAPPING")")/mapping.txt (deobfuscates crash reports)?" y || MAPPING=""
   fi
 fi
-if [ -n "$MAPPING" ]; then
+if [ -n "$MAPPING" ] && [ "$SKIP_UPLOAD" = 0 ]; then
   MAPPING="${MAPPING/#\~/$HOME}"
   [ -f "$MAPPING" ] || die "no such file: $MAPPING"
   MAP_STATUS="$(curl -sS -o "$WORK/mapping.json" -w '%{http_code}' \
@@ -3523,12 +3559,15 @@ api POST "/androidpublisher/v3/applications/$PKG/edits/$EDIT_ID:validate" "$WORK
   || api_fail "validation failed — nothing was committed"
 ok "the edit validates"
 
+ART_SUMMARY="already on Play, not re-uploaded"
+[ "$SKIP_UPLOAD" = 0 ] && ART_SUMMARY="$(basename "$ARTIFACT")"
+
 cat <<SUMMARY
 
    ${B}About to commit:${R}
      package      $PKG
      versionCode  $VCODE
-     artifact     $(basename "$ARTIFACT")
+     artifact     $ART_SUMMARY
      track        $TRACK
      status       $STATUS${ROLLOUT:+  (rollout ${ROLLOUT})}
      notes        $(python3 -c 'import json,sys; n=json.load(open(sys.argv[1])); print(", ".join(x["language"] for x in n) or "none")' "$NOTES_JSON")

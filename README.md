@@ -319,9 +319,22 @@ and any run that fails part-way deletes its edit instead of leaving it open.
 Play never accepts a versionCode twice, and it only says so once the whole
 bundle has been uploaded — a 50 MB round trip to be told the build was numbered
 wrong. So the wizard asks Play which codes it already holds while it is checking
-the package exists, compares that with `pubspec.yaml`'s `version: name+code` (or
-gradle's `versionCode`), and offers to bump before anything is built. A bundle
-built before the bump is treated as stale and rebuilt.
+the package exists, and compares that with `pubspec.yaml`'s `version: name+code`
+(or gradle's `versionCode`) before anything is built. On a clash it offers:
+
+1. **bump** to the next free code, rewrite `pubspec.yaml`/`build.gradle.kts` and
+   build a fresh bundle — a bundle built before the bump is stale, so it is
+   rebuilt rather than uploaded
+2. **keep the code and release what Play already holds** — no build, no upload,
+   straight on to the track, release notes and rollout. This is the way to put a
+   bundle uploaded through the browser onto another track from here
+3. **stop**
+
+There is deliberately no "delete that version" option: Play cannot free a
+versionCode or remove an uploaded bundle, only supersede it with a higher one.
+
+Outside a clash the wizard does not ask about versions at all — the build files
+decide, and it prints what Play's highest code is so a mistake is visible.
 
 ### What it needs
 
