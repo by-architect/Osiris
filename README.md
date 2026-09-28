@@ -329,9 +329,22 @@ and any run that fails part-way deletes its edit instead of leaving it open.
      (it then appears under <https://play.google.com/console/api-access>)
 
   Google's walkthrough: <https://developers.google.com/android-publisher/getting_started>
-- the app **already created in Play Console**, with its store listing filled in.
-  The API cannot create an app or its listing — do the first release by hand,
-  everything after that with this script
+- the app **already in Play Console, with one bundle uploaded there by hand**.
+  The API cannot create an app, and creating one in the console is not enough
+  on its own: the *Create app* dialog never asks for a package name, so the
+  name is bound by the first bundle you upload through the browser
+  (*Test and release → Testing → Internal testing → Create new release*).
+  Every release after that first one can come from here.
+
+  There is no way around this in a script: `androidpublisher` v3 has no
+  `applications.create`, and the only Google API that creates a Play app is
+  `playcustomapp`, which makes private Managed-Google-Play apps rather than
+  public listings. So the wizard checks whether Play knows the package as soon
+  as it has the application id — before building anything — and if not, prints
+  the two console steps, offers to open Play Console and stops.
+
+  Package names are permanent and cannot be re-used, so upload the first
+  bundle with the application id you mean to keep
 - an **App Bundle**. Play has required one for every app created since August
   2021; an `.apk` is only still accepted for an app that was published before
   then, and the wizard says so before uploading one.

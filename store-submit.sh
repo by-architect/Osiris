@@ -2667,7 +2667,12 @@ api_fail() {  # api_fail "what was being done"
     401|403) note "the service account needs release access to this app, granted under" >&2
              note "Play Console → Users and permissions → the account → App permissions" >&2
              note "https://play.google.com/console/users-and-permissions" >&2 ;;
-    404)     note "check the package name — the app must already exist in Play Console" >&2
+    404)     note "$PKG does not exist in Play Console yet." >&2
+             note "Creating the app there is not enough on its own: the Create app" >&2
+             note "dialog never asks for a package name, so the name is fixed by the" >&2
+             note "FIRST bundle — and that one has to go up through the browser:" >&2
+             note "  Test and release -> Testing -> Internal testing -> Create new release" >&2
+             note "Every release after that can come from here." >&2
              note "https://play.google.com/console/developers" >&2 ;;
   esac
   exit 1
@@ -2820,6 +2825,53 @@ if [ -z "$PKG" ]; then
   done
 fi
 ok "package: $PKG"
+
+# Play can only be told about an app it already knows, and it only learns a
+# package name from the first bundle uploaded through the browser. Neither step
+# has an API — androidpublisher has no applications.create — so check now,
+# before the build and the rest of the questions.
+package_known() {
+  printf '{}' > "$WORK/empty.json"
+  api POST "/androidpublisher/v3/applications/$PKG/edits" "$WORK/empty.json" || return 1
+  local id; id="$(jget "$API_BODY" id)"
+  [ -n "$id" ] && api DELETE "/androidpublisher/v3/applications/$PKG/edits/$id" >/dev/null 2>&1
+  return 0
+}
+
+open_url() {
+  if   have xdg-open; then xdg-open "$1" >/dev/null 2>&1 &
+  elif have open;     then open "$1" >/dev/null 2>&1 &
+  else return 1; fi
+  return 0
+}
+
+if package_known; then
+  ok "Play knows this package"
+else
+  case "$API_STATUS" in
+    404)
+      echo
+      warn "Play has never seen $PKG"
+      say "This is the one part no script can do for you: the Play API has no call"
+      say "that creates an app, and the Create app dialog never asks for a package"
+      say "name — Play takes the name from the first bundle uploaded in the browser."
+      echo
+      say "Once per app, in Play Console:"
+      say "  1. Create app — name, language, app or game, free or paid, contact"
+      say "     email, and the declarations"
+      say "  2. in the new app: Test and release -> Testing -> Internal testing ->"
+      say "     Create new release, and upload the bundle there"
+      note "       https://play.google.com/console"
+      echo
+      say "That upload is your first release, so there is nothing left for this run"
+      say "to do. From the next versionCode on, this wizard does the whole thing."
+      if [ "$ASSUME_YES" = 0 ] && confirm "Open Play Console now?" y; then
+        open_url "https://play.google.com/console" || note "open https://play.google.com/console yourself"
+      fi
+      exit 0 ;;
+    *) api_fail "could not look up $PKG" ;;
+  esac
+fi
 
 # ------------------------------------------------ build a signed release bundle
 # Play has required an App Bundle for every app created since August 2021; an
