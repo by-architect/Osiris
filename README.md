@@ -323,10 +323,17 @@ and any run that fails part-way deletes its edit instead of leaving it open.
      <https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com>
   2. create a service account, then *Keys → Add key → Create new key → JSON* —
      <https://console.cloud.google.com/iam-admin/serviceaccounts>
-  3. invite that account's email in Play Console under *Users and permissions*
-     and grant it release access to the app —
-     <https://play.google.com/console/users-and-permissions>
+  3. invite that account's email — the `client_email` field of the JSON key,
+     ending in `.iam.gserviceaccount.com` — in Play Console under
+     <https://play.google.com/console/users-and-permissions>:
+     *Invite new users* → paste the address → *App permissions* → *Add app* →
+     the app → tick **Release apps to testing tracks** (and *Release to
+     production…* for production uploads) → *Invite user*. A service account
+     has no inbox and nothing to accept: it is Active at once.
      (it then appears under <https://play.google.com/console/api-access>)
+
+  The wizard prints that address itself at stage 1/5, as soon as it can read
+  the key, and repeats these steps verbatim if an upload comes back 403.
 
   Google's walkthrough: <https://developers.google.com/android-publisher/getting_started>
 - the app **already in Play Console, with one bundle uploaded there by hand**.

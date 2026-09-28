@@ -2487,6 +2487,7 @@ NOREVIEW=0
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/storepublisher/playstore"
 CONF="$CONF_DIR/last.conf"
 KEY_DEFAULT="$CONF_DIR/service-account.json"
+KEY_IS_NEW=0
 # Where this wizard kept things before the storepublisher layout. Still read, so
 # an existing key and saved answers keep working; anything new is written above.
 OLD_CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/play-submit"
@@ -2673,6 +2674,21 @@ api() {  # api METHOD PATH [body-file]   — 0 on 2xx, body in $API_BODY
   return 1
 }
 
+# The step people get stuck on: the key is fine, but Play Console has never been
+# told about it. Spelled out, with the exact address to paste.
+invite_steps() {  # invite_steps [service account email]
+  local addr="${1:-}"
+  [ -n "$addr" ] || addr="the service account's email — it ends in .iam.gserviceaccount.com"
+  note "  https://play.google.com/console/users-and-permissions"
+  say  "  1. Invite new users"
+  say  "  2. Email address: $B$addr$R"
+  say  "  3. App permissions -> Add app -> this app"
+  say  "  4. tick 'Release apps to testing tracks'"
+  note "       and 'Release to production...' as well, for production uploads"
+  say  "  5. Invite user"
+  note "       a service account has no inbox: it goes Active straight away"
+}
+
 api_fail() {  # api_fail "what was being done"
   local msg
   msg="$(jget "$API_BODY" error.message)"
@@ -2683,9 +2699,9 @@ api_fail() {  # api_fail "what was being done"
     sed 's/^/       /' "$API_BODY" >&2 | head -20
   fi
   case "$API_STATUS" in
-    401|403) note "the service account needs release access to this app, granted under" >&2
-             note "Play Console → Users and permissions → the account → App permissions" >&2
-             note "https://play.google.com/console/users-and-permissions" >&2 ;;
+    401|403) note "the key itself is fine — Play Console has not given this account" >&2
+             note "release access to $PKG:" >&2
+             invite_steps "${SA_EMAIL:-}" >&2 ;;
     404)     note "$PKG does not exist in Play Console yet." >&2
              note "Creating the app there is not enough on its own: the Create app" >&2
              note "dialog never asks for a package name, so the name is fixed by the" >&2
@@ -2733,15 +2749,15 @@ if [ -z "$KEYFILE" ]; then
   note "     https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com"
   say "2. create a service account, then Keys → Add key → Create new key → JSON"
   note "     https://console.cloud.google.com/iam-admin/serviceaccounts"
-  say "3. Play Console → Users and permissions → Invite new users: paste the"
-  say "   service account's email and grant it release access to this app"
-  note "     https://play.google.com/console/users-and-permissions"
+  say "3. invite that service account in Play Console, with release access"
+  note "     the exact steps follow, once this script can read its email"
   say "4. give the grant a few minutes to propagate"
   echo
   note "the account then shows up under https://play.google.com/console/api-access"
   note "Google's own walkthrough: https://developers.google.com/android-publisher/getting_started"
   echo
   ask KEYFILE "Path to the service account JSON key" "$KEY_DEFAULT"
+  KEY_IS_NEW=1
 fi
 KEYFILE="${KEYFILE/#\~/$HOME}"
 [ -f "$KEYFILE" ] || die "no such file: $KEYFILE"
@@ -2757,6 +2773,18 @@ case "$KEYPERM" in
   *) warn "$KEYFILE is mode $KEYPERM — others can read your private key; chmod 600 it" ;;
 esac
 ok "service account: $SA_EMAIL"
+# The address is the thing Play Console has to be told about, so never leave the
+# reader to work out that the line above is what goes in the invite box.
+if [ "$KEY_IS_NEW" = 1 ]; then
+  echo
+  say "${B}Invite that address in Play Console${R} (skip if it is already there):"
+  invite_steps "$SA_EMAIL"
+  echo
+else
+  note "that address is the user Play Console has to know about — if an upload"
+  note "fails with 403, it has not been invited with release access yet:"
+  note "  https://play.google.com/console/users-and-permissions"
+fi
 
 # --- sign a JWT and swap it for an access token (RS256, per Google's docs)
 python3 - "$KEYFILE" > "$WORK/key.pem" <<'PY'
