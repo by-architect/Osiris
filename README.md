@@ -150,8 +150,9 @@ Taken from fdroiddata's merge request checklist and `templates/`:
 - `commit:` is the tag's **full commit hash**, not the tag name
 - an **AuthorName** is always set
 - Flutter apps get **one APK per CPU type** (armeabi-v7a, arm64-v8a, x86_64)
-  with Flutter's own versionCodes (1000/2000/4000 + code) and a matching
-  `VercodeOperation`, so auto-updates keep working
+  with the versionCodes F-Droid's reviewers ask for (10 × code + 1/2/3) and a
+  matching `VercodeOperation`, so auto-updates keep working. The app's gradle
+  file has to set those codes; the wizard checks and shows the snippet if not
 - the Flutter version is read from the app's `.fvmrc` at build time
   (`flutter@stable` + checkout), `pub get --enforce-lockfile`, and unused
   platform folders (`ios`, `web`…) are removed before the build

@@ -987,12 +987,12 @@ if [ "$CUR_TAGGED" = 1 ] && [ "$AHEAD" -gt 0 ] && [ -n "$VER_FILE" ] && [ "$DRYR
       "${EDITOR:-${VISUAL:-vi}}" "$NOTES" || warn "editor exited non-zero — using the text as it stands"
     fi
     mkdir -p "$FL_BASE/changelogs"
-    # With an ABI split, F-Droid publishes 1000/2000/4000 + versionCode, and
+    # With an ABI split, F-Droid publishes 10 * versionCode + 1/2/3, and
     # looks for a changelog named after the code it actually publishes. Which
     # split is used is settled later, so write every name it might look for —
     # the ones that never exist are simply ignored.
     CL_CODES="$NEW_VCODE"
-    [ -n "$FLUTTER_DIR" ] && CL_CODES="$NEW_VCODE $((1000 + NEW_VCODE)) $((2000 + NEW_VCODE)) $((4000 + NEW_VCODE))"
+    [ -n "$FLUTTER_DIR" ] && CL_CODES="$NEW_VCODE $((10 * NEW_VCODE + 1)) $((10 * NEW_VCODE + 2)) $((10 * NEW_VCODE + 3))"
     for c in $CL_CODES; do cp "$NOTES" "$FL_BASE/changelogs/$c.txt"; done
     ok "wrote ${FL_BASE#"$REPO"/}/changelogs/{$(echo "$CL_CODES" | tr ' ' ',')}.txt"
 
@@ -1577,12 +1577,49 @@ if [ -n "$FLUTTER_DIR" ]; then
 
   # F-Droid asks for per-ABI APKs when the universal one is big (it is for
   # Flutter: every engine is inside). Flutter numbers split APKs itself as
-  # 1000 * ABI + versionCode (arm32 1, arm64 2, x86_64 4).
+  # 1000 * ABI + versionCode, but F-Droid's reviewers want 10 * versionCode +
+  # ABI (arm32 1, arm64 2, x86_64 3), so a new release always outranks every
+  # APK of the old one. The app sets that in its gradle file; without it the
+  # APKs F-Droid builds don't match the codes in the metadata.
   ABISPLIT=1
   if [ "$ASK_ALL" = 1 ]; then
     confirm "Build one APK per CPU type (smaller downloads; F-Droid asks for it)?" y || ABISPLIT=0
   fi
   [ "$ABISPLIT" = 1 ] && ok "one APK per CPU type: armeabi-v7a, arm64-v8a, x86_64"
+  if [ "$ABISPLIT" = 1 ] && ! grep -q 'versionCodeOverride' "$GRADLE_FILE" 2>/dev/null; then
+    warn "${GRADLE_FILE#"$REPO"/} does not set the per-CPU version codes F-Droid wants"
+    note "add this to it (the reviewers ask for exactly this), then commit and tag again:"
+    if [ "${GRADLE_FILE##*.}" = kts ]; then
+      sed 's/^/       /' <<'EOF'
+import com.android.build.gradle.internal.api.ApkVariantOutputImpl   // at the top
+
+val abiCodes = mapOf("armeabi-v7a" to 1, "arm64-v8a" to 2, "x86_64" to 3)
+android.applicationVariants.configureEach {
+    val variant = this
+    variant.outputs.forEach { output ->
+        val abiVersionCode = abiCodes[output.filters.find { it.filterType == "ABI" }?.identifier]
+        if (abiVersionCode != null) {
+            (output as ApkVariantOutputImpl).versionCodeOverride = variant.versionCode * 10 + abiVersionCode
+        }
+    }
+}
+EOF
+    else
+      sed 's/^/       /' <<'EOF'
+def abiCodes = ["armeabi-v7a": 1, "arm64-v8a": 2, "x86_64": 3]
+android.applicationVariants.configureEach { variant ->
+    variant.outputs.each { output ->
+        def abiVersionCode = abiCodes.get(output.getFilter(com.android.build.OutputFile.ABI))
+        if (abiVersionCode != null) {
+            output.versionCodeOverride = variant.versionCode * 10 + abiVersionCode
+        }
+    }
+}
+EOF
+    fi
+    [ "$ASSUME_YES" = 1 ] && die "add it and re-run"
+    confirm "Continue anyway?" n || die "add it and re-run"
+  fi
 
   # Platform folders F-Droid doesn't need are removed before the build.
   for pd in ios linux macos web windows; do
@@ -1648,12 +1685,12 @@ emit_entry() {  # emit_entry <versionCode> [<target platform> <abi>] — one Bui
 
 BUILD_BLOCK="$WORK/build.yml"
 if [ "$ABISPLIT" = 1 ]; then
-  VCODES="$((1000 + VCODE)) $((2000 + VCODE)) $((4000 + VCODE))"
-  CUR_VCODE="$((4000 + VCODE))"
+  VCODES="$((10 * VCODE + 1)) $((10 * VCODE + 2)) $((10 * VCODE + 3))"
+  CUR_VCODE="$((10 * VCODE + 3))"
   {
-    emit_entry "$((1000 + VCODE))" android-arm armeabi-v7a; printf '\n'
-    emit_entry "$((2000 + VCODE))" android-arm64 arm64-v8a; printf '\n'
-    emit_entry "$((4000 + VCODE))" android-x64 x86_64
+    emit_entry "$((10 * VCODE + 1))" android-arm armeabi-v7a; printf '\n'
+    emit_entry "$((10 * VCODE + 2))" android-arm64 arm64-v8a; printf '\n'
+    emit_entry "$((10 * VCODE + 3))" android-x64 x86_64
   } > "$BUILD_BLOCK"
 else
   VCODES="$VCODE"; CUR_VCODE="$VCODE"
@@ -1924,10 +1961,10 @@ else
     [ -n "$SIGNKEY" ] && printf 'AllowedAPKSigningKeys: %s\n\n' "$SIGNKEY"
     printf 'AutoUpdateMode: %s\n' "$AUM"
     printf 'UpdateCheckMode: Tags\n'
-    # Split APKs: the codes Flutter gives them, derived from pubspec's code.
+    # Split APKs: the codes the gradle override gives them, from pubspec's code.
     if [ "$ABISPLIT" = 1 ]; then
       printf 'VercodeOperation:\n'
-      printf "  - '%%c + 1000'\n  - '%%c + 2000'\n  - '%%c + 4000'\n"
+      printf "  - '10 * %%c + 1'\n  - '10 * %%c + 2'\n  - '10 * %%c + 3'\n"
     fi
     # The checker reads versions from gradle, where Flutter only has
     # references; point it at pubspec.yaml's `version: name+code` instead.
