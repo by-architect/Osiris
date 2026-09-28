@@ -942,13 +942,20 @@ fi
 # and the "what's new" text have to be in the commit *before* it is tagged.
 # Offered when the source version is already tagged and work has moved on: the
 # commits since then cannot reach anyone without a new version.
-log_notes() {  # log_notes <since-ref> — "- subject" lines, newest last
+# Commit titles as "- title" lines. Drops the "#123 " / "#{id} " ids some
+# commit workflows put in front, and titles that tell a reader nothing: a bare
+# file name ("../../commit-changes.md"), or three letters or fewer ("ok").
+clean_notes() {  # stdin: one title per line
+  sed -E 's/^#(\{id\}|[0-9]+)[[:space:]]+//' \
+    | grep -Eiv '^[[:space:]]*$|^[./]*[a-z0-9_./-]+\.[a-z0-9]+$|^.{0,3}$|^(wip|update|updates|fixes)$' \
+    | sed 's/^/- /'
+}
+log_notes() {  # log_notes <since-ref> — "- title" lines, oldest first
   if [ -n "$1" ]; then
-    git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' "$1..HEAD"
+    { git -C "$REPO" log --reverse --no-merges --pretty=format:'%s' "$1..HEAD"; echo; }
   else
-    git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' -20
-  fi
-  printf '\n'
+    { git -C "$REPO" log --reverse --no-merges --pretty=format:'%s' -20; echo; }
+  fi | clean_notes
 }
 
 # where the version lives, and what the next one would be
@@ -959,6 +966,13 @@ fi
 next_vname() {  # bump the last component: 0.1.0 -> 0.1.1
   printf '%s' "$1" | awk -F. -v OFS=. '{ $NF = $NF + 1; print }'
 }
+
+# F-Droid shows changelogs/<versionCode>.txt as "What's new"; the forge
+# release below reuses it. Known here, not only inside the bump, so a version
+# bumped by hand still gets its written notes rather than commit titles.
+FL_BASE="$REPO/fastlane/metadata/android/en-US"
+[ -n "$FLUTTER_DIR" ] && [ "$FLUTTER_DIR" != "." ] \
+  && [ -d "$REPO/$FLUTTER_DIR/fastlane" ] && FL_BASE="$REPO/$FLUTTER_DIR/fastlane/metadata/android/en-US"
 
 CUR_TAGGED=0
 for t in "v$VNAME" "$VNAME"; do
@@ -975,15 +989,21 @@ if [ "$CUR_TAGGED" = 1 ] && [ "$AHEAD" -gt 0 ] && [ -n "$VER_FILE" ] && [ "$DRYR
     ask NEW_VNAME "New versionName" "$(next_vname "$VNAME")"
     ask NEW_VCODE "New versionCode" "$((VCODE + 1))"
 
-    # --- what's new: F-Droid shows changelogs/<versionCode>.txt from the repo
-    FL_BASE="$REPO/fastlane/metadata/android/en-US"
-    [ -n "$FLUTTER_DIR" ] && [ "$FLUTTER_DIR" != "." ] \
-      && [ -d "$REPO/$FLUTTER_DIR/fastlane" ] && FL_BASE="$REPO/$FLUTTER_DIR/fastlane/metadata/android/en-US"
+    # --- what's new: F-Droid shows changelogs/<versionCode>.txt from the repo.
+    # Notes written ahead of time for this code win over commit titles.
     NOTES="$WORK/release-notes.txt"
-    log_notes "$LASTTAG" > "$NOTES"
-    say "Release notes, from the $AHEAD commit(s) since $LASTTAG:"
+    if [ -s "$FL_BASE/changelogs/$NEW_VCODE.txt" ]; then
+      cp "$FL_BASE/changelogs/$NEW_VCODE.txt" "$NOTES"
+      say "Release notes, from ${FL_BASE#"$REPO"/}/changelogs/$NEW_VCODE.txt:"
+      EDIT_NOTES=n
+    else
+      log_notes "$LASTTAG" > "$NOTES"
+      say "Release notes, from the $AHEAD commit(s) since $LASTTAG:"
+      EDIT_NOTES=y
+    fi
     printf '%s' "$DIM"; sed 's/^/   | /' "$NOTES"; printf '%s' "$R"
-    if [ "$ASSUME_YES" = 0 ] && confirm "Edit them before committing?" n; then
+    [ "$EDIT_NOTES" = y ] && note "users see these as “What's new” — short, plain words work best"
+    if [ "$ASSUME_YES" = 0 ] && confirm "Edit them before committing?" "$EDIT_NOTES"; then
       "${EDITOR:-${VISUAL:-vi}}" "$NOTES" || warn "editor exited non-zero — using the text as it stands"
     fi
     mkdir -p "$FL_BASE/changelogs"
@@ -1155,11 +1175,10 @@ if [ "$DRYRUN" = 0 ] && [ -n "$FORGE_CLI" ]; then
       else
         PREVTAG="$(git -C "$REPO" describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
         if [ -n "$PREVTAG" ]; then
-          git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' "$PREVTAG..$TAG" > "$RELNOTES"
+          { git -C "$REPO" log --reverse --no-merges --pretty=format:'%s' "$PREVTAG..$TAG"; echo; } | clean_notes > "$RELNOTES"
         else
-          git -C "$REPO" log --reverse --no-merges --pretty=format:'- %s' -20 "$TAG" > "$RELNOTES"
+          { git -C "$REPO" log --reverse --no-merges --pretty=format:'%s' -20 "$TAG"; echo; } | clean_notes > "$RELNOTES"
         fi
-        printf '\n' >> "$RELNOTES"
       fi
       printf '%s' "$DIM"; sed 's/^/   | /' "$RELNOTES"; printf '%s' "$R"
       REL_OUT=""
