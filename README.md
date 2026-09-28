@@ -314,6 +314,15 @@ edits.insert → bundles.upload → deobfuscationFiles.upload
 Nothing reaches Google Play until you confirm; `--dry-run` stops after validate,
 and any run that fails part-way deletes its edit instead of leaving it open.
 
+### Version codes
+
+Play never accepts a versionCode twice, and it only says so once the whole
+bundle has been uploaded — a 50 MB round trip to be told the build was numbered
+wrong. So the wizard asks Play which codes it already holds while it is checking
+the package exists, compares that with `pubspec.yaml`'s `version: name+code` (or
+gradle's `versionCode`), and offers to bump before anything is built. A bundle
+built before the bump is treated as stale and rebuilt.
+
 ### What it needs
 
 - a **service account JSON key** in `~/.config/storepublisher/playstore/service-account.json`

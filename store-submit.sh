@@ -2698,6 +2698,30 @@ api_fail() {  # api_fail "what was being done"
   else
     sed 's/^/       /' "$API_BODY" >&2 | head -20
   fi
+  # Play answers 403 for a duplicate version code, a wrong signing key and a
+  # package mismatch as readily as for a missing permission, so the message is
+  # what decides the advice — the status on its own sends people to the wrong
+  # page entirely.
+  case "$msg" in
+    *"already been used"*|*"version code"*|*"Version code"*)
+      note "that versionCode is already taken — every upload needs a higher one." >&2
+      [ -n "${PLAY_VCODES:-}" ] && note "Play already has: $(echo "${PLAY_VCODES:-}" | tr ' ' ',')" >&2
+      case "${VER_KIND:-}" in
+        pubspec) note "bump the +N in ${VER_FILE#"$REPO"/} (version: name+N) and build again" >&2 ;;
+        gradle)  note "bump versionCode in ${VER_FILE#"$REPO"/} and build again" >&2 ;;
+        *)       note "bump the versionCode in your build files and build again" >&2 ;;
+      esac
+      exit 1 ;;
+    *"wrong key"*|*"signed with"*|*"signature"*|*"certificate"*|*"upload key"*|*"not signed"*)
+      note "the bundle is signed with a key Play does not accept for $PKG." >&2
+      note "it has to be the upload key registered under" >&2
+      note "  Test and release -> Setup -> App signing" >&2
+      note "the certificate this bundle carries is printed above" >&2
+      exit 1 ;;
+    *"package name"*|*"different package"*)
+      note "the bundle's package name is not $PKG — check the applicationId" >&2
+      exit 1 ;;
+  esac
   case "$API_STATUS" in
     401|403) note "the key itself is fine — Play Console has not given this account" >&2
              note "release access to $PKG:" >&2
@@ -2877,11 +2901,36 @@ ok "package: $PKG"
 # package name from the first bundle uploaded through the browser. Neither step
 # has an API — androidpublisher has no applications.create — so check now,
 # before the build and the rest of the questions.
+codes_of() {  # codes_of FILE bundles|apks — the versionCodes in a listing
+  python3 - "$1" "$2" <<'JSON_EOF'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print(" ".join(str(x["versionCode"]) for x in (d.get(sys.argv[2]) or [])
+               if isinstance(x, dict) and x.get("versionCode") is not None))
+JSON_EOF
+}
+
+# Every versionCode Play already holds for this package, newest last.
+PLAY_VCODES=""
+PLAY_MAX_VCODE=""
 package_known() {
   printf '{}' > "$WORK/empty.json"
   api POST "/androidpublisher/v3/applications/$PKG/edits" "$WORK/empty.json" || return 1
   local id; id="$(jget "$API_BODY" id)"
-  [ -n "$id" ] && api DELETE "/androidpublisher/v3/applications/$PKG/edits/$id" >/dev/null 2>&1
+  if [ -n "$id" ]; then
+    # What Play already holds decides whether this build can be uploaded at all,
+    # and asking costs two calls inside the edit that is open anyway.
+    for what in bundles apks; do
+      api GET "/androidpublisher/v3/applications/$PKG/edits/$id/$what" || continue
+      PLAY_VCODES="$PLAY_VCODES $(codes_of "$API_BODY" "$what")"
+    done
+    api DELETE "/androidpublisher/v3/applications/$PKG/edits/$id" >/dev/null 2>&1
+  fi
+  PLAY_VCODES="$(printf '%s\n' $PLAY_VCODES | sort -n -u | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
+  PLAY_MAX_VCODE="$(printf '%s\n' $PLAY_VCODES | sort -n | tail -1)"
   return 0
 }
 
@@ -2918,6 +2967,64 @@ else
       exit 0 ;;
     *) api_fail "could not look up $PKG" ;;
   esac
+fi
+
+# ---------------------------------------- the version code this build will get
+# Play refuses a versionCode it has already seen, and it refuses it at the END of
+# the upload — after the whole bundle has gone over the wire. The source files
+# say what the build will be numbered, so the clash can be caught here instead.
+VER_FILE=""; VER_KIND=""; LOCAL_VNAME=""; LOCAL_VCODE=""; FORCE_BUILD=0
+PUBSPEC=""
+if [ -n "$FLUTTER_DIR" ]; then
+  PUBSPEC="$REPO/$FLUTTER_DIR/pubspec.yaml"
+  [ "$FLUTTER_DIR" = "." ] && PUBSPEC="$REPO/pubspec.yaml"
+fi
+if [ -n "$PUBSPEC" ] && [ -f "$PUBSPEC" ]; then
+  # Flutter: `version: 1.2.3+45` is versionName+versionCode
+  VER_FILE="$PUBSPEC"; VER_KIND=pubspec
+  LOCAL_VNAME="$(sed -nE "s/^version:[[:space:]]*['\"]?([^+'\"[:space:]]+).*/\1/p" "$PUBSPEC" | sed -n 1p)"
+  LOCAL_VCODE="$(sed -nE "s/^version:[[:space:]]*[^+]*\+([0-9]+).*/\1/p" "$PUBSPEC" | sed -n 1p)"
+elif [ -n "$GRADLE_FILE" ]; then
+  VER_FILE="$GRADLE_FILE"; VER_KIND=gradle
+  LOCAL_VCODE="$(gval versionCode)"
+  LOCAL_VNAME="$(gval versionName)"
+fi
+case "$LOCAL_VCODE" in ''|*[!0-9]*) LOCAL_VCODE="" ;; esac
+[ -n "$PLAY_MAX_VCODE" ] && note "highest versionCode Play has for $PKG: $PLAY_MAX_VCODE"
+
+if [ -n "$LOCAL_VCODE" ] && [ -n "$PLAY_MAX_VCODE" ] && [ "$LOCAL_VCODE" -le "$PLAY_MAX_VCODE" ]; then
+  echo
+  warn "${VER_FILE#"$REPO"/} says versionCode $LOCAL_VCODE, which Play already has"
+  say "Play never accepts a versionCode twice, so this build cannot go up as it is."
+  if [ "$ASSUME_YES" = 0 ] && confirm "Bump it now?" y; then
+    while :; do
+      ask NEW_VCODE "New versionCode" "$((PLAY_MAX_VCODE + 1))"
+      case "$NEW_VCODE" in ''|*[!0-9]*) warn "versionCode must be a plain integer"; continue ;; esac
+      [ "$NEW_VCODE" -gt "$PLAY_MAX_VCODE" ] && break
+      warn "$NEW_VCODE is not above $PLAY_MAX_VCODE, so Play would reject it too"
+    done
+    case "$VER_KIND" in
+      pubspec)
+        awk -v v="$LOCAL_VNAME+$NEW_VCODE" 'BEGIN{done=0}
+          !done && /^version:[[:space:]]/ { print "version: " v; done=1; next } { print }' \
+          "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
+      gradle)
+        awk -v c="$NEW_VCODE" 'BEGIN{dc=0}
+          !dc && sub(/versionCode[[:space:]]*=?[[:space:]]*[0-9]+/, "versionCode = " c) { dc=1 }
+          { print }' "$VER_FILE" > "$VER_FILE.new" && mv "$VER_FILE.new" "$VER_FILE" ;;
+    esac
+    ok "${VER_FILE#"$REPO"/}: versionCode $LOCAL_VCODE -> $NEW_VCODE"
+    note "that edit is uncommitted — commit it with the release"
+    LOCAL_VCODE="$NEW_VCODE"
+    FORCE_BUILD=1   # whatever is already built still carries the old code
+    CL="$REPO/fastlane/metadata/android/en-US/changelogs/$NEW_VCODE.txt"
+    [ -f "$CL" ] || note "What's new goes in fastlane/metadata/android/en-US/changelogs/$NEW_VCODE.txt"
+  else
+    warn "no bump — Play will reject the upload unless the bundle you pick"
+    warn "already carries a code above $PLAY_MAX_VCODE"
+    [ "$ASSUME_YES" = 1 ] && die "versionCode $LOCAL_VCODE is already on Play"
+    confirm "Carry on anyway?" n || exit 1
+  fi
 fi
 
 # ------------------------------------------------ build a signed release bundle
@@ -3207,6 +3314,10 @@ if [ -z "$ARTIFACT" ]; then
     NEED_BUILD=1
   else
     note "found $(basename "$ART_GUESS") ($(date -r "$ART_GUESS" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 'unknown date'))"
+    if [ "$FORCE_BUILD" = 1 ]; then
+      warn "that one was built before the bump, so it still carries the old versionCode"
+      NEED_BUILD=1
+    fi
     case "$ART_GUESS" in
       *.apk) warn "that is an APK: Play has required an App Bundle for every app"
              warn "created since August 2021 — an APK only still works for an app"
