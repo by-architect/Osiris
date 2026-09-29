@@ -528,6 +528,8 @@ detect_runner() {
 # nothing, an ssh that refuses), and global git config out of the way when it
 # would reroute https to ssh.
 GIT_SHIM=""
+GIT_CFG_OFF=""      # set when global git config reroutes https, so fdroid ignores it
+GIT_REAL_FALSE=""   # a /bin/false that exists here, for git's ssh command
 git_rewrites_https() {  # true if git turns an https forge URL into something else
   local host out
   for host in github.com gitlab.com codeberg.org; do
@@ -546,6 +548,7 @@ make_git_shim() {
   if git_rewrites_https; then
     need=1
     drop_global="export GIT_CONFIG_GLOBAL=/dev/null"
+    GIT_CFG_OFF=1
   fi
   [ "$need" = 1 ] || return 0
   t="$(type -P true || true)"; f="$(type -P false || true)"; g="$(type -P git || true)"
@@ -553,6 +556,7 @@ make_git_shim() {
     warn "no /bin/true, /bin/false or git replacement found — fdroid's clones may fail"
     return 0
   fi
+  GIT_REAL_FALSE="$f"
   GIT_SHIM="$WORK/gitshim"
   mkdir -p "$GIT_SHIM"
   cat > "$GIT_SHIM/git" <<SHIM
@@ -583,12 +587,22 @@ SHIM
 }
 
 frun() {  # frun <fdroid args...>   — run inside $FDROIDDATA
+  # The shim below goes on PATH, but PATH alone is not enough: a packaged
+  # fdroid (nix, pipx) is a wrapper script that prepends its own store paths,
+  # so the real git wins and the shim is never called. Pass the same fixes as
+  # environment variables too, which no wrapper reorders. fdroidserver sets
+  # GIT_ASKPASS and GIT_SSH itself, but not GIT_SSH_COMMAND (which outranks
+  # GIT_SSH) and not GIT_CONFIG_GLOBAL, so these two still land.
+  local envs=()
+  [ -n "$GIT_CFG_OFF" ] && envs+=("GIT_CONFIG_GLOBAL=/dev/null")
+  [ -n "$GIT_REAL_FALSE" ] && envs+=("GIT_SSH_COMMAND=$GIT_REAL_FALSE")
   case "$RUNNER" in
-    path)     ( cd "$FDROIDDATA" && PATH="${GIT_SHIM:+$GIT_SHIM:}$PATH" fdroid "$@" ) ;;
+    path)     ( cd "$FDROIDDATA" && PATH="${GIT_SHIM:+$GIT_SHIM:}$PATH" \
+                env "${envs[@]+"${envs[@]}"}" fdroid "$@" ) ;;
     checkout) ( cd "$FDROIDDATA" && \
                 PATH="${GIT_SHIM:+$GIT_SHIM:}$FDROIDSERVER_DIR:$PATH" \
                 PYTHONPATH="$FDROIDSERVER_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-                "$FDROIDSERVER_DIR/fdroid" "$@" ) ;;
+                env "${envs[@]+"${envs[@]}"}" "$FDROIDSERVER_DIR/fdroid" "$@" ) ;;
     none)     warn "skipped: fdroid $*"; return 0 ;;
   esac
 }
@@ -661,6 +675,96 @@ sync_mr_description() {
   else
     warn "glab could not update it — paste it yourself from $body"
   fi
+}
+
+# reference_apk_reproducible <apk> <appid> — will F-Droid's rebuild match this?
+# A Flutter APK carries the absolute path of its generated plugin registrant
+# inside lib/*/libapp.so, and a hash of that path spreads through the whole Dart
+# snapshot. The rebuild therefore has to happen at the same path, or the
+# reproducible-build check fails on libapp.so however identical everything else
+# is. The apps in fdroiddata that manage this do not move their own build: they
+# make F-Droid build where they built, with a sudo line and a mv in the recipe.
+# reference_apk_blocks <apk> — F-Droid's scanner rejects an APK carrying extra
+# signing blocks. The Android Gradle Plugin adds one, "Dependency metadata", for
+# Play Console; nothing outside Play reads it, and it fails the "check apk" job
+# after everything else has already passed.
+reference_apk_blocks() {
+  have python3 || return 0
+  python3 - "$1" <<'PYBLOCKS'
+import struct, sys
+KNOWN = {0x7109871a: 'v2 signature', 0xf05368c0: 'v3 signature',
+         0x1b93ad61: 'v3.1 signature', 0x42726577: 'padding',
+         0x504b4453: 'Dependency metadata'}
+d = open(sys.argv[1], 'rb').read()
+i = d.rfind(b'APK Sig Block 42')
+if i < 0:
+    sys.exit(0)
+size_end = struct.unpack('<Q', d[i - 8:i])[0]
+start = i + 8 - size_end
+size_begin = struct.unpack('<Q', d[start:start + 8])[0]
+p, end, bad = start + 8, start + 8 + size_begin - 24, []
+while p < end:
+    ln = struct.unpack('<Q', d[p:p + 8])[0]
+    bid = struct.unpack('<I', d[p + 8:p + 12])[0]
+    if bid == 0x504b4453:
+        bad.append(KNOWN[bid])
+    p += 8 + ln
+print("\n".join(bad))
+PYBLOCKS
+}
+
+reference_apk_build_path() {  # the directory the APK was compiled in, if it says
+  local found
+  { have unzip && have strings; } || return 0
+  found="$(unzip -p "$1" 'lib/*/libapp.so' 2>/dev/null \
+            | strings -n 20 2>/dev/null \
+            | grep -m1 -oE 'file://[^"]*dart_plugin_registrant\.dart' || true)"
+  [ -n "$found" ] || return 0
+  found="${found#file://}"
+  printf '%s' "${found%/.dart_tool/*}"
+}
+reference_apk_reproducible() {
+  local apk="$1" appid="$2" path top
+  path="$(reference_apk_build_path "$apk")"
+  [ -n "$path" ] || return 0    # not Flutter, or nothing baked in: nothing to say
+  case "$path" in
+    /home/vagrant/build/"$appid"*) ok "built at F-Droid's own path — it can reproduce this"; return 0 ;;
+  esac
+  ok "the APK was built in: $path"
+  case "$path" in
+    /tmp/*|*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*)
+      warn "that looks like a throwaway directory — a later release built elsewhere"
+      warn "would stop reproducing. Build releases somewhere fixed (CI is ideal:"
+      warn "GitHub Actions is always /home/runner/work/<repo>/<repo>)." ;;
+  esac
+  note "F-Droid must build there too, or libapp.so will differ. Add to each build"
+  note "entry — this is how the Flutter apps in fdroiddata do it:"
+  # the path above ends in the app's subdir; the whole checkout moves, not just it
+  local root="$path" sub="${FLUTTER_DIR:-${SUBDIR:-}}" ups=.. depth=1
+  case "$sub" in
+    ''|.) ;;
+    *) root="${path%/$sub}"
+       depth=$(( $(printf '%s' "$sub" | tr -cd / | wc -c) + 2 )) ;;
+  esac
+  ups="$(n=0; while [ "$n" -lt "$depth" ]; do printf '../'; n=$((n+1)); done)"
+  top="/$(printf '%s' "${root#/}" | cut -d/ -f1-2)"
+  cat <<SNIPPET
+       sudo:
+         - mkdir -p ${root%/*}
+         - chown -R vagrant $top
+       prebuild:
+         - export repo=$root
+         - cd ${ups%/}           # out of the build dir, so it can be moved
+         - mv $appid \$repo
+         - pushd \$repo${sub:+/$sub}    # …the usual prebuild steps here…
+         - popd
+         - mv \$repo $appid
+SNIPPET
+  note "and the same move around the build: steps. A native plugin may also stamp"
+  note "a random build id; neutralise it, e.g. for package:jni"
+  note "  sed -i -e '/^cmake_minimum_required/a add_link_options(\"LINKER:--build-id=none\")' \\"
+  note "    \$PUB_CACHE/hosted/pub.dev/jni-*/src/CMakeLists.txt"
+  return 1
 }
 
 # ------------------------------------------------- -p: just the merge request
@@ -1917,9 +2021,16 @@ else
   ask MODE "Which?" "1"
 
   if [ "$MODE" = "2" ]; then
-    note "use %v where the version goes, e.g. .../releases/download/v%v/App-%v.apk"
     # Name the file after the project, not the local checkout's folder.
-    ask BINARIES "Binaries URL pattern" "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v.apk}"
+    if [ "$ABISPLIT" = 1 ]; then
+      note "use %v for the version and %abi for the CPU type, e.g."
+      note "  .../releases/download/v%v/App-%v-%abi.apk"
+      note "each CPU type gets its own build entry, so each gets its own binary: line"
+      ask BINARIES "Release APK URL pattern" "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v-%abi.apk}"
+    else
+      note "use %v where the version goes, e.g. .../releases/download/v%v/App-%v.apk"
+      ask BINARIES "Binaries URL pattern" "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v.apk}"
+    fi
     say "The signing certificate SHA-256 of your release APK is needed."
     if confirm "Extract it from a local APK now?" y; then
       ask APKPATH "Path to your signed release APK" ""
@@ -1943,10 +2054,33 @@ else
                      | awk '/SHA256:/ {print $2; exit}' | tr -d ':' | tr 'A-Z' 'a-z')"
         fi
         [ -n "$SIGNKEY" ] && ok "signing key: $SIGNKEY" || warn "could not read it automatically"
+        reference_apk_blocks "$APKPATH" | while IFS= read -r blk; do
+          [ -n "$blk" ] || continue
+          warn "the APK carries an extra signing block: $blk"
+          note "F-Droid's scanner refuses it — the \"check apk\" job fails once"
+          note "everything else has passed. Switch it off in the gradle file:"
+          note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
+          note "that changes the APK, so it needs a new version and new binaries"
+        done
+        reference_apk_reproducible "$APKPATH" "$APPID" || \
+          confirm "Submit with reproducible builds anyway?" n || \
+          die "build the APK you publish at F-Droid's path first, then re-run"
       fi
     fi
     [ -n "$SIGNKEY" ] || ask SIGNKEY "AllowedAPKSigningKeys (SHA-256, lowercase hex)" ""
-    [ "$ABISPLIT" = 1 ] && note "with one APK per CPU type, use %c (versionCode) in the Binaries pattern too"
+    # Binaries: is one app-level pattern and only knows %v and %c, so it cannot
+    # name per-ABI release assets. fdroidserver takes `build.binary or
+    # app.Binaries`, so with a split each entry carries its own binary: line.
+    if [ "$ABISPLIT" = 1 ] && [ -n "$BINARIES" ]; then
+      awk -v pat="$BINARIES" '
+        function emit(abi,   b) { b = pat; gsub(/%abi/, abi, b); print "    binary: " b }
+        { print }
+        /^    output: .*armeabi-v7a/ { emit("armeabi-v7a") }
+        /^    output: .*arm64-v8a/   { emit("arm64-v8a") }
+        /^    output: .*x86_64/      { emit("x86_64") }
+      ' "$BUILD_BLOCK" > "$BUILD_BLOCK.new" && mv "$BUILD_BLOCK.new" "$BUILD_BLOCK"
+      ok "each build entry points at its own APK on the release page"
+    fi
   fi
   fi
 
@@ -2000,7 +2134,8 @@ else
     printf 'RepoType: git\n'
     printf 'Repo: %s\n' "$REPOURL"
     [ "$REQROOT" = true ] && printf 'RequiresRoot: true\n'
-    [ -n "$BINARIES" ]    && printf 'Binaries: %s\n' "$BINARIES"
+    # with a split it went into each build entry as binary:, above
+    [ -n "$BINARIES" ] && [ "$ABISPLIT" = 0 ] && printf 'Binaries: %s\n' "$BINARIES"
     printf '\n'
     printf 'Builds:\n'
     cat "$BUILD_BLOCK"
