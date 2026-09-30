@@ -901,8 +901,29 @@ for p in "$REPO/pubspec.yaml" "$REPO"/*/pubspec.yaml "$REPO"/*/*/pubspec.yaml; d
   FLUTTER_DIR="${d#"$REPO"}"; FLUTTER_DIR="${FLUTTER_DIR#/}"; FLUTTER_DIR="${FLUTTER_DIR:-.}"
   break
 done
+# Flutter or not decides the whole build recipe — the srclib, the prebuild
+# steps, one APK per CPU type — so it is confirmed rather than assumed, and can
+# be answered either way when the guess is wrong.
 if [ -n "$FLUTTER_DIR" ]; then
   ok "Flutter app in ${FLUTTER_DIR}/"
+  if [ "$ASSUME_YES" = 0 ] && ! confirm "Build it as a Flutter app?" y; then
+    FLUTTER_DIR=""
+    note "treating it as a plain Gradle app instead"
+  fi
+elif [ "$ASSUME_YES" = 0 ] && confirm "Is this a Flutter app? (no pubspec.yaml was found)" n; then
+  ask FLUTTER_DIR "Path to the Flutter module, relative to the repo" "."
+  FLUTTER_DIR="${FLUTTER_DIR#./}"; FLUTTER_DIR="${FLUTTER_DIR%/}"; FLUTTER_DIR="${FLUTTER_DIR:-.}"
+  if [ ! -f "$REPO/$FLUTTER_DIR/pubspec.yaml" ]; then
+    warn "no pubspec.yaml in $REPO/$FLUTTER_DIR"
+    if confirm "Use the Flutter recipe anyway?" n; then
+      note "the build will probably need hand-editing before it works"
+    else
+      FLUTTER_DIR=""
+      note "treating it as a plain Gradle app"
+    fi
+  fi
+fi
+if [ -n "$FLUTTER_DIR" ]; then
   FLUTTER_ANDROID="$FLUTTER_DIR/android/app"; FLUTTER_ANDROID="${FLUTTER_ANDROID#./}"
 fi
 
@@ -1936,16 +1957,48 @@ else
   ask LICENSE "License" "$LIC_GUESS"
 
   # --- categories
-  CATS_ALL="Connectivity Development Games Graphics Internet Money Multimedia Navigation Phone&SMS Reading Science&Education Security Sports&Health System Theming Time Writing"
-  CATS_MAX="$(echo "$CATS_ALL" | wc -w)"
+  # fdroiddata keeps the real list in config/categories.yml, and it is nothing
+  # like the old handful: ~120 precise ones (Bookmark, Ebook Reader, Password
+  # Manager…). lint rejects anything not in it, and reviewers ask for the
+  # precise one, so read the list out of the clone rather than guessing.
+  CATS_FILE="$FDROIDDATA/config/categories.yml"
+  CATS=()
+  if [ -f "$CATS_FILE" ]; then
+    while IFS= read -r line; do CATS+=("$line"); done < <(
+      sed -n "s/^\([A-Za-z][A-Za-z0-9 &_.,'-]*\):[[:space:]]*$/\1/p" "$CATS_FILE")
+  fi
+  if [ "${#CATS[@]}" -lt 5 ]; then
+    warn "could not read $CATS_FILE — falling back to the old short list"
+    CATS=(Connectivity Development Games Graphics Internet Money Multimedia
+          Navigation "Phone & SMS" Reading "Science & Education" Security
+          "Sports & Health" System Theming Time Writing)
+  fi
+  CATS_MAX="${#CATS[@]}"
+
   # Only a person can pick these; after the first run they're remembered.
   # (remembered per app — another app's categories are no guess for this one)
   CATSEL=""
   [ "${SAVED_CATSEL_APP:-}" = "$APPID" ] && CATSEL="${SAVED_CATSEL:-}"
+  print_cats() {  # print_cats [filter] — numbered, in columns, narrowed if asked
+    local i=1 shown=0 c
+    for c in "${CATS[@]}"; do
+      if [ -z "${1-}" ] || printf '%s' "$c" | grep -qi -- "$1"; then
+        printf '   %3d) %-26s' "$i" "$c"; shown=$((shown + 1))
+        [ $((shown % 3)) = 0 ] && printf '\n'
+      fi
+      i=$((i + 1))
+    done
+    [ $((shown % 3)) = 0 ] || printf '\n'
+    [ "$shown" = 0 ] && warn "nothing matches \"$1\""
+    return 0
+  }
   if [ -z "$CATSEL" ] || [ "$ASK_ALL" = 1 ]; then
     [ "$ASSUME_YES" = 1 ] && [ -z "$CATSEL" ] && die "--yes: pick the categories once in a normal run first"
-    say "Categories (pick one or more by number, space separated):"
-    i=1; for c in $CATS_ALL; do printf '     %2d) %s\n' "$i" "${c//&/ & }"; i=$((i+1)); done
+    say "$CATS_MAX categories. Type a word to narrow the list, or Enter to see them all."
+    ask_opt CATFILTER "Narrow by" ""
+    print_cats "$CATFILTER"
+    say "Pick one or more by number, space separated. Reviewers ask for the"
+    say "precise one — pick the category that names what the app is."
   fi
   while :; do
     if [ -z "$CATSEL" ] || [ "$ASK_ALL" = 1 ]; then ask CATSEL "Numbers" "$CATSEL"; fi
@@ -1953,8 +2006,7 @@ else
     for n in $CATSEL; do
       case "$n" in ''|*[!0-9]*) BADSEL="$n"; break ;; esac
       [ "$n" -ge 1 ] && [ "$n" -le "$CATS_MAX" ] || { BADSEL="$n"; break; }
-      c="$(echo "$CATS_ALL" | awk -v k="$n" '{print $k}')"
-      CATEGORIES="$CATEGORIES${CATEGORIES:+|}${c//&/ & }"
+      CATEGORIES="$CATEGORIES${CATEGORIES:+|}${CATS[$((n - 1))]}"
     done
     [ -z "$BADSEL" ] && [ -n "$CATEGORIES" ] && break
     warn "'${BADSEL:-}' is not one of 1-$CATS_MAX"; CATSEL=""
@@ -1965,9 +2017,16 @@ else
   auto SOURCE  "SourceCode"   "$WEB_GUESS"
   auto REPOURL "Repo" "${WEB_GUESS:+$WEB_GUESS.git}"
   case "$REPOURL" in *.git) ;; *) warn "Repo usually ends in .git — fdroid lint will say so" ;; esac
-  auto_opt ISSUES    "IssueTracker"  "${WEB_GUESS:+$WEB_GUESS/issues}"
-  auto_opt CHANGELOG "Changelog"     "${WEB_GUESS:+$WEB_GUESS/releases}"
-  auto_opt WEBSITE   "WebSite" "${SAVED_WEBSITE:-}"
+  # Every optional field gets asked: blank leaves it out, "-" clears a
+  # remembered one. They all show on the app's f-droid.org page.
+  note "the rest are optional — Enter to accept, blank to leave out"
+  ask_opt ISSUES      "IssueTracker"   "${WEB_GUESS:+$WEB_GUESS/issues}"
+  ask_opt CHANGELOG   "Changelog"      "${WEB_GUESS:+$WEB_GUESS/releases}"
+  ask_opt WEBSITE     "WebSite"        "${SAVED_WEBSITE:-}"
+  ask_opt TRANSLATION "Translation (Weblate, Crowdin…)" ""
+  ask_opt DONATE      "Donate (a page that takes donations)" ""
+  ask_opt LIBERAPAY   "Liberapay (the name, not the URL)" ""
+  ask_opt OPENCOLLECTIVE "OpenCollective (the name, not the URL)" ""
 
   # --- author
   # fdroiddata requires an AuthorName (any name, it needn't be your real one).
@@ -1983,7 +2042,7 @@ else
 
   # --- flags
   REQROOT=false
-  if [ "$ASK_ALL" = 1 ]; then confirm "Does the app require root?" n && REQROOT=true; fi
+  confirm "Does the app need root access on the device?" n && REQROOT=true
 
   # --- anti-features
   AF_ALL="Ads Tracking NonFreeNet NonFreeAdd NonFreeDep NonFreeAssets UpstreamNonFree NoSourceSince KnownVuln"
@@ -2120,8 +2179,12 @@ else
     [ -n "$AUTHORSITE" ]  && printf 'AuthorWebSite: %s\n' "$AUTHORSITE"
     [ -n "$WEBSITE" ]     && printf 'WebSite: %s\n' "$WEBSITE"
     printf 'SourceCode: %s\n' "$SOURCE"
-    [ -n "$ISSUES" ]      && printf 'IssueTracker: %s\n' "$ISSUES"
-    [ -n "$CHANGELOG" ]   && printf 'Changelog: %s\n' "$CHANGELOG"
+    [ -n "$ISSUES" ]         && printf 'IssueTracker: %s\n' "$ISSUES"
+    [ -n "${TRANSLATION:-}" ] && printf 'Translation: %s\n' "$TRANSLATION"
+    [ -n "$CHANGELOG" ]      && printf 'Changelog: %s\n' "$CHANGELOG"
+    [ -n "${DONATE:-}" ]         && printf 'Donate: %s\n' "$DONATE"
+    [ -n "${LIBERAPAY:-}" ]      && printf 'Liberapay: %s\n' "$LIBERAPAY"
+    [ -n "${OPENCOLLECTIVE:-}" ] && printf 'OpenCollective: %s\n' "$OPENCOLLECTIVE"
     printf '\n'
     [ -n "$AUTONAME" ]    && printf 'AutoName: %s\n\n' "$AUTONAME"
     if [ -n "$ANTIFEATURES" ]; then
