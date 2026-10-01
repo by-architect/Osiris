@@ -815,3 +815,36 @@ source-only uploads; it builds the binaries itself.
 - a [Launchpad account](https://launchpad.net/+login) and podman or docker
 - a GPG key (the wizard can make one); its email must be a confirmed address
   of your Launchpad account
+
+## Testing other people's apps for F-Droid: `fdroid-tester.sh`
+
+New apps wait in fdroiddata until someone tests them on a device. This script
+does the testing work on
+[F-Droid's tester checklist](https://gitlab.com/fdroid/wiki/-/wikis/Internal/Reviewing-new-apps)
+for one merge request, and writes the report to post on it.
+
+```sh
+./fdroid-tester.sh https://gitlab.com/fdroid/fdroiddata/-/merge_requests/38458
+./fdroid-tester.sh 38458 --no-device   # only look inside the APK, no phone
+```
+
+Pick merge requests from the
+[review-requested list](https://gitlab.com/fdroid/fdroiddata/-/merge_requests/?sort=created_asc&state=opened&label_name[]=review-requested).
+The script:
+
+- reads the merge request's Code Quality report (APK link, permissions, CI warnings)
+- downloads the APK that fits the phone into the current folder
+- looks inside it: special and runtime permissions, tracker code (Exodus list),
+  web addresses in the code, WebView, languages, debuggable/cleartext flags
+- installs it with adb, records its traffic with
+  [PCAPdroid](https://f-droid.org/packages/com.emanuelef.remote_capture/) if the
+  phone has it, opens it, and watches the first seconds: crash, permission prompt
+  on start, connections on start
+- asks what only you can tell (does it work, its icon, terms, English…)
+- writes `<appid>_<versionCode>-review/report.md` in the wiki's template, ticked
+  from what it found, plus screenshots, the capture and the crash log
+
+Needs `adb`, `curl`, `python3`, `unzip` and Android build-tools (`aapt2`).
+Optional keys, one line per file, in `~/.config/fdroid-tester/`:
+`pcapdroid-api-key` (PCAPdroid starts without a prompt on the phone) and
+`virustotal-api-key` (the scan result goes into the report).
