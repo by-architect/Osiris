@@ -33,10 +33,11 @@ wizard_fdroid() {
 #   https://f-droid.org/docs/Submitting_to_F-Droid_Quick_Start_Guide/
 #   https://f-droid.org/docs/Build_Metadata_Reference/
 #
-# It detects what it can from your app repo and only asks for the rest, writes
-# (or, for an app already in F-Droid, extends) metadata/<applicationId>.yml in
-# your fdroiddata fork, validates it with the fdroid CLI, pushes a branch and —
-# with glab logged in — opens the merge request.
+# It detects what it can from your app repo, then asks about every line of
+# metadata/<applicationId>.yml in your fdroiddata fork — starting from F-Droid's
+# file for an update, your own copy, or another app built the same way — so a
+# recipe can be shaped app by app. It validates the file with the fdroid CLI,
+# pushes a branch and — with glab logged in — opens the merge request.
 #
 # Nothing leaves your machine without asking first, unless you pass --yes.
 
@@ -64,7 +65,8 @@ store-submit.sh fdroid — interactive wizard for getting an Android app into F-
   -h, --help        show this text
   -y, --yes         use everything it detects and don't ask; stops only on
                     problems. A version update becomes a single command.
-      --ask         ask every question, including the ones it can answer
+      --ask         also ask what it can work out about your repo itself
+                    (every line of the recipe is asked either way)
       --repo PATH     the app's git checkout (default: the repo you run it in)
       --build       also run the full `fdroid build` (slow)
       --rfp         open a Request For Packaging issue too (new apps)
@@ -1406,6 +1408,15 @@ if sed -e 's,//.*,,' "$GRADLE_FILE" \
   BLOCKERS=$((BLOCKERS+1))
 fi
 
+# The Android Gradle Plugin signs a "Dependency metadata" block into every APK
+# for Play Console. F-Droid's "check apk" job flags it, and nothing outside
+# Play reads it, so reviewers ask for it to be switched off.
+if ! git -C "$REPO" grep -qE 'includeInApk[[:space:]]*=?[[:space:]]*false' -- '*.gradle' '*.gradle.kts' 2>/dev/null; then
+  warn "the APK will carry Google's \"Dependency metadata\" block — F-Droid's CI flags it"
+  note "switch it off in ${GRADLE_FILE#"$REPO"/}:"
+  note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
+fi
+
 if [ -n "$FLUTTER_DIR" ]; then
   PUBSPEC="$REPO/$FLUTTER_DIR/pubspec.yaml"
   # Plugins that pull in Google Play services / Firebase / ads.
@@ -1675,22 +1686,1027 @@ ok "branch: $BRANCH (off $BASE)"
 # ================================================================ 3. metadata
 step "3/5  Metadata"
 
-# --- the build entry, needed in both modes -----------------------------------
-# No `sudo:` lines by default. F-Droid's buildserver already carries the JDKs,
-# reviewers ask for sudo to be removed when they see it, and a pinned version
-# rots: the move to Debian trixie dropped openjdk-17 and broke every entry that
-# named it. Only --ask offers one, and only an explicit answer emits it.
-if [ "$ASK_ALL" = 1 ]; then
-  note "the build container already has JDKs — leave this blank unless a build needs a specific one"
-  ask_opt JDK "JDK to apt-get in the build container (blank = none, what reviewers prefer)" ""
-else
-  JDK=""
+# Every line of metadata/<appid>.yml is asked, one at a time, with the best
+# default there is: the answer given last time, else the recipe this run starts
+# from — F-Droid's own file for an update, your merge request's or your app
+# repo's copy, or another app built the same way — else what was detected.
+# Enter keeps a line, a new value replaces it, "-" leaves it out, and any field
+# of the Build Metadata Reference can be added. F-Droid recipes differ app by
+# app, so nothing goes into the file without being shown to you first.
+have python3 || die "python3 is needed to read and write metadata/$APPID.yml (fdroidserver needs it too)"
+cat > "$WORK/recipe.py" <<'PYRECIPE'
+import os, re, sys
+
+# recipe.py — reads and writes fdroiddata metadata for store-submit.sh, which
+# asks about it one line at a time. A field lives as a file: <dir>/top/<Key>,
+# or <dir>/b/<n>/<key> for build entry n, holding the value, and beside it
+# <name>.k holding its kind:
+#   s  one line                    l  a list, one item per line
+#   b  a block of text             a  anti-features: "Name" or "Name: why"
+#   r  YAML kept exactly as written (a structure this file does not take apart)
+# A <name>.del file in a result folder means: leave this field out.
+
+# fdroidserver's own order (metadata.py: yaml_app_field_order, build_flags)
+TOP_ORDER = [
+    'Disabled', 'AntiFeatures', 'Categories', 'License', 'AuthorName',
+    'AuthorEmail', 'AuthorWebSite', 'WebSite', 'SourceCode', 'IssueTracker',
+    'Translation', 'Changelog', 'Donate', 'Liberapay', 'OpenCollective',
+    'Bitcoin', 'Litecoin', '\n',
+    'Name', 'AutoName', 'Summary', 'Description', '\n',
+    'RequiresRoot', '\n',
+    'RepoType', 'Repo', 'Binaries', '\n',
+    'Builds', '\n',
+    'AllowedAPKSigningKeys', '\n',
+    'MaintainerNotes', '\n',
+    'ArchivePolicy', 'AutoUpdateMode', 'UpdateCheckMode', 'UpdateCheckIgnore',
+    'VercodeOperation', 'UpdateCheckName', 'UpdateCheckData', 'CurrentVersion',
+    'CurrentVersionCode', '\n',
+    'NoSourceSince',
+]
+TOP_KEYS = [k for k in TOP_ORDER if k != '\n']
+BUILD_ORDER = [
+    'versionName', 'versionCode', 'disable', 'commit', 'timeout', 'subdir',
+    'submodules', 'sudo', 'init', 'patch', 'gradle', 'maven', 'output',
+    'binary', 'srclibs', 'oldsdkloc', 'encoding', 'forceversion',
+    'forcevercode', 'rm', 'extlibs', 'prebuild', 'androidupdate', 'target',
+    'scanignore', 'scandelete', 'build', 'buildjni', 'ndk', 'preassemble',
+    'gradleprops', 'antcommands', 'postbuild', 'novcheck', 'antifeatures',
+]
+# A script with a single command is written on one line, as rewritemeta does.
+SCRIPTS = {'sudo', 'init', 'prebuild', 'build', 'postbuild'}
+# Numbers and booleans: written plain, never quoted.
+PLAIN = {'versionCode', 'CurrentVersionCode', 'ArchivePolicy', 'timeout',
+         'RequiresRoot', 'submodules', 'oldsdkloc', 'forceversion',
+         'forcevercode', 'novcheck'}
+ANTIF = {'AntiFeatures', 'antifeatures'}
+
+KEY = re.compile(r'^([A-Za-z0-9_][\w.-]*):(?:[ \t]+(.*?))?[ \t]*$')
+BLOCK = {'|', '|-', '|+', '>', '>-', '>+'}
+
+
+def indent(s):
+    return len(s) - len(s.lstrip(' '))
+
+
+def dedent(lines):
+    real = [l for l in lines if l.strip()]
+    if not real:
+        return []
+    cut = min(indent(l) for l in real)
+    return [l[cut:] if l.strip() else '' for l in lines]
+
+
+def unquote(s):
+    s = s.strip()
+    if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        esc = {'n': '\n', 't': '\t', '"': '"', '\\': '\\', '/': '/', ' ': ' '}
+        return re.sub(r'\\(.)', lambda m: esc.get(m.group(1), m.group(0)), s[1:-1])
+    m = re.search(r'\s#', s)          # a comment after a plain value
+    return s[:m.start()].rstrip() if m else s
+
+
+def flow_list(s):
+    s = s.strip()
+    if s == '[]':
+        return []
+    return [unquote(x) for x in s[1:-1].split(',') if x.strip()]
+
+
+def parse_map(lines):
+    """[(key, kind, value)] from lines whose keys start at column 0."""
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip() or line[0] in ' #':
+            i += 1
+            continue
+        m = KEY.match(line)
+        if not m:
+            i += 1
+            continue
+        key, rest = m.group(1), (m.group(2) or '')
+        j = i + 1
+        while j < n and (not lines[j].strip() or lines[j][0] == ' '):
+            j += 1
+        child = lines[i + 1:j]
+        while child and not child[-1].strip():
+            child.pop()
+        if key == 'Builds' and not rest:
+            out.append((key, 'B', parse_builds(child)))
+        else:
+            out.append(parse_value(key, rest, child))
+        i = j
+    return out
+
+
+def parse_value(key, rest, child):
+    if rest in BLOCK:
+        return key, 'b', '\n'.join(dedent(child)).rstrip('\n')
+    if rest.startswith('[') and rest.rstrip().endswith(']'):
+        return antif(key, 'l', flow_list(rest))
+    if rest.strip() == '{}':
+        return key, 's', ''
+    if rest:
+        # a value on the key's line, maybe folded onto the lines after it
+        val = ' '.join([rest] + [c.strip() for c in child if c.strip()])
+        val = unquote(val)
+        return (key, 'b', val) if '\n' in val else (key, 's', val)
+    real = [c for c in child if c.strip()]
+    if not real:
+        return key, 's', ''
+    at = min(indent(c) for c in real)
+    first = real[0][at:]
+    if first.startswith('- ') or first == '-':
+        items = []
+        for c in child:
+            if not c.strip():
+                continue
+            if indent(c) == at and (c[at:].startswith('- ') or c[at:] == '-'):
+                items.append(c[at + 2:].strip())
+            elif items:                    # an item folded onto more lines
+                items[-1] += ' ' + c.strip()
+        return antif(key, 'l', [unquote(x) for x in items])
+    if KEY.match(first):
+        if key in ANTIF:
+            return antif_map(key, dedent(child))
+        return key, 'r', dedent(child)
+    val = unquote(' '.join(c.strip() for c in real))
+    return (key, 'b', val) if '\n' in val else (key, 's', val)
+
+
+def antif(key, kind, items):
+    return (key, 'a', items) if key in ANTIF else (key, kind, items)
+
+
+def antif_map(key, lines):
+    """Anti-features with reasons; kept as written unless every reason is en-US."""
+    out = []
+    for name, kind, val in parse_map(lines):
+        if kind == 's':
+            out.append(name + (': ' + val if val else ''))
+            continue
+        if kind != 'r':
+            return key, 'r', lines
+        locs = parse_map(val)
+        if any(k != 'en-US' or kd != 's' for k, kd, _ in locs):
+            return key, 'r', lines
+        why = locs[0][2] if locs else ''
+        out.append(name + (': ' + why if why else ''))
+    return key, 'a', out
+
+
+def parse_builds(child):
+    real = [c for c in child if c.strip()]
+    if not real:
+        return []
+    at = min(indent(c) for c in real)
+    entries, cur = [], None
+    for c in child:
+        if not c.strip():
+            if cur is not None:
+                cur.append('')
+            continue
+        if indent(c) == at and c[at:].startswith('- '):
+            cur = [' ' * (at + 2) + c[at + 2:]]
+            entries.append(cur)
+        elif cur is not None:
+            cur.append(c)
+    return [parse_map([l[at + 2:] if l.strip() else '' for l in e]) for e in entries]
+
+
+# ---------------------------------------------------------------- field files
+def write_field(d, name, kind, value):
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, name)
+    with open(p, 'w') as f:
+        if kind in ('l', 'a', 'r'):
+            f.write(''.join(v + '\n' for v in value))
+        else:
+            f.write(value + '\n')
+    with open(p + '.k', 'w') as f:
+        f.write(kind + '\n')
+
+
+def read_field(p):
+    try:
+        kind = open(p + '.k').read().strip() or 's'
+    except FileNotFoundError:
+        kind = 's'
+    text = open(p).read()
+    if kind in ('l', 'a'):
+        return kind, [l for l in text.split('\n') if l.strip()]
+    if kind == 'r':
+        lines = text.split('\n')
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return kind, lines
+    return kind, text.rstrip('\n')
+
+
+def read_dir(d, order):
+    """{name: (kind, value)} for the fields in d, and the names to leave out."""
+    fields, dels = {}, set()
+    if not os.path.isdir(d):
+        return fields, dels
+    names = sorted(os.listdir(d))
+    for f in names:
+        p = os.path.join(d, f)
+        if f.endswith('.del'):
+            dels.add(f[:-4])
+        elif not f.endswith('.k') and os.path.isfile(p):
+            fields[f] = read_field(p)
+    known = [k for k in order if k in fields]
+    rest = [k for k in fields if k not in order]
+    return {k: fields[k] for k in known + rest}, dels
+
+
+def read_entries(d):
+    out, n = [], 1
+    while os.path.isdir(os.path.join(d, 'b', str(n))):
+        fields, _ = read_dir(os.path.join(d, 'b', str(n)), BUILD_ORDER)
+        out.append(fields)
+        n += 1
+    return out
+
+
+def write_entries(d, entries):
+    for n, e in enumerate(entries, 1):
+        for k, (kind, v) in e.items():
+            write_field(os.path.join(d, 'b', str(n)), k, kind, v)
+    with open(os.path.join(d, 'b.count'), 'w') as f:
+        f.write('%d\n' % len(entries))
+
+
+# ---------------------------------------------------------------- commands
+def cmd_load(path, out):
+    """Take a metadata file apart into field files."""
+    lines = open(path, encoding='utf-8').read().split('\n')
+    os.makedirs(os.path.join(out, 'top'), exist_ok=True)
+    order, entries = [], []
+    for key, kind, val in parse_map(lines):
+        if kind == 'B':
+            entries = [{k: (kd, v) for k, kd, v in e} for e in val]
+            continue
+        write_field(os.path.join(out, 'top'), key, kind, val)
+        order.append(key)
+    with open(os.path.join(out, 'top.order'), 'w') as f:
+        f.write(''.join(k + '\n' for k in order))
+    write_entries(out, entries)
+
+
+def code_of(e):
+    try:
+        return int(e.get('versionCode', ('s', '0'))[1])
+    except ValueError:
+        return 0
+
+
+def evalop(op, vcode):
+    expr = op.replace('%c', str(vcode))
+    if not re.fullmatch(r'[\d\s+\-*/()]+', expr):
+        raise ValueError(op)
+    return int(eval(expr.replace('//', '/').replace('/', '//')))
+
+
+def cmd_template(gdir, ddir, kind, out, vcode):
+    """The new build entries: the generator's, on top of the base recipe's.
+
+    The version lines are always this run's. Everything else comes from the
+    base when there is one: the previous release's entries for an update or an
+    unmerged merge request, the newest entry of another app for a reference.
+    """
+    gen = read_entries(gdir)
+    base = read_entries(ddir)
+    version = ('versionName', 'versionCode', 'commit')
+
+    def bump(new, g):
+        # a Flutter srclib follows the version this run detected
+        if 'srclibs' in new and 'srclibs' in g:
+            gf = [x for x in g['srclibs'][1] if x.startswith('flutter@')]
+            if gf and gf[0] != 'flutter@stable':
+                new['srclibs'] = (new['srclibs'][0],
+                                  [gf[0] if x.startswith('flutter@') else x
+                                   for x in new['srclibs'][1]])
+        return new
+
+    def from_base(e, g, keep=()):
+        new = dict(e)
+        for k in version + tuple(keep):
+            if k in g:
+                new[k] = g[k]
+            else:
+                new.pop(k, None)
+        return bump(new, g)
+
+    entries = gen
+    if base and kind in ('upstream', 'fork', 'app'):
+        last = base[-1].get('versionName', ('s', ''))[1]
+        group = []
+        for e in reversed(base):
+            if e.get('versionName', ('s', ''))[1] != last:
+                break
+            group.insert(0, e)
+        group.sort(key=code_of)
+        ops = []
+        if os.path.isfile(os.path.join(ddir, 'top', 'VercodeOperation')):
+            ops = read_field(os.path.join(ddir, 'top', 'VercodeOperation'))[1]
+        if len(gen) == 1 and len(group) > 1 and len(ops) == len(group):
+            # one APK per CPU type: each entry's code from the app's own
+            try:
+                codes = sorted(evalop(op, vcode) for op in ops)
+                entries = []
+                for e, c in zip(group, codes):
+                    new = from_base(e, gen[0])
+                    new['versionCode'] = ('s', str(c))
+                    entries.append(new)
+            except (ValueError, SyntaxError):
+                entries = [from_base(base[-1], g) for g in gen]
+        elif len(group) == len(gen):
+            entries = [from_base(e, g) for e, g in zip(group, sorted(gen, key=code_of))]
+        else:
+            entries = [from_base(base[-1], g) for g in gen]
+    elif base and kind == 'reference':
+        # another app's build steps; where its source lives is its own business
+        entries = [from_base(base[-1], g, keep=('subdir', 'binary')) for g in gen]
+    write_entries(out, [{k: e[k] for k in order_build(e)} for e in entries])
+
+
+def order_build(e):
+    return [k for k in BUILD_ORDER if k in e] + [k for k in e if k not in BUILD_ORDER]
+
+
+# ---------------------------------------------------------------- writing YAML
+NUMBERISH = re.compile(
+    r'(?i)(true|false|null|~|[-+]?(\d[\d_]*|\.\d+|\d[\d_]*\.\d*)([eE][-+]?\d+)?'
+    r'|[-+]?\.(inf|nan)|0x[0-9a-f]+|0o[0-7]+)')
+
+
+def q(v, key=''):
+    """v as a YAML scalar, quoted only when it has to be."""
+    if key in PLAIN and re.fullmatch(r'-?\d+|true|false', v):
+        return v
+    if v == '':
+        return "''"
+    if '\n' in v:
+        return '"' + v.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n') + '"'
+    need = (v != v.strip() or v[0] in "!&*|>'\"%@`#,[]{}" or v[:2] in ('- ', '? ', ': ')
+            or v in ('-', '?', ':') or ': ' in v or ' #' in v or v.endswith(':')
+            or '\t' in v or NUMBERISH.fullmatch(v))
+    return "'" + v.replace("'", "''") + "'" if need else v
+
+
+def af_lines(items, ind):
+    pairs = []
+    for it in items:
+        name, _, why = it.partition(':')
+        pairs.append((name.strip(), why.strip()))
+    if not any(w for _, w in pairs):
+        return ['%s- %s' % (ind, n) for n, _ in sorted(pairs, key=lambda p: p[0].lower())]
+    out = []
+    for n, w in pairs:
+        if w:
+            out += ['%s%s:' % (ind, n), '%s  en-US: %s' % (ind, q(w))]
+        else:
+            out.append('%s%s: {}' % (ind, n))
+    return out
+
+
+def render_top(key, kind, v):
+    if kind == 's':
+        return ['%s: %s' % (key, q(v, key))]
+    if kind == 'b':
+        return ['%s: |-' % key] + [('  ' + l) if l else '' for l in v.split('\n')]
+    if kind == 'l':
+        return ['%s:' % key] + ['  - %s' % q(x) for x in v]
+    if kind == 'a':
+        return ['%s:' % key] + af_lines(v, '  ')
+    return ['%s:' % key] + v
+
+
+def render_entry(e):
+    out = []
+    for i, k in enumerate(order_build(e)):
+        kind, v = e[k]
+        lead = '  - ' if i == 0 else '    '
+        if kind == 'l' and k in SCRIPTS and len(v) == 1:
+            kind, v = 's', v[0]
+        if kind == 's':
+            out.append('%s%s: %s' % (lead, k, q(v, k)))
+        elif kind == 'l':
+            out += ['%s%s:' % (lead, k)] + ['      - %s' % q(x) for x in v]
+        elif kind == 'b':
+            out += ['%s%s: |-' % (lead, k)] + [('      ' + l) if l else '' for l in v.split('\n')]
+        elif kind == 'a':
+            out += ['%s%s:' % (lead, k)] + af_lines(v, '      ')
+        else:
+            out += ['%s%s:' % (lead, k)] + [('    ' + l) if l else '' for l in v]
+    return out
+
+
+def group_of(k):
+    g = 0
+    for x in TOP_ORDER:
+        if x == '\n':
+            g += 1
+        elif x == k:
+            return g
+    return g + 1
+
+
+def canon(k):
+    return TOP_KEYS.index(k) if k in TOP_KEYS else len(TOP_KEYS)
+
+
+def segments(lines):
+    """The base file as [key or None, lines]: fields, and what lies between."""
+    segs, i, n = [], 0, len(lines)
+    while i < n:
+        l = lines[i]
+        m = KEY.match(l) if l and l[0] not in ' #' else None
+        if not m:
+            segs.append([None, [l]])
+            i += 1
+            continue
+        j = i + 1
+        while j < n and (not lines[j].strip() or lines[j][0] == ' '):
+            j += 1
+        body, k = lines[i:j], j - i
+        while k > 1 and not body[k - 1].strip():
+            k -= 1
+        segs.append([m.group(1), body[:k]])
+        segs += [[None, [b]] for b in body[k:]]
+        i = j
+    return segs
+
+
+def cmd_render(base, rdir, out, mode):
+    """Write the recipe: the base file with every answered field put in place.
+
+    Fields nobody touched stay exactly as they were written, so an update's
+    merge request shows only what changed; new ones go where fdroidserver
+    would put them. mode keep|replace: the base's own build entries stay in
+    front of the new ones, or go.
+    """
+    top, dels = read_dir(os.path.join(rdir, 'top'), TOP_KEYS)
+    new = [render_entry(e) for e in read_entries(rdir)]
+    lines = []
+    if base != '-' and os.path.isfile(base):
+        lines = open(base, encoding='utf-8').read().split('\n')
+    segs = segments(lines)
+    if not any(s[0] for s in segs):
+        segs = []
+
+    def builds_lines(old):
+        body = ['Builds:']
+        if mode == 'keep' and old:
+            kept = old[1:]
+            while kept and not kept[-1].strip():
+                kept.pop()
+            if kept:
+                body += kept + ['']
+        for i, e in enumerate(new):
+            body += ([''] if i else []) + e
+        return body
+
+    done = set()
+    for s in segs:
+        k = s[0]
+        if k is None:
+            continue
+        if k == 'Builds':
+            s[1] = builds_lines(s[1])
+        elif k in dels:
+            s[1] = None
+        elif k in top:
+            s[1] = render_top(k, *top[k])
+        done.add(k)
+    segs = [s for s in segs if s[1] is not None]
+    missing = [k for k in top if k not in done]
+    if 'Builds' not in done and new:
+        missing.append('Builds')
+    missing.sort(key=canon)
+
+    def block(k):
+        return builds_lines(None) if k == 'Builds' else render_top(k, *top[k])
+
+    if not segs:
+        # a fresh file: fdroidserver's groups, a blank line between them
+        groups, cur = [], []
+        for k in TOP_ORDER:
+            if k == '\n':
+                if cur:
+                    groups.append(cur)
+                cur = []
+            elif k in missing:
+                cur += block(k)
+        if cur:
+            groups.append(cur)
+        rest = [k for k in missing if k not in TOP_KEYS]
+        if rest:
+            groups.append(sum((block(k) for k in rest), []))
+        lines = []
+        for g in groups:
+            lines += ([''] if lines else []) + g
+    else:
+        for k in missing:
+            # right before the first field fdroidserver writes after it, with a
+            # blank line wherever that crosses one of its groups
+            at = next((i for i, s in enumerate(segs) if s[0] and canon(s[0]) > canon(k)), len(segs))
+            ins = [[k, block(k)]]
+            if at < len(segs) and group_of(segs[at][0]) != group_of(k):
+                ins.append([None, ['']])
+            if at and segs[at - 1][0] and group_of(segs[at - 1][0]) != group_of(k):
+                ins.insert(0, [None, ['']])
+            segs[at:at] = ins
+        lines = sum((s[1] for s in segs), [])
+    # one blank line at most between fields, none at the ends
+    tidy = []
+    for l in lines:
+        if not l.strip() and (not tidy or not tidy[-1].strip()):
+            continue
+        tidy.append(l.rstrip() if not l.strip() else l)
+    while tidy and not tidy[-1].strip():
+        tidy.pop()
+    with open(out, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(tidy) + '\n')
+
+
+# ---------------------------------------------------------------- CI's wrapping
+# fdroiddata's CI runs `fdroid rewritemeta` with Debian trixie's ruamel.yaml
+# 0.18.10, whose plain-scalar writer gives a word longer than the line (80)
+# a line of its own: `output: ` with a trailing space, the path below it.
+# ruamel.yaml 0.19 dropped that rule, so a newer local fdroid writes such a
+# value on one line and CI's rewritemeta job then fails on the difference.
+# Everything else wraps the same in both, so only values holding a word over
+# 80 characters are rewritten, with 0.18.10's write_plain replayed exactly.
+WIDTH = 80
+MAPLINE = re.compile(r'^( *)(- )?([A-Za-z0-9_][\w.-]*):(?: (.*))?$')
+SEQLINE = re.compile(r'^( *)- (.*)$')
+
+
+def plain(v):
+    return v and v[0] not in "'\"|>[{&*!"
+
+
+def flow018(head, column, indent, text, whitespace):
+    out = [head]
+
+    def write(s):
+        out[-1] += s
+
+    if not whitespace:
+        write(' ')
+        column += 1
+    spaces, start, end = False, 0, 0
+    while end <= len(text):
+        ch = text[end] if end < len(text) else None
+        if spaces:
+            if ch != ' ':
+                if start + 1 == end and column > WIDTH:
+                    out.append(' ' * indent)
+                    column = indent
+                else:
+                    write(text[start:end])
+                    column += end - start
+                start = end
+        elif ch is None or ch == ' ':
+            data = text[start:end]
+            if len(data) > WIDTH and column > indent:
+                out.append(' ' * indent)
+                column = indent
+            write(data)
+            column += len(data)
+            start = end
+        if ch is not None:
+            spaces = ch == ' '
+        end += 1
+    return out
+
+
+def cmd_ciwrap(path, every=False):
+    """every: wrap all values (for a file no local rewritemeta has formatted)."""
+    lines = open(path, encoding='utf-8').read().split('\n')
+    out, i, n, changed = [], 0, len(lines), []
+    while i < n:
+        line = lines[i]
+        m, s = MAPLINE.match(line), SEQLINE.match(line)
+        if m:
+            col = len(m.group(1)) + (2 if m.group(2) else 0)
+            indent, val = col + 2, (m.group(4) or '').strip()
+            head = line[:len(m.group(1)) + (2 if m.group(2) else 0) + len(m.group(3)) + 1]
+            whitespace = False
+        elif s and not MAPLINE.match(' ' * len(s.group(1)) + '  ' + s.group(2)):
+            indent = len(s.group(1)) + 2
+            val, head, whitespace = s.group(2).strip(), line[:indent], True
+        else:
+            out.append(line)
+            i += 1
+            continue
+        if val in ('|', '|-', '|+', '>', '>-', '>+'):
+            # a block of text: copy it as it is
+            out.append(line)
+            i += 1
+            while i < n and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip()) > indent - 2):
+                out.append(lines[i])
+                i += 1
+            continue
+        j = i + 1
+        while (j < n and lines[j].strip() and len(lines[j]) - len(lines[j].lstrip()) == indent
+               and not SEQLINE.match(lines[j]) and not MAPLINE.match(lines[j])):
+            j += 1
+        text = ' '.join([val] + [l.strip() for l in lines[i + 1:j]]).strip()
+        if not val and j == i + 1:
+            out.append(line)                 # a key with a list or a map below it
+            i += 1
+            continue
+        if plain(text) and (every or any(len(w) > WIDTH for w in text.split(' '))):
+            new = flow018(head, len(head), indent, text, whitespace)
+            if new != lines[i:j]:
+                changed.append((m.group(3) if m else '-') + ' (line %d)' % (i + 1))
+            out += new
+        else:
+            out += lines[i:j]
+        i = j
+    if changed:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(out))
+        print('\n'.join(changed))
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1]
+    if cmd == 'load':
+        cmd_load(sys.argv[2], sys.argv[3])
+    elif cmd == 'template':
+        cmd_template(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], int(sys.argv[6]))
+    elif cmd == 'render':
+        cmd_render(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    elif cmd == 'ciwrap':
+        cmd_ciwrap(sys.argv[2], len(sys.argv) > 3 and sys.argv[3] == 'all')
+    else:
+        sys.exit('recipe.py: unknown command ' + cmd)
+PYRECIPE
+rcp() { python3 "$WORK/recipe.py" "$@"; }
+# the recipe it starts from, what this run would write itself, the new build
+# entries before they are asked about, and the answers
+RD="$WORK/d"; RG="$WORK/g"; RT="$WORK/t"; RR="$WORK/r"
+rm -rf "$RD" "$RG" "$RT" "$RR"; mkdir -p "$RD/top" "$RR/top"
+
+# --- every field, in fdroidserver's order, with what it is for
+# kind: s one line · l a list · b paragraphs · a anti-features ("Name: why")
+declare -A FHELP=() FKIND=()
+FTOP=""; FBUILD=""
+fdef() {  # fdef top|build <name> <kind> <help>
+  FKIND["$1:$2"]="$3"; FHELP["$1:$2"]="$4"
+  if [ "$1" = top ]; then FTOP="$FTOP $2"; else FBUILD="$FBUILD $2"; fi
+}
+fdef top Disabled s "stops F-Droid building the app; the value says why"
+fdef top AntiFeatures a "what users may not want: ads, tracking, non-free network services or parts"
+fdef top Categories l "what the app is, from fdroiddata's list"
+fdef top License s "the SPDX id of the app's license, e.g. GPL-3.0-or-later"
+fdef top AuthorName s "shown on f-droid.org — any name will do, it needn't be your real one"
+fdef top AuthorEmail s "public in fdroiddata"
+fdef top AuthorWebSite s "the author's site"
+fdef top WebSite s "the app's site"
+fdef top SourceCode s "where the source can be read"
+fdef top IssueTracker s "where bugs are reported"
+fdef top Translation s "where the app is translated (Weblate, Crowdin…)"
+fdef top Changelog s "where the release notes are"
+fdef top Donate s "a page that takes donations"
+fdef top Liberapay s "the Liberapay name, not the URL"
+fdef top OpenCollective s "the OpenCollective name, not the URL"
+fdef top Bitcoin s "a Bitcoin address for donations"
+fdef top Litecoin s "a Litecoin address for donations"
+fdef top Name s "the name F-Droid shows, when it should differ from the app's own"
+fdef top AutoName s "the app's android:label — CI fills it in when it is missing"
+fdef top Summary s "one line about the app — normally read from fastlane in your repo"
+fdef top Description b "the long description — normally read from fastlane in your repo"
+fdef top RequiresRoot s "true if the app needs root on the phone"
+fdef top RepoType s "git, almost always"
+fdef top Repo s "the address F-Droid clones the source from"
+fdef top Binaries s "where your signed APKs are, for reproducible builds (%v is the version)"
+fdef top AllowedAPKSigningKeys l "the SHA-256 of your signing certificate, for reproducible builds"
+fdef top MaintainerNotes b "notes for F-Droid's maintainers: why the recipe is the way it is"
+fdef top ArchivePolicy s "how many old versions stay available (a number)"
+fdef top AutoUpdateMode s "Version: F-Droid adds new versions by itself · None: you send a merge request"
+fdef top UpdateCheckMode s "how new versions are found: Tags, Tags <regex>, RepoManifest, HTTP, Static or None"
+fdef top UpdateCheckIgnore s "a regex of versions the update check skips"
+fdef top VercodeOperation l "formulas from the app's versionCode to each build's, e.g. 10 * %c + 1"
+fdef top UpdateCheckName s "the application id the update check looks for, when the source has several"
+fdef top UpdateCheckData s "where the update check reads versions: file|code regex|file|name regex"
+fdef top CurrentVersion s "the newest version F-Droid offers"
+fdef top CurrentVersionCode s "its versionCode"
+fdef top NoSourceSince s "the version since which the source is gone"
+fdef build versionName s "the version this entry builds"
+fdef build versionCode s "its versionCode — the APK must carry exactly this one"
+fdef build disable s "skips this entry; the value says why"
+fdef build commit s "the commit to build: the full hash (a tag works, reviewers prefer the hash)"
+fdef build timeout s "seconds the build may take (the default is 2 hours)"
+fdef build subdir s "the folder the build runs in: the Gradle module, or the project"
+fdef build submodules s "true to check out the git submodules too"
+fdef build sudo l "commands run as root first, e.g. apt-get install -y rustup"
+fdef build init l "commands run right after the checkout, before anything else"
+fdef build patch l "patch files from fdroiddata, applied before the build"
+fdef build gradle l "the Gradle flavour to build, or yes for the default one"
+fdef build maven s "build with Maven instead (yes, or a module)"
+fdef build output s "the APK the build leaves, when it is not the usual Gradle one"
+fdef build binary s "the address of your signed APK, for reproducible builds"
+fdef build srclibs l "other source trees the build needs, as name@ref"
+fdef build oldsdkloc s "true for very old projects that keep sdk.dir elsewhere"
+fdef build encoding s "the source files' encoding, when it is not UTF-8"
+fdef build forceversion s "true to force versionName into the manifest"
+fdef build forcevercode s "true to force versionCode into the manifest"
+fdef build rm l "files and folders deleted before the build, e.g. a proprietary.gradle"
+fdef build extlibs l "libraries from fdroiddata's extlib folder"
+fdef build prebuild l "commands run before the build: sed out non-free parts, set things up"
+fdef build androidupdate l "projects to run android update on (old Ant builds)"
+fdef build target s "the Android target to build against (old Ant builds)"
+fdef build scanignore l "paths the source scanner skips — reviewers ask to avoid it"
+fdef build scandelete l "paths deleted after the scan, e.g. a downloaded cache"
+fdef build build l "commands that build the app, instead of plain Gradle"
+fdef build buildjni l "folders to run ndk-build in (yes for the default one)"
+fdef build ndk s "the NDK version, when the app has native code (r27c, or 27.2.12479018)"
+fdef build preassemble l "Gradle tasks run before assemble"
+fdef build gradleprops l "-P properties passed to Gradle, as name=value"
+fdef build antcommands l "Ant targets (old Ant builds)"
+fdef build postbuild l "commands run after the build"
+fdef build novcheck s "true to skip the check that the APK's version matches"
+fdef build antifeatures a "anti-features of this version only"
+
+# --- one line at a time
+# A line lives as a file under $RR (see recipe.py): the value, and beside it
+# <name>.k, its kind. Answers are remembered per task, so a re-run offers them.
+fv()   { [ -f "$1" ] && cat "$1" || true; }        # a field's value
+fk()   { cat "$1.k" 2>/dev/null || echo s; }        # its kind
+mkey() { printf 'Y_%s' "$1" | tr -c 'A-Za-z0-9_' '_'; }
+rset() {  # rset <rel> <kind> <value> — a line of the result
+  local f="$RR/$1"
+  mkdir -p "${f%/*}"; rm -f "$f.del"
+  if [ -n "$3" ]; then printf '%s\n' "$3" > "$f"; else : > "$f"; fi
+  printf '%s\n' "$2" > "$f.k"
+}
+rdel() {  # rdel <rel> — the result leaves this line out
+  local f="$RR/$1"
+  mkdir -p "${f%/*}"; rm -f "$f" "$f.k"; : > "$f.del"
+}
+akind() {  # akind <scope> <name> <field file> — how to ask about it
+  local k t
+  k="$(fk "$3")"; t="${FKIND[$1:$2]:-}"
+  case "$k" in r) printf 'r'; return ;; esac
+  printf '%s' "${t:-$k}"
+}
+trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+yhelp() {  # yhelp <scope> <name> — the grey line saying what a field is for
+  [ -n "${FHELP[$1:$2]:-}" ] && note "$2 — ${FHELP[$1:$2]}"
+  return 0
+}
+
+# What reviewers say about a line, shown with it.
+yhint() {  # yhint <scope> <name> <value>
+  local n="$2" v="$3"
+  case "$n" in
+    srclibs)
+      if printf '%s\n' "$v" | grep -qi '^rustup@'; then
+        warn "reviewers ask for Debian's rustup instead of the rustup srclib:"
+        note "drop it here, and add 'apt-get install -y rustup' to sudo:"
+      fi ;;
+    scanignore)
+      [ -n "$v" ] && warn "reviewers ask not to hide files from the scanner: delete them (rm:, prebuild:) or bring them in as a srclib" ;;
+    sudo)
+      if printf '%s\n' "$v" | grep -q 'openjdk'; then
+        note "the build server already has JDKs — reviewers ask to drop a JDK install unless the build needs that one"
+      fi
+      if [ -n "$HAS_RUST" ] && ! printf '%s\n' "$v" | grep -q rustup; then
+        note "this project has Rust code: Debian's rustup goes here, as apt-get install -y rustup"
+      fi ;;
+    gradle)
+      [ -n "${FLAVOURS// /}" ] && note "product flavours in ${GRADLE_FILE#"$REPO"/}: $FLAVOURS" ;;
+    ndk)
+      [ -n "$NATIVE" ] && note "native code: $NATIVE" ;;
+    UpdateCheckMode)
+      if [ "${MANIFESTS:-0}" -gt 20 ]; then
+        note "$MANIFESTS AndroidManifest.xml files in the repo: with Tags, checkupdates reads them all"
+        note "and gives up — Fennec uses None for that reason"
+      fi ;;
+  esac
+  return 0
+}
+
+ycheck() {  # ycheck <scope> <name> <value> — false, with a warning, if fdroiddata would refuse it
+  local n="$2" v="$3"
+  case "$n" in
+    versionCode|CurrentVersionCode|timeout|ArchivePolicy)
+      case "$v" in *[!0-9]*) warn "$n is a whole number"; return 1 ;; esac
+      if [ "$n" = versionCode ] || [ "$n" = CurrentVersionCode ]; then
+        [ "$v" -le 2100000000 ] || { warn "Android allows versionCode up to 2100000000"; return 1; }
+      fi ;;
+    RequiresRoot|submodules|oldsdkloc|forceversion|forcevercode|novcheck)
+      case "$v" in true|false) ;; *) warn "$n is true or false"; return 1 ;; esac ;;
+    RepoType)
+      case "$v" in git|git-svn|hg|srclib) ;; *) warn "RepoType is git, git-svn, hg or srclib"; return 1 ;; esac ;;
+    UpdateCheckMode)
+      printf '%s' "$v" | grep -qE '^(None|Static|HTTP|RepoManifest(/.+)?|Tags( .*)?)$' \
+        || { warn "UpdateCheckMode is Tags, Tags <regex>, RepoManifest[/branch], HTTP, Static or None"; return 1; } ;;
+    AutoUpdateMode)
+      printf '%s' "$v" | grep -qE '^(None|Version|Version( \+.+)? [^+].+)$' \
+        || { warn "AutoUpdateMode is None, Version, or Version with a tag pattern"; return 1; } ;;
+    ndk)
+      printf '%s' "$v" | grep -qE '^(r[0-9]+([b-e]?|-.*)|[0-9.]+)$' \
+        || { warn "ndk looks like r27c or 27.2.12479018"; return 1; } ;;
+    subdir|output)
+      case "$v" in .|./*) warn "$n is written without ./ (and . means: leave it out)"; return 1 ;; esac ;;
+    SourceCode|IssueTracker|WebSite|Changelog|Translation|Donate|AuthorWebSite)
+      case "$v" in http://*|https://*) ;; *) warn "$n is a web address (https://…)"; return 1 ;; esac ;;
+    binary|Binaries)
+      case "$v" in https://*) ;; *) warn "$n has to be an https:// address"; return 1 ;; esac ;;
+    srclibs)
+      printf '%s\n' "$v" | grep -qv '@' && { warn "every srclib is name@ref, e.g. rustup@1.28.2"; return 1; } ;;
+  esac
+  return 0
+}
+
+# The memory of a line: last time's answer ("-" = it was left out), or nothing.
+ymem() {  # ymem <rel> <default> — prints the default to offer
+  local last; last="$(recall "$(mkey "$1")")"
+  case "$last" in '') printf '%s' "$2" ;; -) ;; *) printf '%s' "$last" ;; esac
+}
+ysave() {  # ysave <rel> <kind> <value>
+  if [ -n "$3" ]; then rset "$1" "$2" "$3"; remember "$(mkey "$1")" "$3"
+  else rdel "$1"; remember "$(mkey "$1")" -; fi
+}
+
+yline() {  # yline <rel> <scope> <default> [req] — a one-line field
+  local rel="$1" scope="$2" def req="${4-}" name="${1##*/}" ans
+  def="$(ymem "$rel" "$3")"
+  if [ "$ASSUME_YES" = 1 ]; then
+    [ -z "$def" ] && [ "$req" = req ] && die "--yes: nothing to answer $name with — run once without --yes"
+    [ -n "$def" ] && ok "$name: $def"
+    ysave "$rel" s "$def"; return 0
+  fi
+  yhelp "$scope" "$name"; yhint "$scope" "$name" "$def"
+  while :; do
+    if [ -n "$def" ] && [ "$req" = req ]; then printf '   %s%s%s [%s]: ' "$B" "$name" "$R" "$def" >&2
+    elif [ -n "$def" ]; then printf '   %s%s%s [%s, - for none]: ' "$B" "$name" "$R" "$def" >&2
+    elif [ "$req" = req ]; then printf '   %s%s%s: ' "$B" "$name" "$R" >&2
+    else printf '   %s%s%s [Enter for none]: ' "$B" "$name" "$R" >&2; fi
+    readline ans
+    ans="$(trim "$ans")"
+    [ -z "$ans" ] && ans="$def"
+    [ "$ans" = - ] && ans=""
+    if [ -z "$ans" ]; then
+      [ "$req" = req ] && { warn "$name is required"; continue; }
+      break
+    fi
+    ycheck "$scope" "$name" "$ans" && break
+  done
+  ysave "$rel" s "$ans"
+}
+
+YL_ADD=0   # set by the "add a line" menu: an empty list starts by asking for items
+ylist() {  # ylist <rel> <scope> <default items, one per line> [kind] — a list
+  local rel="$1" scope="$2" items kind="${4:-l}" name="${1##*/}" ch line tmp
+  items="$(ymem "$rel" "$3")"
+  if [ "$ASSUME_YES" = 1 ]; then
+    [ -n "$items" ] && ok "$name: $(printf '%s' "$items" | tr '\n' ' ' | cut -c1-70)"
+    ysave "$rel" "$kind" "$items"; return 0
+  fi
+  yhelp "$scope" "$name"; yhint "$scope" "$name" "$items"
+  [ "$kind" = a ] && note "one per line: the anti-feature, then optionally \": why\" (users see the why)"
+  ch=""; [ -z "$items" ] && [ "$YL_ADD" = 1 ] && ch=a
+  while :; do
+    if [ -z "$ch" ]; then
+      if [ -n "$items" ]; then
+        printf '   %s%s:%s\n' "$B" "$name" "$R" >&2
+        printf '%s\n' "$items" | sed 's/^/     - /' >&2
+        printf '   %s%s%s [Enter keeps · a adds · e edits · - for none]: ' "$B" "$name" "$R" >&2
+      else
+        printf '   %s%s%s [Enter for none · a adds · e edits]: ' "$B" "$name" "$R" >&2
+      fi
+      readline ch
+    fi
+    case "$(trim "$ch")" in
+      '')  if [ -z "$items" ] || ycheck "$scope" "$name" "$items"; then break; fi ;;
+      -)   items=""; break ;;
+      a|A) note "one per line; an empty line ends it"
+           while :; do
+             printf '     - ' >&2; readline line; line="$(trim "$line")"
+             [ -n "$line" ] || break
+             line="${line#- }"; items="${items:+$items$'\n'}$line"
+           done ;;
+      e|E) tmp="$WORK/edit-$name.txt"
+           printf '%s\n' "$items" > "$tmp"
+           if edit_file "$tmp"; then
+             items="$(sed -e 's/^[[:space:]]*- //' -e 's/[[:space:]]*$//' -e '/^$/d' "$tmp")"
+           fi ;;
+      *)   warn "Enter, a, e or -" ;;
+    esac
+    ch=""
+  done
+  ysave "$rel" "$kind" "$items"
+}
+
+yblock() {  # yblock <rel> <scope> <default text> [kind] — paragraphs, or YAML kept as written
+  local rel="$1" scope="$2" text kind="${4:-b}" name="${1##*/}" ch tmp n
+  text="$(ymem "$rel" "$3")"
+  if [ "$ASSUME_YES" = 1 ]; then ysave "$rel" "$kind" "$text"; return 0; fi
+  yhelp "$scope" "$name"
+  [ "$kind" = r ] && note "kept exactly as written — e opens it in your editor"
+  while :; do
+    if [ -n "$text" ]; then
+      n="$(printf '%s\n' "$text" | wc -l)"
+      printf '   %s%s:%s\n' "$B" "$name" "$R" >&2
+      printf '%s\n' "$text" | head -8 | sed "s/^/     $DIM|$R /" >&2
+      [ "$n" -gt 8 ] && note "  … $((n - 8)) more lines — e shows them all"
+      printf '   %s%s%s [Enter keeps · e edits · - for none]: ' "$B" "$name" "$R" >&2
+    else
+      printf '   %s%s%s [Enter for none · e writes it · or type one line]: ' "$B" "$name" "$R" >&2
+    fi
+    readline ch
+    case "$(trim "$ch")" in
+      '') break ;;
+      -)  text=""; break ;;
+      e|E) tmp="$WORK/edit-$name.txt"
+           printf '%s\n' "$text" > "$tmp"
+           edit_file "$tmp" && text="$(sed -e 's/[[:space:]]*$//' "$tmp")" ;;
+      *)  if [ -z "$text" ]; then text="$(trim "$ch")"; else warn "Enter, e or -"; fi ;;
+    esac
+  done
+  ysave "$rel" "$kind" "$text"
+}
+
+yfield() {  # yfield <rel> <scope> <kind> <default> [req]
+  case "$3" in
+    l|a) ylist  "$1" "$2" "$4" "$3" ;;
+    b|r) yblock "$1" "$2" "$4" "$3" ;;
+    *)   yline  "$1" "$2" "$4" "${5-}" ;;
+  esac
+}
+
+K=1
+ycopy_build() {  # ycopy_build <name> — entry 1's answer for this line, in every entry
+  local n x f="$RR/b/1/$1"
+  for n in $(seq 2 "$K"); do
+    mkdir -p "$RR/b/$n"; rm -f "$RR/b/$n/$1" "$RR/b/$n/$1.k" "$RR/b/$n/$1.del"
+    for x in "" .k .del; do [ -f "$f$x" ] && cp "$f$x" "$RR/b/$n/$1$x"; done
+  done
+  return 0
+}
+
+# The fields the recipe does not have yet, any of them a number away.
+yadd() {  # yadd top|build <label>
+  local scope="$1" label="$2" names=() k i ch pre="top/" list
+  [ "$ASSUME_YES" = 1 ] && return 0
+  [ "$scope" = build ] && pre="b/1/"
+  while :; do
+    names=()
+    list="$FTOP"; [ "$scope" = build ] && list="$FBUILD"
+    for k in $list; do
+      [ -f "$RR/$pre$k" ] && continue
+      case "$scope:$k" in top:Builds|build:versionName|build:versionCode) continue ;; esac
+      names+=("$k")
+    done
+    printf '\n'; say "$label — a number or a field name, Enter when done:"
+    i=1
+    for k in "${names[@]}"; do
+      printf '   %3d) %-22s' "$i" "$k"; [ $((i % 3)) = 0 ] && printf '\n'; i=$((i + 1))
+    done
+    [ $(((i - 1) % 3)) = 0 ] || printf '\n'
+    printf '   %sAdd%s: ' "$B" "$R" >&2; readline ch; ch="$(trim "$ch")"
+    [ -n "$ch" ] || break
+    case "$ch" in
+      *[!0-9]*) k="$ch" ;;
+      *) if [ "$ch" -ge 1 ] && [ "$ch" -lt "$i" ]; then k="${names[$((ch - 1))]}"
+         else warn "there is no $ch"; continue; fi ;;
+    esac
+    if [ -z "${FKIND[$scope:$k]:-}" ]; then
+      warn "$k is not in the Build Metadata Reference — fdroiddata's schema will refuse it"
+      confirm "Add it anyway?" n || continue
+      if confirm "Does it hold a list (several values)?" n; then FKIND["$scope:$k"]=l; else FKIND["$scope:$k"]=s; fi
+    fi
+    YL_ADD=1; yfield "$pre$k" "$scope" "${FKIND[$scope:$k]}" ""; YL_ADD=0
+    [ "$scope" = build ] && ycopy_build "$k"
+    case " $(recall "Y_added_$scope") " in *" $k "*) ;; *) remember "Y_added_$scope" "$(recall "Y_added_$scope") $k" ;; esac
+  done
+}
+
+# --- what the project needs, as far as its files tell
+REPO_FILES="$WORK/repo-files.txt"
+git -C "$REPO" ls-files > "$REPO_FILES" 2>/dev/null || : > "$REPO_FILES"
+SUBMODULES=""; [ -f "$REPO/.gitmodules" ] && SUBMODULES=1
+NDK_GUESS="$(gval ndkVersion)"
+printf '%s' "$NDK_GUESS" | grep -qE '^(r[0-9]+[a-z]?|[0-9][0-9.]*)$' || NDK_GUESS=""
+NATIVE=""
+if grep -qE 'externalNativeBuild|ndkBuild' "$GRADLE_FILE" 2>/dev/null; then NATIVE="externalNativeBuild in $GRADLE_REL"
+elif [ -d "$REPO/$SUBDIR/src/main/cpp" ]; then NATIVE="$SUBDIR/src/main/cpp"
+elif [ -d "$REPO/$SUBDIR/src/main/jni" ]; then NATIVE="$SUBDIR/src/main/jni"
 fi
-case "$JDK" in ''|*[!0-9]*) JDK="" ;; esac
-if [ -n "$JDK" ]; then
-  ok "build container JDK: $JDK"
-  warn "that adds sudo: lines, which F-Droid reviewers usually ask you to remove"
-fi
+HAS_RUST=""; grep -qE '(^|/)(Cargo\.toml|rust-toolchain(\.toml)?)$' "$REPO_FILES" && HAS_RUST=1
+# closed-source libraries kept apart in their own gradle file: the F-Droid build deletes it
+PROPRIETARY_GRADLE="$(grep -iE '(^|/)[^/]*proprietary[^/]*\.gradle(\.kts)?$' "$REPO_FILES" | head -10 || true)"
+MANIFESTS="$(grep -c 'AndroidManifest\.xml$' "$REPO_FILES" || true)"
 
 # Offer the product flavours declared in the gradle file, if any.
 # (plain POSIX awk — no gawk-only 3-argument match(), Debian's awk is mawk)
@@ -1708,9 +2724,14 @@ FLAVOURS="$(awk '
     depth += gsub(/\{/, "{", line); depth -= gsub(/\}/, "}", line)
     if (depth <= 0) exit
   }' "$GRADLE_FILE" 2>/dev/null | tr '\n' ' ' || true)"
-[ -n "${FLAVOURS// /}" ] && note "product flavours found: $FLAVOURS"
+# the build F-Droid wants is usually the FOSS flavour, when there is one
+GRADLE_DEF="yes"
+for f in $FLAVOURS; do
+  case "$f" in foss|fdroid|libre|free|floss|oss|opensource) GRADLE_DEF="$f"; break ;; esac
+done
 GRADLEFLAVOUR=""
-if [ -n "${FLAVOURS// /}" ] || [ "$ASK_ALL" = 1 ]; then
+if [ -n "$FLUTTER_DIR" ] && { [ -n "${FLAVOURS// /}" ] || [ "$ASK_ALL" = 1 ]; }; then
+  [ -n "${FLAVOURS// /}" ] && note "product flavours found: $FLAVOURS"
   ask_opt GRADLEFLAVOUR "Gradle flavour (blank = the default variant)" ""
 fi
 
@@ -1752,9 +2773,10 @@ if [ -n "$FLUTTER_DIR" ]; then
   # 1000 * ABI + versionCode, but F-Droid's reviewers want 10 * versionCode +
   # ABI (arm32 1, arm64 2, x86_64 3), so a new release always outranks every
   # APK of the old one. The app sets that in its gradle file; without it the
-  # APKs F-Droid builds don't match the codes in the metadata.
+  # APKs F-Droid builds don't match the codes in the metadata. An update keeps
+  # whatever the app already has in F-Droid.
   ABISPLIT=1
-  if [ "$ASK_ALL" = 1 ]; then
+  if [ "$IS_UPDATE" = 0 ]; then
     confirm "Build one APK per CPU type (smaller downloads; F-Droid asks for it)?" y || ABISPLIT=0
   fi
   [ "$ABISPLIT" = 1 ] && ok "one APK per CPU type: armeabi-v7a, arm64-v8a, x86_64"
@@ -1800,6 +2822,8 @@ EOF
   done
 fi
 
+# --- what this wizard would write by itself: the starting point when there is
+# no recipe to start from, and the version lines either way
 emit_entry() {  # emit_entry <versionCode> [<target platform> <abi>] — one Builds: item
   local vc="$1" tp="${2-}" abi="${3-}" apk flavor_flag="" f
   printf "  - versionName: '%s'\n" "$VNAME"
@@ -1811,19 +2835,16 @@ emit_entry() {  # emit_entry <versionCode> [<target platform> <abi>] — one Bui
   else
     [ "$SUBDIR" != "." ] && printf '    subdir: %s\n' "$SUBDIR"
   fi
-  if [ -n "$JDK" ]; then
-    # Falling back to default-jdk-headless keeps the build alive when the pinned
-    # version is not in that release: F-Droid moved to Debian trixie, which
-    # dropped openjdk-17, and the next move will drop something else.
-    printf '    sudo:\n'
-    printf '      - apt-get update\n'
-    printf '      - apt-get install -y openjdk-%s-jdk-headless || apt-get install -y default-jdk-headless\n' "$JDK"
-    printf '      - update-java-alternatives -a\n'
-  fi
+  [ -n "$SUBMODULES" ] && printf '    submodules: true\n'
   if [ -z "$FLUTTER_DIR" ]; then
     printf '    gradle:\n'
-    printf "      - '%s'\n" "${GRADLEFLAVOUR:-yes}"
-    return
+    printf "      - '%s'\n" "$GRADLE_DEF"
+    if [ -n "$PROPRIETARY_GRADLE" ]; then
+      printf '    rm:\n'
+      printf '%s\n' "$PROPRIETARY_GRADLE" | sed "s/^/      - /"
+    fi
+    [ -n "$NDK_GUESS" ] && printf "    ndk: '%s'\n" "$NDK_GUESS"
+    return 0
   fi
   # fdroiddata's Flutter recipe (templates/build-flutter.yml)
   apk="app"; [ -n "$abi" ] && apk="$apk-$abi"
@@ -1854,68 +2875,139 @@ emit_entry() {  # emit_entry <versionCode> [<target platform> <abi>] — one Bui
     printf '      - $$flutter$$/bin/flutter build apk --release%s\n' "$flavor_flag"
   fi
 }
-
-BUILD_BLOCK="$WORK/build.yml"
-if [ "$ABISPLIT" = 1 ]; then
-  VCODES="$((10 * VCODE + 1)) $((10 * VCODE + 2)) $((10 * VCODE + 3))"
-  CUR_VCODE="$((10 * VCODE + 3))"
-  {
+{
+  printf 'Builds:\n'
+  if [ "$ABISPLIT" = 1 ]; then
     emit_entry "$((10 * VCODE + 1))" android-arm armeabi-v7a; printf '\n'
     emit_entry "$((10 * VCODE + 2))" android-arm64 arm64-v8a; printf '\n'
     emit_entry "$((10 * VCODE + 3))" android-x64 x86_64
-  } > "$BUILD_BLOCK"
-else
-  VCODES="$VCODE"; CUR_VCODE="$VCODE"
-  emit_entry "$VCODE" > "$BUILD_BLOCK"
-fi
+    printf "\nVercodeOperation:\n  - '10 * %%c + 1'\n  - '10 * %%c + 2'\n  - '10 * %%c + 3'\n"
+  else
+    emit_entry "$VCODE"
+  fi
+  # The checker reads versions from gradle, where Flutter only has
+  # references; point it at pubspec.yaml's `version: name+code` instead.
+  if [ -n "$FLUTTER_DIR" ]; then
+    UCD_FILE="pubspec.yaml"; [ "$FLUTTER_DIR" != "." ] && UCD_FILE="$FLUTTER_DIR/pubspec.yaml"
+    printf 'UpdateCheckData: %s|version:\\s.+\\+(\\d+)|.|version:\\s(.+)\\+\n' "$UCD_FILE"
+  fi
+} > "$WORK/gen.yml"
+rcp load "$WORK/gen.yml" "$RG"
 
-YML="$WORK/$APPID.yml"
-
+# --- the recipe to start from
+BASE_FILE=""; BASE_KIND=none; BASE_LABEL="what this wizard detected"
 if [ "$IS_UPDATE" = 1 ]; then
-  # ---------- update: keep the upstream file, add one build, bump CurrentVersion
-  git -C "$FDROIDDATA" show "$EXISTING" > "$YML"
-  for vc in $VCODES; do
-    if grep -qE "^[[:space:]]+versionCode: $vc\$" "$YML"; then
-      die "versionCode $vc is already in metadata/$APPID.yml — nothing to do"
+  git -C "$FDROIDDATA" show "$EXISTING" > "$WORK/base.yml"
+  BASE_FILE="$WORK/base.yml"; BASE_KIND=upstream; BASE_LABEL="F-Droid's metadata/$APPID.yml"
+else
+  CANDS=()
+  # your merge request, if its branch is on your fork already
+  if git -C "$FDROIDDATA" fetch -q origin "refs/heads/$BRANCH" 2>/dev/null \
+     && git -C "$FDROIDDATA" show "FETCH_HEAD:metadata/$APPID.yml" > "$WORK/base-fork.yml" 2>/dev/null; then
+    CANDS+=("fork|$WORK/base-fork.yml|your merge request's recipe (branch $BRANCH on your fork)")
+  fi
+  # a copy kept in the app's own repo, e.g. fdroid/<appid>.yml
+  for f in "fdroid/$APPID.yml" "metadata/$APPID.yml" ".fdroid.yml"; do
+    [ -f "$REPO/$f" ] || continue
+    if [ -f "$WORK/base-fork.yml" ] && cmp -s "$REPO/$f" "$WORK/base-fork.yml"; then
+      note "$f in your app repo is the same as your merge request's recipe"
+      continue
+    fi
+    CANDS+=("app|$REPO/$f|$f in your app repo")
+  done
+  say "Start the recipe from:"
+  i=1
+  for c in "${CANDS[@]}"; do printf '     %d) %s\n' "$i" "${c##*|}"; i=$((i + 1)); done
+  REF_N=$i;  printf '     %d) %s\n' "$i" "another app's recipe in fdroiddata — one built the way yours is"; i=$((i + 1))
+  NEW_N=$i;  printf '     %d) %s\n' "$i" "a fresh one, from what this wizard detected"
+  BASE_DEF=$NEW_N; [ "${#CANDS[@]}" -gt 0 ] && BASE_DEF=1
+  while :; do
+    ask BASE_PICK "Which" "$BASE_DEF"
+    case "$BASE_PICK" in *[!0-9]*|'') warn "a number from the list"; continue ;; esac
+    if [ "$BASE_PICK" -ge 1 ] && [ "$BASE_PICK" -le "${#CANDS[@]}" ]; then
+      c="${CANDS[$((BASE_PICK - 1))]}"
+      BASE_KIND="${c%%|*}"; c="${c#*|}"; BASE_FILE="${c%%|*}"; BASE_LABEL="${c#*|}"
+      break
+    elif [ "$BASE_PICK" = "$REF_N" ]; then
+      note "its newest build entry becomes the template for yours; the rest of the recipe stays yours"
+      ask REF_APP "Its application id (e.g. org.mozilla.fennec_fdroid)" "$(recall REF_APP)"
+      if git -C "$FDROIDDATA" show "$BASE:metadata/$REF_APP.yml" > "$WORK/base-ref.yml" 2>/dev/null; then
+        BASE_FILE="$WORK/base-ref.yml"; BASE_KIND=reference; BASE_LABEL="$REF_APP's recipe"
+        break
+      fi
+      warn "fdroiddata has no metadata/$REF_APP.yml"
+    elif [ "$BASE_PICK" = "$NEW_N" ]; then
+      break
+    else
+      warn "a number from the list"
     fi
   done
-  if grep -q '^Builds:' "$YML"; then
-    awk -v bf="$BUILD_BLOCK" '
-      BEGIN { while ((getline l < bf) > 0) blk = blk l "\n" }
-      /^Builds:[[:space:]]*$/ { inb = 1; print; next }
-      inb && /^[^[:space:]#]/ { printf "%s\n", blk; inb = 0; print; next }
-      { print }
-      END { if (inb) printf "%s", blk }
-    ' "$YML" > "$YML.new" && mv "$YML.new" "$YML"
-  else
-    { printf '\nBuilds:\n'; cat "$BUILD_BLOCK"; } >> "$YML"
+fi
+[ -n "$BASE_FILE" ] && rcp load "$BASE_FILE" "$RD"
+[ "$BASE_KIND" = none ] || ok "starting from $BASE_LABEL"
+# Last time's answers are the defaults — unless this run starts from another
+# recipe: then that recipe's lines are what you came for.
+case "$BASE_KIND" in
+  reference) BASE_ID="reference:$REF_APP" ;;
+  app)       BASE_ID="app:${BASE_FILE#"$REPO"/}" ;;
+  *)         BASE_ID="$BASE_KIND" ;;
+esac
+if [ -n "$(recall Y_BASE)" ] && [ "$(recall Y_BASE)" != "$BASE_ID" ]; then
+  note "a different starting recipe from last time: its lines are the defaults now, not last time's answers"
+  for k in "${!MEM[@]}"; do case "$k" in Y_*) unset "MEM[$k]" ;; esac; done
+fi
+remember Y_BASE "$BASE_ID"
+if [ "$BASE_KIND" = reference ]; then
+  # another app's license, links and author are no default for yours
+  for f in "$RD"/top/*; do
+    case "${f##*/}" in AntiFeatures|AntiFeatures.k|UpdateCheckMode|UpdateCheckMode.k|AutoUpdateMode|AutoUpdateMode.k) ;;
+      *) rm -f "$f" ;; esac
+  done
+  : > "$RD/top.order"
+  note "from it: the build steps, the anti-features and the update checks — each one asked"
+fi
+
+# The new build entries: this run's versions, on top of the base's build steps.
+rcp template "$RG" "$RD" "$BASE_KIND" "$RT" "$VCODE"
+K="$(cat "$RT/b.count")"
+if [ "$IS_UPDATE" = 1 ]; then
+  for n in $(seq 1 "$K"); do
+    vc="$(fv "$RT/b/$n/versionCode")"
+    for e in $(cat "$RD"/b/*/versionCode 2>/dev/null); do
+      [ "$e" = "$vc" ] && die "versionCode $vc is already in metadata/$APPID.yml — nothing to do"
+    done
+  done
+fi
+# The base's own build entries: F-Droid's stay, an unmerged recipe's are asked about.
+BUILDS_MODE=replace
+[ "$BASE_KIND" = upstream ] && BUILDS_MODE=keep
+if [ "$BASE_KIND" = fork ] || [ "$BASE_KIND" = app ]; then
+  OLDV="$(cat "$RD"/b/*/versionName 2>/dev/null | grep -vxF "$VNAME" | sort -u | tr '\n' ' ' || true)"
+  if [ -n "$OLDV" ]; then
+    note "it has build entries for ${OLDV% } — a new app's merge request usually has only the newest"
+    confirm "Keep them next to the new one?" n && BUILDS_MODE=keep
   fi
-  # CurrentVersion drives what F-Droid offers as the latest release.
-  if grep -q '^CurrentVersion:' "$YML"; then
-    # not `sed -i`: that needs an argument on BSD/macOS sed and none on GNU
-    sed -E "s|^CurrentVersion:.*|CurrentVersion: '$VNAME'|; s|^CurrentVersionCode:.*|CurrentVersionCode: $CUR_VCODE|" \
-      "$YML" > "$YML.new" && mv "$YML.new" "$YML"
-  else
-    printf "\nCurrentVersion: '%s'\nCurrentVersionCode: %s\n" "$VNAME" "$CUR_VCODE" >> "$YML"
+fi
+
+# where a field comes from: the base recipe, else what was detected
+dflt() {  # dflt <Key> <fallback>
+  local v=""
+  [ -f "$RD/top/$1" ] && v="$(fv "$RD/top/$1")"
+  printf '%s' "${v:-$2}"
+}
+TOP_DONE=" "
+tdone() { TOP_DONE="$TOP_DONE$* "; }
+
+# --- the app itself: license, categories, links, author, anti-features
+ask_about_app() {
+  local c i found lic_guess="" lic_from="" mail_def a n why whydef new cur defnums
+  printf '\n'; say "${B}About the app${R}"
+  # license: what the recipe says, else last time's answer, else the repo's file
+  if [ -f "$RD/top/License" ]; then lic_guess="$(fv "$RD/top/License")"; lic_from="$BASE_LABEL"
+  elif [ "${SAVED_LICENSE_APP:-}" = "$APPID" ] && [ -n "${SAVED_LICENSE:-}" ]; then
+    lic_guess="$SAVED_LICENSE"; lic_from="your answer last time"
   fi
-  # An older entry may predate AutoName; CI's checkupdates would add it and then
-  # fail the job on the diff, so put it in now.
-  if [ -n "$AUTONAME" ] && ! grep -q '^AutoName:' "$YML"; then
-    awk -v n="$AUTONAME" '
-      !ins && /^RepoType:/ { print "AutoName: " n; print ""; ins = 1 }
-      { print }' "$YML" > "$YML.new" && mv "$YML.new" "$YML"
-    grep -q '^AutoName:' "$YML" && note "added the AutoName that CI expects"
-  fi
-  ok "added versionCode(s) $VCODES to the existing metadata"
-else
-  # ---------- new app: ask for everything the entry needs
-  # --- license: always asked, with what the repo says as the default.
-  # Remembered answers only count for the same app.
-  LIC_GUESS=""; LIC_FROM=""
-  if [ "${SAVED_LICENSE_APP:-}" = "$APPID" ] && [ -n "${SAVED_LICENSE:-}" ]; then
-    LIC_GUESS="$SAVED_LICENSE"; LIC_FROM="your answer last time"
-  fi
-  if [ -z "$LIC_GUESS" ]; then
+  if [ -z "$lic_guess" ]; then
     for f in LICENSE LICENSE.md LICENSE.txt LICENCE LICENCE.md COPYING COPYING.md; do
       [ -f "$REPO/$f" ] || continue
       # Only the head: the GPL-3.0 text itself mentions the Affero license
@@ -1928,39 +3020,39 @@ else
         if grep -q "Version 2.1" "$LH"; then GNU="LGPL-2.1"; else GNU="LGPL-3.0"; fi
       elif grep -qi "GNU GENERAL PUBLIC LICENSE" "$LH"; then
         if grep -q "Version 3" "$LH"; then GNU="GPL-3.0"; else GNU="GPL-2.0"; fi
-      elif grep -qi "Apache License" "$LH";        then LIC_GUESS="Apache-2.0"
-      elif grep -qi "MIT License" "$LH";           then LIC_GUESS="MIT"
-      elif grep -qi "Mozilla Public License" "$LH"; then LIC_GUESS="MPL-2.0"
-      elif grep -qi "Redistribution and use in source" "$LH"; then LIC_GUESS="BSD-3-Clause"
-      elif grep -qi "This is free and unencumbered" "$LH"; then LIC_GUESS="Unlicense"
+      elif grep -qi "Apache License" "$LH";        then lic_guess="Apache-2.0"
+      elif grep -qi "MIT License" "$LH";           then lic_guess="MIT"
+      elif grep -qi "Mozilla Public License" "$LH"; then lic_guess="MPL-2.0"
+      elif grep -qi "Redistribution and use in source" "$LH"; then lic_guess="BSD-3-Clause"
+      elif grep -qi "This is free and unencumbered" "$LH"; then lic_guess="Unlicense"
       fi
       if [ -n "$GNU" ]; then
         # The license text is the same for "-only" and "-or-later"; the
         # difference is in the notices in the source files.
         if git -C "$REPO" grep -qi "any later version" -- ':!LICENSE*' ':!LICENCE*' ':!COPYING*' 2>/dev/null; then
-          LIC_GUESS="$GNU-or-later"; LIC_FROM="$f; source files say \"any later version\""
+          lic_guess="$GNU-or-later"; lic_from="$f; source files say \"any later version\""
         else
-          LIC_GUESS="$GNU-only"; LIC_FROM="$f; no \"any later version\" notice in the source"
+          lic_guess="$GNU-only"; lic_from="$f; no \"any later version\" notice in the source"
         fi
-      elif [ -n "$LIC_GUESS" ]; then
-        LIC_FROM="$f"
+      elif [ -n "$lic_guess" ]; then
+        lic_from="$f"
       fi
-      [ -n "$LIC_GUESS" ] && break
+      [ -n "$lic_guess" ] && break
     done
   fi
-  if [ -n "$LIC_GUESS" ]; then
-    note "license from $LIC_FROM — Enter keeps it, or type another SPDX id"
-    case "$LIC_GUESS" in *GPL*) note "(GPL-3.0-only and GPL-3.0-or-later are different licenses: pick the one you mean)" ;; esac
+  if [ -n "$lic_guess" ]; then
+    note "License from $lic_from — Enter keeps it, or type another SPDX id"
+    case "$lic_guess" in *GPL*) note "(GPL-3.0-only and GPL-3.0-or-later are different licenses: pick the one you mean)" ;; esac
   else
-    note "no license found — SPDX identifier, e.g. GPL-3.0-only, Apache-2.0, MIT, AGPL-3.0-only"
+    note "no license found — an SPDX identifier, e.g. GPL-3.0-only, Apache-2.0, MIT, AGPL-3.0-only"
   fi
-  ask LICENSE "License" "$LIC_GUESS"
+  ask LICENSE "License" "$(ymem top/License "$lic_guess")"
+  ysave top/License s "$LICENSE"; tdone License
 
-  # --- categories
-  # fdroiddata keeps the real list in config/categories.yml, and it is nothing
-  # like the old handful: ~120 precise ones (Bookmark, Ebook Reader, Password
-  # Manager…). lint rejects anything not in it, and reviewers ask for the
-  # precise one, so read the list out of the clone rather than guessing.
+  # categories: fdroiddata keeps the real list in config/categories.yml, and it
+  # is nothing like the old handful: ~120 precise ones (Bookmark, Ebook Reader,
+  # Password Manager…). lint rejects anything not in it, and reviewers ask for
+  # the precise one, so the list comes out of the clone rather than a guess.
   CATS_FILE="$FDROIDDATA/config/categories.yml"
   CATS=()
   if [ -f "$CATS_FILE" ]; then
@@ -1974,11 +3066,17 @@ else
           "Sports & Health" System Theming Time Writing)
   fi
   CATS_MAX="${#CATS[@]}"
-
-  # Only a person can pick these; after the first run they're remembered.
-  # (remembered per app — another app's categories are no guess for this one)
-  CATSEL=""
-  [ "${SAVED_CATSEL_APP:-}" = "$APPID" ] && CATSEL="${SAVED_CATSEL:-}"
+  # remembered per app — another app's categories are no guess for this one
+  CATSEL="$(recall CATSEL)"
+  [ -z "$CATSEL" ] && [ "${SAVED_CATSEL_APP:-}" = "$APPID" ] && CATSEL="${SAVED_CATSEL:-}"
+  if [ -z "$CATSEL" ] && [ -s "$RD/top/Categories" ]; then
+    for c in $(tr ' ' '\037' < "$RD/top/Categories"); do
+      c="${c//$'\037'/ }"; found=""
+      for i in "${!CATS[@]}"; do [ "${CATS[$i]}" = "$c" ] && found=$((i + 1)); done
+      if [ -n "$found" ]; then CATSEL="${CATSEL:+$CATSEL }$found"
+      else warn "category '$c' from $BASE_LABEL is not in fdroiddata's list"; fi
+    done
+  fi
   print_cats() {  # print_cats [filter] — numbered, in columns, narrowed if asked
     local i=1 shown=0 c
     for c in "${CATS[@]}"; do
@@ -1992,8 +3090,14 @@ else
     [ "$shown" = 0 ] && warn "nothing matches \"$1\""
     return 0
   }
-  if [ -z "$CATSEL" ] || [ "$ASK_ALL" = 1 ]; then
-    [ "$ASSUME_YES" = 1 ] && [ -z "$CATSEL" ] && die "--yes: pick the categories once in a normal run first"
+  cat_names() { local n out=""; for n in $1; do out="${out:+$out, }${CATS[$((n - 1))]:-?}"; done; printf '%s' "$out"; }
+  yhelp top Categories
+  if [ -n "$CATSEL" ]; then
+    say "Categories: $(cat_names "$CATSEL")"
+    confirm "Keep them?" y || CATSEL=""
+  fi
+  if [ -z "$CATSEL" ]; then
+    [ "$ASSUME_YES" = 1 ] && die "--yes: pick the categories once in a normal run first"
     say "$CATS_MAX categories. Type a word to narrow the list, or Enter to see them all."
     ask_opt CATFILTER "Narrow by" ""
     print_cats "$CATFILTER"
@@ -2001,7 +3105,7 @@ else
     say "precise one — pick the category that names what the app is."
   fi
   while :; do
-    if [ -z "$CATSEL" ] || [ "$ASK_ALL" = 1 ]; then ask CATSEL "Numbers" "$CATSEL"; fi
+    [ -z "$CATSEL" ] && ask CATSEL "Numbers" ""
     CATEGORIES=""; BADSEL=""
     for n in $CATSEL; do
       case "$n" in ''|*[!0-9]*) BADSEL="$n"; break ;; esac
@@ -2011,216 +3115,344 @@ else
     [ -z "$BADSEL" ] && [ -n "$CATEGORIES" ] && break
     warn "'${BADSEL:-}' is not one of 1-$CATS_MAX"; CATSEL=""
   done
+  remember CATSEL "$CATSEL"
   ok "categories: ${CATEGORIES//|/, }"
+  rset top/Categories l "$(printf '%s' "$CATEGORIES" | tr '|' '\n')"; tdone Categories
 
-  # --- urls
-  auto SOURCE  "SourceCode"   "$WEB_GUESS"
-  auto REPOURL "Repo" "${WEB_GUESS:+$WEB_GUESS.git}"
-  case "$REPOURL" in *.git) ;; *) warn "Repo usually ends in .git — fdroid lint will say so" ;; esac
-  # Every optional field gets asked: blank leaves it out, "-" clears a
-  # remembered one. They all show on the app's f-droid.org page.
-  note "the rest are optional — Enter to accept, blank to leave out"
-  ask_opt ISSUES      "IssueTracker"   "${WEB_GUESS:+$WEB_GUESS/issues}"
-  ask_opt CHANGELOG   "Changelog"      "${WEB_GUESS:+$WEB_GUESS/releases}"
-  ask_opt WEBSITE     "WebSite"        "${SAVED_WEBSITE:-}"
-  ask_opt TRANSLATION "Translation (Weblate, Crowdin…)" ""
-  ask_opt DONATE      "Donate (a page that takes donations)" ""
-  ask_opt LIBERAPAY   "Liberapay (the name, not the URL)" ""
-  ask_opt OPENCOLLECTIVE "OpenCollective (the name, not the URL)" ""
+  # links and author: shown on the app's f-droid.org page
+  yline top/SourceCode    top "$(dflt SourceCode "$WEB_GUESS")" req
+  yline top/IssueTracker  top "$(dflt IssueTracker "${WEB_GUESS:+$WEB_GUESS/issues}")"
+  yline top/Changelog     top "$(dflt Changelog "${WEB_GUESS:+$WEB_GUESS/releases}")"
+  yline top/WebSite       top "$(dflt WebSite "${SAVED_WEBSITE:-}")"
+  yline top/Translation   top "$(dflt Translation "")"
+  yline top/Donate        top "$(dflt Donate "")"
+  yline top/Liberapay     top "$(dflt Liberapay "")"
+  yline top/OpenCollective top "$(dflt OpenCollective "")"
+  yline top/AuthorName    top "$(dflt AuthorName "${SAVED_AUTHORNAME:-$(git -C "$REPO" config user.name 2>/dev/null || true)}")" req
+  mail_def="$(dflt AuthorEmail "${SAVED_AUTHOREMAIL:-$(git -C "$REPO" config user.email 2>/dev/null || true)}")"
+  [ -n "$mail_def" ] && note "the email will be public in fdroiddata — Enter keeps it, - leaves it out"
+  yline top/AuthorEmail   top "$mail_def"
+  yline top/AuthorWebSite top "$(dflt AuthorWebSite "${SAVED_AUTHORSITE:-}")"
+  yline top/AutoName      top "$(dflt AutoName "$AUTONAME")"
+  tdone SourceCode IssueTracker Changelog WebSite Translation Donate Liberapay OpenCollective \
+        AuthorName AuthorEmail AuthorWebSite AutoName
+  SOURCE="$(fv "$RR/top/SourceCode")"; ISSUES="$(fv "$RR/top/IssueTracker")"
+  CHANGELOG="$(fv "$RR/top/Changelog")"; WEBSITE="$(fv "$RR/top/WebSite")"
+  AUTHORNAME="$(fv "$RR/top/AuthorName")"; AUTHOREMAIL="$(fv "$RR/top/AuthorEmail")"
+  AUTHORSITE="$(fv "$RR/top/AuthorWebSite")"
 
-  # --- author
-  # fdroiddata requires an AuthorName (any name, it needn't be your real one).
-  note "AuthorName is shown on f-droid.org — any name will do, it needn't be your real one"
-  ask_once AUTHORNAME "AuthorName" "${SAVED_AUTHORNAME:-$(git -C "$REPO" config user.name 2>/dev/null || echo "")}"
-  # The email is published in fdroiddata: always asked, never assumed.
-  if [ -n "${SAVED_AUTHOREMAIL:-}" ]; then MAIL_GUESS="$SAVED_AUTHOREMAIL"; MAIL_FROM="your answer last time"
-  else MAIL_GUESS="$(git -C "$REPO" config user.email 2>/dev/null || echo "")"; MAIL_FROM="your git identity (git config user.email)"; fi
-  [ -n "$MAIL_GUESS" ] && note "email from $MAIL_FROM — it will be public in fdroiddata; Enter keeps it, - leaves it out"
-  ask_opt AUTHOREMAIL "AuthorEmail" "$MAIL_GUESS"
-  [ -n "$AUTHOREMAIL" ] && ok "AuthorEmail: $AUTHOREMAIL" || ok "no AuthorEmail"
-  auto_opt AUTHORSITE  "AuthorWebSite" "${SAVED_AUTHORSITE:-}"
-
-  # --- flags
-  REQROOT=false
-  confirm "Does the app need root access on the device?" n && REQROOT=true
-
-  # --- anti-features
-  AF_ALL="Ads Tracking NonFreeNet NonFreeAdd NonFreeDep NonFreeAssets UpstreamNonFree NoSourceSince KnownVuln"
-  ANTIFEATURES=""
-  # Asked when the pitfall check found proprietary bits, or with --ask.
-  AF_ASK=0
-  [ -n "${PROPRIETARY:-}${PROPRIETARY_PUB// /}" ] && AF_ASK=1
-  [ "$ASK_ALL" = 1 ] && AF_ASK=1
-  [ "$AF_ASK" = 0 ] && ok "anti-features: none (no ads, trackers or non-free dependencies found)"
-  if [ "$AF_ASK" = 1 ] && confirm "Declare any anti-features (ads, tracking, non-free deps…)?" n; then
-    i=1; for a in $AF_ALL; do printf '     %2d) %s\n' "$i" "$a"; i=$((i+1)); done
-    AF_MAX=$((i-1))
-    ask_opt AFSEL "Numbers (space separated, blank for none)" ""
-    for n in $AFSEL; do
-      case "$n" in ''|*[!0-9]*) continue ;; esac
-      [ "$n" -ge 1 ] && [ "$n" -le "$AF_MAX" ] || continue
-      a="$(echo "$AF_ALL" | awk -v k="$n" '{print $k}')"
-      ANTIFEATURES="$ANTIFEATURES${ANTIFEATURES:+|}$a"
-    done
-    [ -n "$ANTIFEATURES" ] && ok "anti-features: ${ANTIFEATURES//|/, }"
-  fi
-
-  # --- publishing mode
-  MODE=1; BINARIES=""; SIGNKEY=""
-  if [ "$ASK_ALL" = 0 ]; then
-    ok "publishing: F-Droid builds and signs (--ask to set up reproducible builds)"
+  # anti-features, with a sentence each saying why (users see it)
+  if [ "$(fk "$RD/top/AntiFeatures")" = r ]; then
+    yblock top/AntiFeatures top "$(fv "$RD/top/AntiFeatures")" r
   else
-  step "Publishing mode"
+    yhelp top AntiFeatures
+    [ -n "${PROPRIETARY:-}${PROPRIETARY_PUB// /}" ] && \
+      note "the pitfall check found non-free dependencies: NonFreeDep, unless the F-Droid build removes them"
+    cur="$(ymem top/AntiFeatures "$(fv "$RD/top/AntiFeatures")")"
+    if [ -n "$cur" ]; then say "AntiFeatures:"; printf '%s\n' "$cur" | sed 's/^/     - /'
+    else say "AntiFeatures: none"; fi
+    if [ "$ASSUME_YES" = 0 ] && confirm "Change them?" n; then
+      AF_ALL="Ads ApplicationDebuggable KnownVuln NonFreeAdd NonFreeAssets NonFreeDep NonFreeNet NoSourceSince TetheredNet Tracking"
+      i=1; defnums=""
+      for a in $AF_ALL; do
+        printf '     %2d) %s\n' "$i" "$a"
+        printf '%s\n' "$cur" | grep -qE "^$a(:|$)" && defnums="${defnums:+$defnums }$i"
+        i=$((i + 1))
+      done
+      ask_opt AFSEL "Numbers (space separated, - for none)" "$defnums"
+      new=""
+      for n in $AFSEL; do
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        a="$(echo "$AF_ALL" | awk -v k="$n" '{print $k}')"
+        [ -n "$a" ] || continue
+        whydef="$(printf '%s\n' "$cur" | sed -n "s/^$a:[[:space:]]*//p" | sed -n 1p)"
+        ask_opt AFWHY "$a — why, in one sentence users see (- for none)" "$whydef"
+        new="${new:+$new$'\n'}$a${AFWHY:+: $AFWHY}"
+      done
+      cur="$new"
+    fi
+    ysave top/AntiFeatures a "$cur"
+  fi
+  tdone AntiFeatures
+
+  a=n; [ "$(dflt RequiresRoot false)" = true ] && a=y
+  if [ "$ASSUME_YES" = 0 ]; then
+    confirm "Does the app need root access on the phone? (RequiresRoot)" "$a" && a=y || a=n
+  fi
+  if [ "$a" = y ]; then rset top/RequiresRoot s true; else rdel top/RequiresRoot; fi
+  tdone RequiresRoot
+  yline top/RepoType top "$(dflt RepoType git)" req
+  yline top/Repo     top "$(dflt Repo "${WEB_GUESS:+$WEB_GUESS.git}")" req
+  REPOURL="$(fv "$RR/top/Repo")"
+  case "$REPOURL" in *.git) ;; *) [ "$(fv "$RR/top/RepoType")" = git ] && warn "Repo usually ends in .git — fdroid lint will say so" ;; esac
+  tdone RepoType Repo
+}
+
+# --- who signs what users install
+ask_publishing() {
+  local def=1 n abi b
+  { [ -f "$RD/top/Binaries" ] || [ -f "$RD/top/AllowedAPKSigningKeys" ] \
+    || ls "$RT"/b/*/binary >/dev/null 2>&1; } && def=2
+  printf '\n'; say "${B}Publishing${R}"
   say "  1) ${B}F-Droid builds and signs${R}  — F-Droid compiles from source and signs with"
   say "     its own key. Simplest. Users get F-Droid's signature, so an app already"
   say "     installed from your GitHub APK cannot update to it."
   say "  2) ${B}Reproducible build${R}         — F-Droid rebuilds from source, checks the result"
   say "     matches your signed APK, and ships YOUR APK. Keeps your signature."
   say "     Needs Binaries: and AllowedAPKSigningKeys."
-  ask MODE "Which?" "1"
-
-  if [ "$MODE" = "2" ]; then
-    # Name the file after the project, not the local checkout's folder.
-    if [ "$ABISPLIT" = 1 ]; then
-      note "use %v for the version and %abi for the CPU type, e.g."
-      note "  .../releases/download/v%v/App-%v-%abi.apk"
-      note "each CPU type gets its own build entry, so each gets its own binary: line"
-      ask BINARIES "Release APK URL pattern" "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v-%abi.apk}"
+  ask MODE "Which?" "$(r="$(recall MODE)"; printf '%s' "${r:-$def}")"
+  tdone Binaries AllowedAPKSigningKeys
+  if [ "$MODE" != 2 ]; then
+    rdel top/Binaries; rdel top/AllowedAPKSigningKeys
+    for n in $(seq 1 "$K"); do rm -f "$RT/b/$n/binary" "$RT/b/$n/binary.k"; done
+    return 0
+  fi
+  # Name the file after the project, not the local checkout's folder.
+  if [ "$K" -gt 1 ]; then
+    note "use %v for the version and %abi for the CPU type, e.g."
+    note "  .../releases/download/v%v/App-%v-%abi.apk"
+    note "each CPU type gets its own build entry, so each gets its own binary: line"
+    ask BINARIES "Release APK URL pattern" \
+      "$(dflt Binaries "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v-%abi.apk}")"
+  else
+    note "use %v where the version goes, e.g. .../releases/download/v%v/App-%v.apk"
+    ask BINARIES "Binaries URL pattern" \
+      "$(dflt Binaries "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v.apk}")"
+  fi
+  SIGNKEY="$(sed -n 1p "$RD/top/AllowedAPKSigningKeys" 2>/dev/null || true)"
+  say "The signing certificate SHA-256 of your release APK is needed."
+  if confirm "Extract it from a local APK now?" "$([ -n "$SIGNKEY" ] && echo n || echo y)"; then
+    ask APKPATH "Path to your signed release APK" ""
+    APKPATH="${APKPATH/#\~/$HOME}"
+    if [ ! -f "$APKPATH" ]; then
+      warn "no such file: $APKPATH"
     else
-      note "use %v where the version goes, e.g. .../releases/download/v%v/App-%v.apk"
-      ask BINARIES "Binaries URL pattern" "${WEB_GUESS:+$WEB_GUESS/releases/download/v%v/${WEB_GUESS##*/}-%v.apk}"
-    fi
-    say "The signing certificate SHA-256 of your release APK is needed."
-    if confirm "Extract it from a local APK now?" y; then
-      ask APKPATH "Path to your signed release APK" ""
-      APKPATH="${APKPATH/#\~/$HOME}"
-      if [ ! -f "$APKPATH" ]; then
-        warn "no such file: $APKPATH"
-      else
-        AS=""
-        if have apksigner; then AS="apksigner"
-        elif [ -n "${ANDROID_HOME:-}" ]; then
-          cand="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | tail -1)"
-          [ -n "$cand" ] && [ -f "$cand/lib/apksigner.jar" ] && AS="java -jar $cand/lib/apksigner.jar"
-        fi
-        if [ -n "$AS" ]; then
-          SIGNKEY="$($AS verify --print-certs "$APKPATH" 2>/dev/null \
-                     | awk '/SHA-256 digest/ {print $NF; exit}')"
-        fi
-        # keytool ships with any JDK and reads the APK's signature block too
-        if [ -z "$SIGNKEY" ] && have keytool; then
-          SIGNKEY="$(keytool -printcert -jarfile "$APKPATH" 2>/dev/null \
-                     | awk '/SHA256:/ {print $2; exit}' | tr -d ':' | tr 'A-Z' 'a-z')"
-        fi
-        [ -n "$SIGNKEY" ] && ok "signing key: $SIGNKEY" || warn "could not read it automatically"
-        reference_apk_blocks "$APKPATH" | while IFS= read -r blk; do
-          [ -n "$blk" ] || continue
-          warn "the APK carries an extra signing block: $blk"
-          note "F-Droid's scanner refuses it — the \"check apk\" job fails once"
-          note "everything else has passed. Switch it off in the gradle file:"
-          note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
-          note "that changes the APK, so it needs a new version and new binaries"
-        done
-        reference_apk_reproducible "$APKPATH" "$APPID" || \
-          confirm "Submit with reproducible builds anyway?" n || \
-          die "build the APK you publish at F-Droid's path first, then re-run"
+      AS=""
+      if have apksigner; then AS="apksigner"
+      elif [ -n "${ANDROID_HOME:-}" ]; then
+        cand="$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | tail -1)"
+        [ -n "$cand" ] && [ -f "$cand/lib/apksigner.jar" ] && AS="java -jar $cand/lib/apksigner.jar"
       fi
-    fi
-    [ -n "$SIGNKEY" ] || ask SIGNKEY "AllowedAPKSigningKeys (SHA-256, lowercase hex)" ""
-    # Binaries: is one app-level pattern and only knows %v and %c, so it cannot
-    # name per-ABI release assets. fdroidserver takes `build.binary or
-    # app.Binaries`, so with a split each entry carries its own binary: line.
-    if [ "$ABISPLIT" = 1 ] && [ -n "$BINARIES" ]; then
-      awk -v pat="$BINARIES" '
-        function emit(abi,   b) { b = pat; gsub(/%abi/, abi, b); print "    binary: " b }
-        { print }
-        /^    output: .*armeabi-v7a/ { emit("armeabi-v7a") }
-        /^    output: .*arm64-v8a/   { emit("arm64-v8a") }
-        /^    output: .*x86_64/      { emit("x86_64") }
-      ' "$BUILD_BLOCK" > "$BUILD_BLOCK.new" && mv "$BUILD_BLOCK.new" "$BUILD_BLOCK"
-      ok "each build entry points at its own APK on the release page"
+      if [ -n "$AS" ]; then
+        SIGNKEY="$($AS verify --print-certs "$APKPATH" 2>/dev/null \
+                   | awk '/SHA-256 digest/ {print $NF; exit}')"
+      fi
+      # keytool ships with any JDK and reads the APK's signature block too
+      if [ -z "$SIGNKEY" ] && have keytool; then
+        SIGNKEY="$(keytool -printcert -jarfile "$APKPATH" 2>/dev/null \
+                   | awk '/SHA256:/ {print $2; exit}' | tr -d ':' | tr 'A-Z' 'a-z')"
+      fi
+      [ -n "$SIGNKEY" ] && ok "signing key: $SIGNKEY" || warn "could not read it automatically"
+      reference_apk_blocks "$APKPATH" | while IFS= read -r blk; do
+        [ -n "$blk" ] || continue
+        warn "the APK carries an extra signing block: $blk"
+        note "F-Droid's scanner refuses it — the \"check apk\" job fails once"
+        note "everything else has passed. Switch it off in the gradle file:"
+        note "  android { dependenciesInfo { includeInApk = false; includeInBundle = false } }"
+        note "that changes the APK, so it needs a new version and new binaries"
+      done
+      reference_apk_reproducible "$APKPATH" "$APPID" || \
+        confirm "Submit with reproducible builds anyway?" n || \
+        die "build the APK you publish at F-Droid's path first, then re-run"
     fi
   fi
+  ask SIGNKEY "AllowedAPKSigningKeys (SHA-256, lowercase hex)" "$SIGNKEY"
+  rset top/AllowedAPKSigningKeys l "$SIGNKEY"
+  # Binaries: is one app-level pattern and only knows %v and %c, so it cannot
+  # name per-ABI release assets. fdroidserver takes `build.binary or
+  # app.Binaries`, so with a split each entry carries its own binary: line.
+  if [ "$K" -gt 1 ]; then
+    rdel top/Binaries
+    for n in $(seq 1 "$K"); do
+      abi="$(cat "$RT/b/$n/output" "$RT/b/$n/build" 2>/dev/null \
+             | grep -oE 'armeabi-v7a|arm64-v8a|x86_64|x86' | sed -n 1p || true)"
+      b="$BINARIES"; [ -n "$abi" ] && b="${b//%abi/$abi}"
+      printf '%s\n' "$b" > "$RT/b/$n/binary"; echo s > "$RT/b/$n/binary.k"
+    done
+    ok "each build entry points at its own APK on the release page"
+  else
+    rset top/Binaries s "$BINARIES"
+    for n in $(seq 1 "$K"); do rm -f "$RT/b/$n/binary" "$RT/b/$n/binary.k"; done
   fi
+}
 
-  # --- auto-update
-  # fdroiddata's schema allows only None, Version, or "Version +suffix"
-  # (schemas/metadata.json: ^(None|Version( \+.+)?)$). The old tag-pattern form
-  # "Version v%v" is gone: with UpdateCheckMode Tags, fdroidserver reuses the
-  # tag it actually found, whatever that tag is called.
-  AUM_RE='^(None|Version( \+.+)?)$'
-  AUM="Version"
-  case "$TAG" in
-    "$VNAME"|"v$VNAME") ;;
-    *)
-      warn "tag '$TAG' is neither '$VNAME' nor 'v$VNAME'"
-      note "UpdateCheckMode: Tags takes the newest tag whatever it is called, so"
-      note "'Version' still works; answer None to update the metadata by hand"
-      while :; do
-        ask_opt AUM "AutoUpdateMode (Version, None, or 'Version +suffix')" "Version"
-        AUM="${AUM:-None}"
-        printf '%s' "$AUM" | grep -qE "$AUM_RE" && break
-        warn "fdroiddata's schema only accepts None, Version, or 'Version +suffix'"
-      done ;;
-  esac
+# --- the build entries, line by line
+entry_label() {  # entry_label <n> — the CPU type an entry builds, else its versionCode
+  local abi
+  abi="$(cat "$RT/b/$1/output" "$RT/b/$1/build" "$RT/b/$1/gradleprops" "$RT/b/$1/prebuild" 2>/dev/null \
+         | grep -oE 'armeabi-v7a|arm64-v8a|x86_64|x86' | sed -n 1p || true)"
+  printf '%s' "${abi:-versionCode $(fv "$RT/b/$1/versionCode")}"
+}
+ask_build_entries() {
+  local key keys n same t kind req vc dup e m
+  printf '\n'
+  if [ "$K" -gt 1 ]; then
+    say "${B}Build entries${R} — $K of them, one per CPU type; a line that is the same in all is asked once"
+  else
+    say "${B}Build entry${R}"
+  fi
+  # the template's lines, in fdroidserver's order, then anything else it has,
+  # then what was added by hand last time
+  keys=""
+  for key in $FBUILD; do ls "$RT"/b/*/"$key" >/dev/null 2>&1 && keys="$keys $key"; done
+  for t in "$RT"/b/*/*; do
+    [ -e "$t" ] || continue
+    key="${t##*/}"
+    case "$key" in *.k|*.del) continue ;; esac
+    case " $keys " in *" $key "*) ;; *) keys="$keys $key" ;; esac
+  done
+  for key in $(recall Y_added_build); do case " $keys " in *" $key "*) ;; *) keys="$keys $key" ;; esac; done
+  for key in $keys; do
+    req=""; case "$key" in versionName|versionCode|commit) req=req ;; esac
+    same=1
+    for n in $(seq 2 "$K"); do
+      { cmp -s "$RT/b/1/$key" "$RT/b/$n/$key" 2>/dev/null \
+        || { [ ! -f "$RT/b/1/$key" ] && [ ! -f "$RT/b/$n/$key" ]; }; } || same=0
+    done
+    if [ "$same" = 1 ]; then
+      kind="$(akind build "$key" "$RT/b/1/$key")"
+      yfield "b/1/$key" build "$kind" "$(fv "$RT/b/1/$key")" "$req"
+      ycopy_build "$key"
+    else
+      for n in $(seq 1 "$K"); do
+        note "entry $n of $K — $(entry_label "$n"):"
+        kind="$(akind build "$key" "$RT/b/$n/$key")"
+        yfield "b/$n/$key" build "$kind" "$(fv "$RT/b/$n/$key")" "$req"
+      done
+    fi
+  done
+  # every new versionCode has to be new
+  for n in $(seq 1 "$K"); do
+    while :; do
+      vc="$(fv "$RR/b/$n/versionCode")"; dup=""
+      if [ "$BUILDS_MODE" = keep ]; then
+        for e in $(cat "$RD"/b/*/versionCode 2>/dev/null); do [ "$e" = "$vc" ] && dup=1; done
+      fi
+      for m in $(seq 1 $((n - 1))); do [ "$(fv "$RR/b/$m/versionCode")" = "$vc" ] && dup=1; done
+      [ -z "$dup" ] && break
+      [ "$ASSUME_YES" = 1 ] && die "versionCode $vc is already in metadata/$APPID.yml"
+      warn "versionCode $vc is already taken — every build entry needs its own"
+      remember "$(mkey "b/$n/versionCode")" ""
+      yline "b/$n/versionCode" build "" req
+    done
+  done
+  # A $$name$$ is filled in from a srclib of that name (fdroidserver knows only
+  # SDK, NDK, COMMIT, VERSION and VERCODE itself): one with no srclibs: line
+  # behind it — typically a srclib just dropped — fails the build.
+  local u lib seen=" "
+  for n in $(seq 1 "$K"); do
+    for u in $(cat "$RR/b/$n"/* 2>/dev/null | grep -o '\$\$[A-Za-z0-9_.-]*\$\$' | sort -u); do
+      lib="${u//\$/}"
+      case "$lib" in SDK|NDK|MVN3|COMMIT|VERSION|VERCODE) continue ;; esac
+      sed 's/^[0-9]*://' "$RR/b/$n/srclibs" 2>/dev/null | grep -q "^$lib@" && continue
+      case "$seen" in *" $lib "*) continue ;; esac
+      seen="$seen$lib "
+      warn "the build uses $u, but no srclibs: line brings in $lib — the build would fail"
+      note "add the srclib below, or change the lines that use it (e at the preview opens the file)"
+    done
+  done
+  # what is missing, before the add menu offers it
+  if [ -n "$NATIVE" ] && [ ! -f "$RR/b/1/ndk" ]; then
+    warn "native code ($NATIVE), but no ndk: line — F-Droid needs one; add it below"
+  fi
+  if [ -n "$HAS_RUST" ] && ! grep -qs rustup "$RR"/b/*/sudo "$RR"/b/*/srclibs "$RR"/b/*/build "$RR"/b/*/prebuild; then
+    note "Rust code in the repo, and nothing installs rustup — reviewers ask for apt-get install -y rustup in sudo:"
+  fi
+  yadd build "Add a line to the build entr$([ "$K" -gt 1 ] && echo ies || echo y)"
+}
 
-  # --- assemble yaml
-  # NOTE: versionName/CurrentVersion/gradle are quoted on purpose. Unquoted, YAML reads
-  # 'yes' as boolean true and a versionName like 1.0 as a float. `fdroid rewritemeta`
-  # normalises the file afterwards anyway.
-  {
-    printf 'Categories:\n'
-    old_ifs="$IFS"; IFS='|'
-    for c in $CATEGORIES; do printf '  - %s\n' "$c"; done
-    IFS="$old_ifs"
-    printf 'License: %s\n' "$LICENSE"
-    [ -n "$AUTHORNAME" ]  && printf 'AuthorName: %s\n' "$AUTHORNAME"
-    [ -n "$AUTHOREMAIL" ] && printf 'AuthorEmail: %s\n' "$AUTHOREMAIL"
-    [ -n "$AUTHORSITE" ]  && printf 'AuthorWebSite: %s\n' "$AUTHORSITE"
-    [ -n "$WEBSITE" ]     && printf 'WebSite: %s\n' "$WEBSITE"
-    printf 'SourceCode: %s\n' "$SOURCE"
-    [ -n "$ISSUES" ]         && printf 'IssueTracker: %s\n' "$ISSUES"
-    [ -n "${TRANSLATION:-}" ] && printf 'Translation: %s\n' "$TRANSLATION"
-    [ -n "$CHANGELOG" ]      && printf 'Changelog: %s\n' "$CHANGELOG"
-    [ -n "${DONATE:-}" ]         && printf 'Donate: %s\n' "$DONATE"
-    [ -n "${LIBERAPAY:-}" ]      && printf 'Liberapay: %s\n' "$LIBERAPAY"
-    [ -n "${OPENCOLLECTIVE:-}" ] && printf 'OpenCollective: %s\n' "$OPENCOLLECTIVE"
-    printf '\n'
-    [ -n "$AUTONAME" ]    && printf 'AutoName: %s\n\n' "$AUTONAME"
-    if [ -n "$ANTIFEATURES" ]; then
-      printf 'AntiFeatures:\n'
-      old_ifs="$IFS"; IFS='|'
-      for a in $ANTIFEATURES; do printf '  - %s\n' "$a"; done
-      IFS="$old_ifs"
-      printf '\n'
+# --- how F-Droid learns about new versions, and which one is current
+ask_update_checks() {
+  local ucm aum k src
+  printf '\n'; say "${B}Updates${R}"
+  ucm="$(dflt UpdateCheckMode "")"
+  if [ -z "$ucm" ]; then ucm=Tags; [ "${MANIFESTS:-0}" -gt 20 ] && ucm=None; fi
+  yline top/UpdateCheckMode top "$ucm" req
+  aum="$(dflt AutoUpdateMode "")"
+  if [ -z "$aum" ]; then
+    aum=Version; [ "$(fv "$RR/top/UpdateCheckMode")" = None ] && aum=None
+    case "$TAG" in
+      "$VNAME"|"v$VNAME") ;;
+      *) warn "tag '$TAG' is neither '$VNAME' nor 'v$VNAME'"
+         note "UpdateCheckMode: Tags takes the newest tag whatever it is called, so"
+         note "'Version' still works; answer None to update the metadata by hand" ;;
+    esac
+  fi
+  yline top/AutoUpdateMode top "$aum" req
+  for k in UpdateCheckIgnore VercodeOperation UpdateCheckName UpdateCheckData; do
+    src=""
+    if [ -f "$RD/top/$k" ]; then src="$RD/top/$k"; elif [ -f "$RG/top/$k" ]; then src="$RG/top/$k"; fi
+    [ -n "$src" ] && yfield "top/$k" top "$(akind top "$k" "$src")" "$(fv "$src")"
+  done
+  tdone UpdateCheckMode AutoUpdateMode UpdateCheckIgnore VercodeOperation UpdateCheckName UpdateCheckData
+}
+ask_current_version() {
+  local cur="" n vc
+  for n in $(seq 1 "$K"); do
+    vc="$(fv "$RR/b/$n/versionCode")"
+    [ -z "$cur" ] || [ "$vc" -gt "$cur" ] && cur="$vc"
+  done
+  yline top/CurrentVersion     top "$VNAME" req
+  yline top/CurrentVersionCode top "$cur" req
+  tdone CurrentVersion CurrentVersionCode
+}
+
+# --- whatever else the base recipe holds, and what was added by hand last time
+ask_rest() {
+  local k
+  for k in $(cat "$RD/top.order" 2>/dev/null) $(recall Y_added_top); do
+    case "$TOP_DONE" in *" $k "*) continue ;; esac
+    if [ -f "$RD/top/$k" ]; then
+      yfield "top/$k" top "$(akind top "$k" "$RD/top/$k")" "$(fv "$RD/top/$k")"
+    else
+      yfield "top/$k" top "${FKIND[top:$k]:-s}" ""
     fi
-    printf 'RepoType: git\n'
-    printf 'Repo: %s\n' "$REPOURL"
-    [ "$REQROOT" = true ] && printf 'RequiresRoot: true\n'
-    # with a split it went into each build entry as binary:, above
-    [ -n "$BINARIES" ] && [ "$ABISPLIT" = 0 ] && printf 'Binaries: %s\n' "$BINARIES"
-    printf '\n'
-    printf 'Builds:\n'
-    cat "$BUILD_BLOCK"
-    printf '\n'
-    [ -n "$SIGNKEY" ] && printf 'AllowedAPKSigningKeys: %s\n\n' "$SIGNKEY"
-    printf 'AutoUpdateMode: %s\n' "$AUM"
-    printf 'UpdateCheckMode: Tags\n'
-    # Split APKs: the codes the gradle override gives them, from pubspec's code.
-    if [ "$ABISPLIT" = 1 ]; then
-      printf 'VercodeOperation:\n'
-      printf "  - '10 * %%c + 1'\n  - '10 * %%c + 2'\n  - '10 * %%c + 3'\n"
-    fi
-    # The checker reads versions from gradle, where Flutter only has
-    # references; point it at pubspec.yaml's `version: name+code` instead.
-    if [ -n "$FLUTTER_DIR" ]; then
-      UCD_FILE="pubspec.yaml"; [ "$FLUTTER_DIR" != "." ] && UCD_FILE="$FLUTTER_DIR/pubspec.yaml"
-      printf 'UpdateCheckData: %s|version:\\s.+\\+(\\d+)|.|version:\\s(.+)\\+\n' "$UCD_FILE"
-    fi
-    printf "CurrentVersion: '%s'\n" "$VNAME"
-    printf 'CurrentVersionCode: %s\n' "$CUR_VCODE"
-  } > "$YML"
+    tdone "$k"
+  done
+}
+
+ASK_TOP=1
+[ "$IS_UPDATE" = 1 ] && ASK_TOP=0
+if [ "$ASK_TOP" = 1 ]; then
+  ask_about_app
+  ask_publishing
 fi
+ask_build_entries
+if [ "$ASK_TOP" = 1 ]; then
+  ask_update_checks
+  ask_current_version
+else
+  printf '\n'; say "${B}Current version${R}"
+  ask_current_version
+  # An older recipe may predate AutoName; CI's checkupdates would add it and
+  # then fail the job on the diff, so it goes in now.
+  if [ -n "$AUTONAME" ] && [ ! -f "$RD/top/AutoName" ]; then
+    note "the recipe has no AutoName — CI's checkupdates would add it and then fail on the diff"
+    yline top/AutoName top "$AUTONAME"
+  fi
+  tdone AutoName
+  if [ "$ASSUME_YES" = 0 ] && confirm "Go through the rest of metadata/$APPID.yml too (license, links, update checks…)?" n; then
+    ASK_TOP=1
+  fi
+fi
+if [ "$ASK_TOP" = 1 ]; then
+  ask_rest
+  yadd top "Add a field to the recipe"
+fi
+
+YML="$WORK/$APPID.yml"
+RENDER_BASE=-
+case "$BASE_KIND" in upstream|fork|app) RENDER_BASE="$BASE_FILE" ;; esac
+rcp render "$RENDER_BASE" "$RR" "$YML" "$BUILDS_MODE"
+# laid out as fdroiddata's CI lays it out; a local rewritemeta does it again below
+rcp ciwrap "$YML" all >/dev/null || true
+
+# what the later steps — the merge request text, the RFP — need from all this
+VCODES="$(for n in $(seq 1 "$K"); do fv "$RR/b/$n/versionCode"; done | tr '\n' ' ')"; VCODES="${VCODES% }"
+CUR_VCODE="$(fv "$RR/top/CurrentVersionCode")"
+ABISPLIT=0; [ "$K" -gt 1 ] && ABISPLIT=1
+AUM="$(fv "$RR/top/AutoUpdateMode")"; [ -n "$AUM" ] || AUM="$(dflt AutoUpdateMode None)"
+ok "metadata/$APPID.yml: $K build entr$([ "$K" -gt 1 ] && echo ies || echo y) ($VCODES)"
 
 step "metadata/$APPID.yml"
 while :; do
@@ -2285,6 +3517,10 @@ else
     fi
   fi
   say "fdroid rewritemeta $APPID"; frun rewritemeta "$APPID" || VALID_FAIL="$VALID_FAIL rewritemeta"
+  # CI's rewritemeta (Debian's ruamel.yaml 0.18) gives a word longer than a line
+  # a line of its own; a newer local fdroid does not, and CI then fails the job.
+  CIW="$(rcp ciwrap "$FDROIDDATA/metadata/$APPID.yml" || true)"
+  [ -n "$CIW" ] && note "laid out long values the way fdroiddata's CI does: $(printf '%s' "$CIW" | tr '\n' ' ')"
   say "fdroid lint $APPID";        frun lint "$APPID"        || VALID_FAIL="$VALID_FAIL lint"
 
   # fdroiddata's CI validates every changed file against schemas/metadata.json
@@ -2363,6 +3599,18 @@ PYSCHEMA
     fi
   else
     note "full build skipped (--build to run it; F-Droid's CI builds it anyway)"
+  fi
+fi
+
+# A recipe copy kept in the app repo (e.g. fdroid/<appid>.yml) is offered the
+# final file, so it never drifts from the merge request. It is not committed.
+APP_COPY=""
+case "$BASE_KIND" in app) APP_COPY="${BASE_FILE#"$REPO"/}" ;; esac
+[ -z "$APP_COPY" ] && [ -f "$REPO/fdroid/$APPID.yml" ] && APP_COPY="fdroid/$APPID.yml"
+if [ -n "$APP_COPY" ] && ! cmp -s "$FDROIDDATA/metadata/$APPID.yml" "$REPO/$APP_COPY"; then
+  if confirm "Copy the final recipe to $APP_COPY in your app repo too? (not committed there)" y; then
+    cp "$FDROIDDATA/metadata/$APPID.yml" "$REPO/$APP_COPY"
+    ok "updated $APP_COPY — commit it with your next change"
   fi
 fi
 
@@ -2530,7 +3778,7 @@ mr_description() {
 
 if [ "$DRYRUN" = 1 ]; then
   warn "dry run — not committing, pushing or opening a merge request"
-  note "so `fdroid checkupdates --auto` was not run either: it needs the commit,"
+  note "so 'fdroid checkupdates --auto' was not run either: it needs the commit,"
   note "and CI fails the job on any diff it would produce"
   note "$FDROIDDATA (branch $BRANCH)"
   exit 0
@@ -2578,6 +3826,8 @@ if [ "$RUNNER" != none ]; then
   mkdir -p "$WORK/deploy-sink/repo/status"
   if serverwebroot="$WORK/deploy-sink" \
      frun checkupdates --auto --allow-dirty "$APPID" > "$WORK/checkupdates.log" 2>&1; then
+    # it writes the file with the local fdroid's layout: put CI's back first
+    rcp ciwrap "$FDROIDDATA/metadata/$APPID.yml" >/dev/null || true
     CU_ERRORS="$(grep -c 'ERROR' "$WORK/checkupdates.log" || true)"
     if [ "${CU_ERRORS:-0}" -gt 0 ]; then
       warn "checkupdates logged $CU_ERRORS error(s) — usually fdroiddata's config.yml"
@@ -9029,6 +10279,7 @@ tools_fdroid() {
       note "  $(install_hint git)"; MISSING=$((MISSING+1))
     fi
   fi
+  need python3 "reading and writing metadata/<appid>.yml, line by line"
   want curl    "checking and creating the fdroiddata fork"
   want fdroid  "validating the metadata (readmeta / lint) before the merge request"
   want glab    "forking fdroiddata and opening the merge request for you"

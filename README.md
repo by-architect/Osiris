@@ -74,7 +74,7 @@ cd ~/path/to/your-app
 | flag | effect |
 | --- | --- |
 | `-y`, `--yes` | use everything detected, ask nothing; stops only on problems |
-| `--ask` | ask every question, including the ones it can answer itself |
+| `--ask` | also ask what it can work out about your repo (every recipe line is asked anyway) |
 | `--repo PATH` | the app's checkout (default: the git repo you run it in) |
 | `--build` | also run the full `fdroid build` (slow) |
 | `--rfp` | also open a Request For Packaging issue (new apps) |
@@ -124,24 +124,87 @@ Detected values are shown as `✓` lines instead of questions:
 - **GitLab:** your username from `glab`, the fork (created if missing); where
   to put the local fdroiddata clone is always asked, with the last path (or
   `~/fdroiddata`) as the default
-- **the metadata:** source/issue/changelog URLs from the git remote,
-  AuthorName from git config, the Flutter version from `.fvmrc`, no
-  anti-features unless the pitfall check found proprietary bits
+- **the metadata's defaults:** source/issue/changelog URLs from the git
+  remote, AuthorName from git config, the Flutter version from `.fvmrc`, the
+  Gradle module's flavours, NDK and submodules — each line is still asked
 - **validation:** `readmeta`, `rewritemeta` and `lint` run on their own; a
   failure stops the run before anything is pushed
 - **the merge request:** title in fdroiddata's format (`New app: <name>`,
   `Update <name> to <version>`), fdroiddata's own template as the description
   with the checklist items it verified ticked, opened with `glab`
 
-What it asks: the **categories** (the first time for each app — remembered
-after); the **license** and the **AuthorEmail**, each with what it found as
-the default and where it came from (the license from `LICENSE`, with GPL's
+What it asks: **every line of the recipe** (below), each with what it found
+as the default and where it came from — the license from `LICENSE`, with GPL's
 "only" or "or later" read from the notices in your source files; the email
-from `git config user.email` — Enter keeps it, `-` leaves it out, since it
-becomes public); "Looks right?" for the metadata, and before each action that leaves
-your machine (tag push, branch push, merge request). `--yes` answers those;
-it never force-pushes and stops where only a person can decide (categories
-for a new app, a missing store listing, failing validation).
+from `git config user.email`, which becomes public — and, before each action
+that leaves your machine, whether to do it (tag push, branch push, merge
+request). `--yes` takes every default; it never force-pushes and stops where
+only a person can decide (categories for a new app, a missing store listing,
+failing validation).
+
+### The recipe, line by line
+
+F-Droid recipes differ app by app, so every line of `metadata/<appid>.yml` is
+asked, one at a time, in fdroidserver's own order, with a short note saying
+what the field is for:
+
+```
+   subdir — the folder the build runs in: the Gradle module, or the project
+   subdir [app, - for none]:
+   sudo — commands run as root first, e.g. apt-get install -y rustup
+   sudo:
+     - apt-get update
+     - apt-get install -y rustup
+   sudo [Enter keeps · a adds · e edits · - for none]:
+```
+
+Enter keeps a line, typing replaces it, `-` leaves it out. Lists (`sudo:`,
+`srclibs:`, `prebuild:`, `scanignore:`…) take more items with `a`, or open in
+your editor with `e`, one item per line; longer text (`MaintainerNotes`)
+opens in the editor too. With one APK per CPU type, a line that is the same in
+every build entry is asked once, and the ones that differ (`versionCode`,
+`output`…) per entry.
+
+**Where the defaults come from**, in this order: your answer last time (a
+re-run of the same task offers it back), then the recipe this run starts
+from, then what was detected. For a new app it asks where to start:
+
+- **your merge request's recipe**, if its branch is on your fork already
+- **a copy in your app repo**: `fdroid/<appid>.yml`, `metadata/<appid>.yml`
+  or `.fdroid.yml`
+- **another app's recipe in fdroiddata**, one built the way yours is (Fennec
+  F-Droid for a Firefox fork, say): its newest build entry becomes yours, with
+  your version, commit and module folder; its anti-features and update checks
+  are offered too; its license, links and author are not
+- a fresh one, from what was detected
+
+Starting a task from a different recipe than last time sets last time's line
+answers aside, so the new recipe's lines are what you see.
+
+An update always starts from F-Droid's own file: the new build entry is the
+previous release's with the new version lines, so custom `sudo:`, `prebuild:`
+or `rm:` lines carry over (per-CPU entries get their codes from the app's
+`VercodeOperation`), and only the new entry and `CurrentVersion` are asked.
+"Go through the rest of the file too?" opens every other line.
+
+**Adding lines:** after the build entry, and at the end, a numbered list
+offers every field of the Build Metadata Reference the recipe doesn't have
+yet (`timeout`, `submodules`, `srclibs`, `gradleprops`, `MaintainerNotes`,
+`ArchivePolicy`…); a field it doesn't know can be typed by name.
+
+**What reviewers say** shows up next to the line it is about: a `rustup@`
+srclib (they ask for Debian's `rustup` in `sudo:`), `scanignore` (they ask
+for the files to be deleted or come from a srclib instead), a JDK install in
+`sudo:` (the build server has JDKs), Rust code with nothing installing
+`rustup`, a `$$name$$` with no `srclibs:` line behind it (the build would
+fail), native code with no `ndk:` line, and a tree so large that
+`UpdateCheckMode: Tags` gives up. Values fdroiddata's schema refuses
+(`versionCode` above 2100000000, a `srclibs` item without `@ref`, a
+`subdir` starting with `./`…) are asked again.
+
+If the recipe came from your app repo — or the repo has `fdroid/<appid>.yml`
+— the validated file is offered back to it, so the copy there never drifts
+from the merge request (not committed for you).
 
 ### fdroiddata's rules it follows
 
@@ -157,6 +220,13 @@ Taken from fdroiddata's merge request checklist and `templates/`:
   (`flutter@stable` + checkout), `pub get --enforce-lockfile`, and unused
   platform folders (`ios`, `web`…) are removed before the build
 - `AutoUpdateMode` and `UpdateCheckData` are set so F-Droid picks up new tags
+- the file is laid out **the way fdroiddata's CI lays it out**. CI's
+  `rewritemeta` job runs with Debian's `ruamel.yaml` 0.18, which puts a word
+  longer than 80 characters on a line of its own (`output: ` with a trailing
+  space, the path below it); a newer local fdroid writes it on one line, and
+  the job then fails on the difference. The wizard re-wraps those values
+  after every local `rewritemeta` and `checkupdates`, and lays out the whole
+  file that way when there is no local fdroid
 
 ### New app or update
 
@@ -165,8 +235,9 @@ the right mode by itself:
 
 - **new app** — writes the whole file.
 - **update** — keeps the upstream file untouched apart from appending this
-  release's `Builds:` entries and bumping `CurrentVersion`/`CurrentVersionCode`.
-  It refuses if those versionCodes are already there, and shows you the diff.
+  release's `Builds:` entries (built on the previous release's, see above) and
+  bumping `CurrentVersion`/`CurrentVersionCode`. It refuses if those
+  versionCodes are already there, and shows you the diff.
 
 The branch is always cut from `upstream/master` (`<appid>` for a new app,
 `<appid>-<versionCode>` for an update), so the merge request is a single-file
@@ -187,6 +258,9 @@ often stall a merge request:
   `google_mobile_ads`, `in_app_purchase`…)
 - a release build signed with the **debug key** (the Flutter template does
   this) — F-Droid needs builds without your key to come out unsigned
+- no `dependenciesInfo { includeInApk = false }` — the Android Gradle Plugin
+  then signs a "Dependency metadata" block into the APK, which F-Droid's CI
+  flags
 - for Flutter apps, a **pre-release Dart SDK** constraint in `pubspec.yaml`,
   which only a dev/master Flutter can build
 - no fastlane metadata, which means an F-Droid listing with no description —
@@ -210,7 +284,27 @@ depends on the Flutter SDK, with `android/app/` beside it) is recognised:
 - new apps get `UpdateCheckData` pointing at `pubspec.yaml`, so F-Droid's update
   checker can read versions from it
 
+### Kotlin and other Gradle apps
+
+For a plain Gradle project the first build entry is built from the files:
+
+- `gradle:` the FOSS flavour when there is one (`foss`, `fdroid`, `libre`…),
+  else `yes`; the flavours found are shown next to the line
+- `submodules: true` when the repo has a `.gitmodules`
+- `ndk:` the module's `ndkVersion`; native code without one (CMake,
+  `ndkBuild`, `src/main/cpp`) is pointed out
+- `rm:` any `*proprietary*.gradle` — closed-source libraries kept apart in
+  their own file, which the F-Droid build deletes
+- `UpdateCheckMode: None` as the default when the repo holds more than 20
+  `AndroidManifest.xml` files: with `Tags`, `checkupdates` reads them all and
+  gives up (a Firefox tree has hundreds)
+
+Anything beyond that — `sudo:`, `srclibs:`, `prebuild:`, `build:`,
+`output:` — is added line by line, or comes from the recipe it starts from.
+
 ### What you need beforehand
+
+- `python3`: it reads and writes the recipe (fdroidserver needs it too)
 
 - a **GitLab account** with a fork of <https://gitlab.com/fdroid/fdroiddata> —
   once per account, reused for every app and update (each submission is a
@@ -815,36 +909,3 @@ source-only uploads; it builds the binaries itself.
 - a [Launchpad account](https://launchpad.net/+login) and podman or docker
 - a GPG key (the wizard can make one); its email must be a confirmed address
   of your Launchpad account
-
-## Testing other people's apps for F-Droid: `fdroid-tester.sh`
-
-New apps wait in fdroiddata until someone tests them on a device. This script
-does the testing work on
-[F-Droid's tester checklist](https://gitlab.com/fdroid/wiki/-/wikis/Internal/Reviewing-new-apps)
-for one merge request, and writes the report to post on it.
-
-```sh
-./fdroid-tester.sh https://gitlab.com/fdroid/fdroiddata/-/merge_requests/38458
-./fdroid-tester.sh 38458 --no-device   # only look inside the APK, no phone
-```
-
-Pick merge requests from the
-[review-requested list](https://gitlab.com/fdroid/fdroiddata/-/merge_requests/?sort=created_asc&state=opened&label_name[]=review-requested).
-The script:
-
-- reads the merge request's Code Quality report (APK link, permissions, CI warnings)
-- downloads the APK that fits the phone into the current folder
-- looks inside it: special and runtime permissions, tracker code (Exodus list),
-  web addresses in the code, WebView, languages, debuggable/cleartext flags
-- installs it with adb, records its traffic with
-  [PCAPdroid](https://f-droid.org/packages/com.emanuelef.remote_capture/) if the
-  phone has it, opens it, and watches the first seconds: crash, permission prompt
-  on start, connections on start
-- asks what only you can tell (does it work, its icon, terms, English…)
-- writes `<appid>_<versionCode>-review/report.md` in the wiki's template, ticked
-  from what it found, plus screenshots, the capture and the crash log
-
-Needs `adb`, `curl`, `python3`, `unzip` and Android build-tools (`aapt2`).
-Optional keys, one line per file, in `~/.config/fdroid-tester/`:
-`pcapdroid-api-key` (PCAPdroid starts without a prompt on the phone) and
-`virustotal-api-key` (the scan result goes into the report).
