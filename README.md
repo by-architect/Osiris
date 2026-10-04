@@ -1,14 +1,19 @@
-# store-submit.sh
+# StoreHelper
 
-One script for publishing an app: to F-Droid for Android, and to Linux —
+Scripts for publishing an app: to F-Droid for Android, and to Linux —
 NixOS (nixpkgs), Arch (AUR), Flathub, the Snap Store and Ubuntu (Launchpad
-PPA) — from one set of answers.
+PPA) — from one set of answers. F-Droid and Linux each have their own script;
+each works on its own.
 
-- `store-submit.sh` — asks which store(s), checks what each needs from the
-  app and what this machine has, then runs that store's wizard
-- `store-submit.sh fdroid|linux [options]` — one store's wizard directly
-- `store-submit.sh nix|aur|flathub|snap|ppa [options]` — one Linux distro's wizard directly
+- `fdroid-submit.sh [options]` — the F-Droid wizard
+- `linux-submit.sh [options]` — the Linux distros, from one set of answers
+- `linux-submit.sh nix|aur|flathub|snap|ppa [options]` — one Linux distro's wizard
   (each takes `--help`)
+- `store-submit.sh` — optional front door: asks which store(s), checks what
+  each needs from the app and what this machine has, then runs
+  `fdroid-submit.sh` or `linux-submit.sh` (it needs them next to it).
+  `fdroid-submit.sh|linux|nix|… [options]` still works and just runs
+  that script.
 
 Each wizard runs in a process of its own, so running one directly or from the
 picker behaves the same. F-Droid keeps one file per **task** — one store, one
@@ -54,11 +59,13 @@ Picking **Linux** opens a checkbox list of distributions (↑/↓, Space, `a` fo
 all, Enter; numbers when there's no terminal). Fedora is listed as coming
 later.
 
-Adding a store is a line in `STORES`, a `needs_<id>` and a `tools_<id>`
-function, a `wizard_<id>` function, and its id in the direct-run `case` just
-above the picker. Adding a Linux distro is the same with a line in `DISTROS`.
+Adding a store is its own script next to the others, a line in `STORES`, and
+a `needs_<id>` and a `tools_<id>` function in `store-submit.sh`. Adding a Linux
+distro is a line in `DISTROS` and a `wizard_<id>` function in
+`linux-submit.sh`, its id in the `case` at the bottom of that file, and a
+`needs_<id>` and `tools_<id>` in `store-submit.sh`.
 
-## F-Droid: `store-submit.sh fdroid`
+## F-Droid: `fdroid-submit.sh`
 
 Gets an Android app into F-Droid, or a new version of it: writes the
 `metadata/<applicationId>.yml` entry, validates it, pushes a branch to your
@@ -66,8 +73,8 @@ Gets an Android app into F-Droid, or a new version of it: writes the
 
 ```bash
 cd ~/path/to/your-app
-~/path/to/store-submit.sh fdroid        # first time: a few questions
-~/path/to/store-submit.sh fdroid --yes  # every release after: one command
+~/path/to/fdroid-submit.sh        # first time: a few questions
+~/path/to/fdroid-submit.sh --yes  # every release after: one command
 ```
 
 | flag | effect |
@@ -370,7 +377,7 @@ The wizard asks which you want:
 - <https://f-droid.org/docs/Submitting_to_F-Droid_Quick_Start_Guide/>
 - <https://f-droid.org/docs/Build_Metadata_Reference/>
 
-## Linux: `store-submit.sh linux`
+## Linux: `linux-submit.sh`
 
 Publishes one app to several Linux distributions in one go:
 
@@ -410,11 +417,11 @@ app; only the version and tag come from each release. `--ask` goes through the
 questions again.
 
 ```bash
-~/path/to/store-submit.sh linux                        # pick distros, answer once, publish
-~/path/to/store-submit.sh linux --distros nix,aur -n   # a dry run of both
+~/path/to/linux-submit.sh                        # pick distros, answer once, publish
+~/path/to/linux-submit.sh --distros nix,aur -n   # a dry run of both
 ```
 
-## nixpkgs: `store-submit.sh nix`
+## nixpkgs: `linux-submit.sh nix`
 
 Gets an app into [nixpkgs](https://github.com/NixOS/nixpkgs) — what Nix and
 NixOS install from — or ships a new version of one that's already there:
@@ -423,8 +430,8 @@ nixpkgs reviewers do, and opens the pull request.
 
 ```bash
 cd ~/path/to/your-app
-~/path/to/store-submit.sh nix             # new package or update: it works out which
-~/path/to/store-submit.sh nix --dry-run   # everything up to the commits, nothing pushed
+~/path/to/linux-submit.sh nix             # new package or update: it works out which
+~/path/to/linux-submit.sh nix --dry-run   # everything up to the commits, nothing pushed
 ```
 
 | flag | effect |
@@ -517,7 +524,7 @@ follows the automation policy.
 - <https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/README.md>
 - <https://github.com/NixOS/nixpkgs/blob/master/maintainers/README.md>
 
-## Arch (AUR): `store-submit.sh aur`
+## Arch (AUR): `linux-submit.sh aur`
 
 Publishes an app to the [AUR](https://aur.archlinux.org), or ships a new
 version of one already there, following Arch's
@@ -525,8 +532,8 @@ version of one already there, following Arch's
 and [package guidelines](https://manual.archlinux.page/package-guidelines/).
 
 ```bash
-~/path/to/store-submit.sh aur            # new package or update: it works out which
-~/path/to/store-submit.sh aur --dry-run  # everything up to the commit, nothing pushed
+~/path/to/linux-submit.sh aur            # new package or update: it works out which
+~/path/to/linux-submit.sh aur --dry-run  # everything up to the commit, nothing pushed
 ```
 
 | flag | effect |
@@ -578,7 +585,7 @@ and [package guidelines](https://manual.archlinux.page/package-guidelines/).
 - `git`, `ssh`, `curl`; podman or docker for the test build (recommended)
 - the app on GitHub, GitLab, Codeberg or another public git host
 
-## Flathub: `store-submit.sh flathub`
+## Flathub: `linux-submit.sh flathub`
 
 Prepares an app for [Flathub](https://flathub.org), or an update of one
 already there — everything **up to the pull request, which you open
@@ -588,8 +595,8 @@ ends with your to-do list and a link that opens the pull request form with
 the branch and title filled in.
 
 ```bash
-~/path/to/store-submit.sh flathub            # new app or update: it works out which
-~/path/to/store-submit.sh flathub --dry-run  # build and check; your fork isn't touched
+~/path/to/linux-submit.sh flathub            # new app or update: it works out which
+~/path/to/linux-submit.sh flathub --dry-run  # build and check; your fork isn't touched
 ```
 
 | flag | effect |
@@ -655,7 +662,7 @@ Any store that wants a person to open the pull request can end the same way:
 - Flatpak (NixOS: `services.flatpak.enable = true;`), `git`, `python3`, `gh`
 - a GitHub account with two-factor authentication (for the maintainer invite)
 
-## Snap Store: `store-submit.sh snap`
+## Snap Store: `linux-submit.sh snap`
 
 Publishes an app to the [Snap Store](https://snapcraft.io), or a new version,
 following [Snapcraft's documentation](https://ubuntu.com/docs/snapcraft/stable/how-to/publishing/).
@@ -664,8 +671,8 @@ every new snap and revision before it's public, so the wizard publishes by
 itself and tells you when a release waits for that review.
 
 ```bash
-~/path/to/store-submit.sh snap            # new snap or update
-~/path/to/store-submit.sh snap --dry-run  # build it; register and upload nothing
+~/path/to/linux-submit.sh snap            # new snap or update
+~/path/to/linux-submit.sh snap --dry-run  # build it; register and upload nothing
 ```
 
 | flag | effect |
@@ -704,7 +711,7 @@ itself and tells you when a release waits for that review.
 - podman or docker (NixOS: `virtualisation.podman.enable = true;`)
 - a free [Snapcraft developer account](https://snapcraft.io/account) (Ubuntu One)
 
-## Ubuntu (Launchpad PPA): `store-submit.sh ppa`
+## Ubuntu (Launchpad PPA): `linux-submit.sh ppa`
 
 Ubuntu and the distributions built on it — Linux Mint, Pop!_OS, Zorin,
 elementary — are the most used Linux desktops. Their App Center is the Snap
@@ -716,8 +723,8 @@ automated.) Launchpad's rules ask only for an open-source license and signed,
 source-only uploads; it builds the binaries itself.
 
 ```bash
-~/path/to/store-submit.sh ppa            # new package or a new version
-~/path/to/store-submit.sh ppa --dry-run  # make and test-build; don't sign or upload
+~/path/to/linux-submit.sh ppa            # new package or a new version
+~/path/to/linux-submit.sh ppa --dry-run  # make and test-build; don't sign or upload
 ```
 
 | flag | effect |
