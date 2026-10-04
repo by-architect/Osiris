@@ -1,12 +1,12 @@
 # store-submit.sh
 
-One script for publishing an app: to F-Droid and Google Play for Android, and
-to Linux — NixOS (nixpkgs), Arch (AUR), Flathub, the Snap Store and Ubuntu
-(Launchpad PPA) — from one set of answers.
+One script for publishing an app: to F-Droid for Android, and to Linux —
+NixOS (nixpkgs), Arch (AUR), Flathub, the Snap Store and Ubuntu (Launchpad
+PPA) — from one set of answers.
 
 - `store-submit.sh` — asks which store(s), checks what each needs from the
   app and what this machine has, then runs that store's wizard
-- `store-submit.sh fdroid|play|linux [options]` — one store's wizard directly
+- `store-submit.sh fdroid|linux [options]` — one store's wizard directly
 - `store-submit.sh nix|aur|flathub|snap|ppa [options]` — one Linux distro's wizard directly
   (each takes `--help`)
 
@@ -14,9 +14,8 @@ Each wizard runs in a process of its own, so running one directly or from the
 picker behaves the same. F-Droid keeps one file per **task** — one store, one
 app, one version — in `~/.config/storepublisher/tasks/`, plus the answers that
 carry across tasks in `~/.config/storepublisher/last.conf`. Remembered answers
-for the others stay in `~/.config/storepublisher/playstore/` for Google Play and
-`~/.config/{store-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit,ppa-submit}/`
-for the rest;
+for the others stay in
+`~/.config/{store-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit,ppa-submit}/`;
 what the Linux packages say about the app is in `.store-submit.conf` in the
 app's own repository.
 
@@ -25,13 +24,13 @@ app's own repository.
 ```bash
 cd ~/path/to/your-app
 ~/path/to/store-submit.sh                         # asks where to publish
-~/path/to/store-submit.sh -s fdroid,play --check  # only the checks
-~/path/to/store-submit.sh -s play -- --track beta # args after -- go to the wizard
+~/path/to/store-submit.sh -s fdroid,linux --check # only the checks
+~/path/to/store-submit.sh -s fdroid -- --build    # args after -- go to the wizard
 ```
 
 | flag | effect |
 | --- | --- |
-| `-s`, `--store LIST` | `fdroid`, `play`, `linux`, comma-separated, or `all` (`nix` or `aur` = `linux` with that distro) |
+| `-s`, `--store LIST` | `fdroid`, `linux`, comma-separated, or `all` (`nix` or `aur` = `linux` with that distro) |
 | `-d`, `--distros LIST` | for `linux`: the distros (`nix`, `aur`, `flathub`, `snap`, `ppa`), skipping the checkbox list |
 | `--repo PATH` | the app's checkout (default: the git repo you run it in) |
 | `-c`, `--check` | run the checks, start no wizard |
@@ -40,9 +39,9 @@ cd ~/path/to/your-app
 
 - **the app:** project type (Android, Flutter, Rust, Go, Node, Python…),
   application ID and version, git remote and tags, license, fastlane metadata;
-  then per store — e.g. a signed release build and service account key for
-  Play, proprietary dependencies for F-Droid, a Linux target and lock files
-  for the Linux distros, a name Arch doesn't ship already for the AUR
+  then per store — e.g. proprietary dependencies for F-Droid, a Linux target
+  and lock files for the Linux distros, a name Arch doesn't ship already for
+  the AUR
 - **this machine:** OS and package manager, and each tool the store's wizard
   runs, required (✗ stops the run) or optional (!), with an install command for
   your package manager
@@ -370,151 +369,6 @@ The wizard asks which you want:
 
 - <https://f-droid.org/docs/Submitting_to_F-Droid_Quick_Start_Guide/>
 - <https://f-droid.org/docs/Build_Metadata_Reference/>
-
-## Google Play: `store-submit.sh play`
-
-Uploads a release to **Google Play** through the Play Developer API
-(androidpublisher v3) — the same endpoints Play Console itself uses.
-
-```bash
-./store-submit.sh play                # the wizard
-./store-submit.sh play --dry-run      # upload + validate, then throw the edit away
-./store-submit.sh play --yes --track internal --rollout 0.1 --key ~/sa.json   # CI
-./store-submit.sh play --help
-```
-
-| flag | effect |
-| --- | --- |
-| `-n`, `--dry-run` | insert the edit, upload, validate, then delete it |
-| `-y`, `--yes` | take the defaults and commit without asking (CI) |
-| `--key FILE` | service account JSON key (or `$PLAY_SERVICE_ACCOUNT_JSON`) |
-| `--package ID` | application id; detected from gradle otherwise |
-| `--artifact FILE` | the `.aab` or `.apk`; found under `build/outputs/` (or Flutter's `build/app/outputs/`) otherwise |
-| `--track NAME` | `internal`, `alpha`, `beta`, `production`, or a closed track |
-| `--rollout F` | staged rollout fraction, `0 < F <= 1` |
-| `--draft` | upload as a draft release instead of releasing it |
-| `--notes FILE` | release notes; fastlane changelogs are used otherwise |
-| `--mapping FILE` | R8/ProGuard `mapping.txt`; auto-detected otherwise |
-| `--no-review` | commit with `changesNotSentForReview=true` |
-| `--no-save`, `--forget` | control `~/.config/storepublisher/playstore/last.conf` |
-
-One API *edit* per run, committed only at the very end:
-
-```
-edits.insert → bundles.upload → deobfuscationFiles.upload
-             → tracks.update → edits.validate → edits.commit
-```
-
-Nothing reaches Google Play until you confirm; `--dry-run` stops after validate,
-and any run that fails part-way deletes its edit instead of leaving it open.
-
-### Version codes
-
-Play never accepts a versionCode twice, and it only says so once the whole
-bundle has been uploaded — a 50 MB round trip to be told the build was numbered
-wrong. So the wizard asks Play which codes it already holds while it is checking
-the package exists, and compares that with `pubspec.yaml`'s `version: name+code`
-(or gradle's `versionCode`) before anything is built. On a clash it offers:
-
-1. **bump** to the next free code, rewrite `pubspec.yaml`/`build.gradle.kts` and
-   build a fresh bundle — a bundle built before the bump is stale, so it is
-   rebuilt rather than uploaded
-2. **keep the code and release what Play already holds** — no build, no upload,
-   straight on to the track, release notes and rollout. This is the way to put a
-   bundle uploaded through the browser onto another track from here
-3. **stop**
-
-There is deliberately no "delete that version" option: Play cannot free a
-versionCode or remove an uploaded bundle, only supersede it with a higher one.
-
-Outside a clash the wizard does not ask about versions at all — the build files
-decide, and it prints what Play's highest code is so a mistake is visible.
-
-### What it needs
-
-- a **service account JSON key** in `~/.config/storepublisher/playstore/service-account.json`
-  (or passed with `--key`, or in `$PLAY_SERVICE_ACCOUNT_JSON`). A key in that
-  location is picked up without being asked for. Set one up once:
-  1. enable the *Google Play Android Developer API* for a Cloud project —
-     <https://console.cloud.google.com/apis/library/androidpublisher.googleapis.com>
-  2. create a service account, then *Keys → Add key → Create new key → JSON* —
-     <https://console.cloud.google.com/iam-admin/serviceaccounts>
-  3. invite that account's email — the `client_email` field of the JSON key,
-     ending in `.iam.gserviceaccount.com` — in Play Console under
-     <https://play.google.com/console/users-and-permissions>:
-     *Invite new users* → paste the address → *App permissions* → *Add app* →
-     the app → tick **Release apps to testing tracks** (and *Release to
-     production…* for production uploads) → *Invite user*. A service account
-     has no inbox and nothing to accept: it is Active at once.
-     (it then appears under <https://play.google.com/console/api-access>)
-
-  The wizard prints that address itself at stage 1/5, as soon as it can read
-  the key, and repeats these steps verbatim if an upload comes back 403.
-
-  Google's walkthrough: <https://developers.google.com/android-publisher/getting_started>
-- the app **already in Play Console, with one bundle uploaded there by hand**.
-  The API cannot create an app, and creating one in the console is not enough
-  on its own: the *Create app* dialog never asks for a package name, so the
-  name is bound by the first bundle you upload through the browser
-  (*Test and release → Testing → Internal testing → Create new release*).
-  Every release after that first one can come from here.
-
-  There is no way around this in a script: `androidpublisher` v3 has no
-  `applications.create`, and the only Google API that creates a Play app is
-  `playcustomapp`, which makes private Managed-Google-Play apps rather than
-  public listings. So the wizard checks whether Play knows the package as soon
-  as it has the application id — before building anything — and if not, prints
-  the two console steps, offers to open Play Console and stops.
-
-  Package names are permanent and cannot be re-used, so upload the first
-  bundle with the application id you mean to keep
-- an **App Bundle**. Play has required one for every app created since August
-  2021; an `.apk` is only still accepted for an app that was published before
-  then, and the wizard says so before uploading one.
-
-  You do not have to build it yourself. If nothing has been built — or only an
-  APK has — the wizard offers to build the bundle, and sets up signing first if
-  the project has none:
-
-  1. creates an upload keystore in `~/.config/storepublisher/playstore/`
-     (outside the repo, so it cannot be committed), RSA 2048, valid 10000 days,
-     with a generated 32-character password you never have to type
-  2. writes `key.properties` at the Gradle root, mode 600, and adds it,
-     `*.jks`, `*.keystore` and `*.store-submit.orig` to `.gitignore`
-  3. appends a release `signingConfigs` block to the module's Gradle file —
-     purely additive, with the original kept beside it as
-     `build.gradle.kts.store-submit.orig`. A build that succeeds deletes the
-     backup; a build that fails restores it and prints the block for you
-  4. prints the upload certificate's SHA-1 and SHA-256 — the fingerprint Play
-     App Signing, Firebase and the Maps API all ask for
-  5. runs `flutter build appbundle --release` or `./gradlew :<module>:bundleRelease`
-
-  Before uploading, the artifact's certificate is read with `keytool`: an
-  unsigned one, or one signed with the Android debug key (which Play rejects
-  with a message that never mentions signing), stops the upload.
-
-  Back up the keystore and `key.properties`. Losing them means asking Google to
-  reset your upload key.
-
-Release notes are read from the same layout F-Droid uses, so both scripts share
-one source of truth:
-
-```
-fastlane/metadata/android/<locale>/changelogs/<versionCode>.txt
-```
-
-Every locale with a changelog for that versionCode is sent. In Flutter repos
-that keep `fastlane/` inside the Flutter project instead of the repo root, it is
-found there too.
-
-Authentication is a signed JWT swapped for an access token (`openssl` +
-`curl`), so there is no SDK or `gcloud` to install — only `curl`, `openssl`
-and `python3`.
-
-### References
-
-- <https://developers.google.com/android-publisher/edits>
-- <https://developers.google.com/android-publisher/api-ref/rest>
 
 ## Linux: `store-submit.sh linux`
 
