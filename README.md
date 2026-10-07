@@ -1,381 +1,42 @@
-# StoreHelper
-
-Scripts for publishing an app: to F-Droid for Android, and to Linux —
-NixOS (nixpkgs), Arch (AUR), Flathub, the Snap Store and Ubuntu (Launchpad
-PPA) — from one set of answers. F-Droid and Linux each have their own script;
-each works on its own.
-
-- `fdroid-submit.sh [options]` — the F-Droid wizard
-- `linux-submit.sh [options]` — the Linux distros, from one set of answers
-- `linux-submit.sh nix|aur|flathub|snap|ppa [options]` — one Linux distro's wizard
-  (each takes `--help`)
-- `store-submit.sh` — optional front door: asks which store(s), checks what
-  each needs from the app and what this machine has, then runs
-  `fdroid-submit.sh` or `linux-submit.sh` (it needs them next to it).
-  `fdroid-submit.sh|linux|nix|… [options]` still works and just runs
-  that script.
-
-Each wizard runs in a process of its own, so running one directly or from the
-picker behaves the same. F-Droid keeps one file per **task** — one store, one
-app, one version — in `~/.config/storepublisher/tasks/`, plus the answers that
-carry across tasks in `~/.config/storepublisher/last.conf`. Remembered answers
-for the others stay in
-`~/.config/{store-submit,nixpkgs-submit,aur-submit,flathub-submit,snap-submit,ppa-submit}/`;
-what the Linux packages say about the app is in `.store-submit.conf` in the
-app's own repository.
-
-## The store picker: `store-submit.sh`
-
-```bash
-cd ~/path/to/your-app
-~/path/to/store-submit.sh                         # asks where to publish
-~/path/to/store-submit.sh -s fdroid,linux --check # only the checks
-~/path/to/store-submit.sh -s fdroid -- --build    # args after -- go to the wizard
-```
-
-| flag | effect |
-| --- | --- |
-| `-s`, `--store LIST` | `fdroid`, `linux`, comma-separated, or `all` (`nix` or `aur` = `linux` with that distro) |
-| `-d`, `--distros LIST` | for `linux`: the distros (`nix`, `aur`, `flathub`, `snap`, `ppa`), skipping the checkbox list |
-| `--repo PATH` | the app's checkout (default: the git repo you run it in) |
-| `-c`, `--check` | run the checks, start no wizard |
-| `-y`, `-n`, `--no-save` | passed on to the wizard(s); `--yes` needs `--store` |
-| `--list`, `--forget` | list the stores / forget the remembered choice |
-
-- **the app:** project type (Android, Flutter, Rust, Go, Node, Python…),
-  application ID and version, git remote and tags, license, fastlane metadata;
-  then per store — e.g. proprietary dependencies for F-Droid, a Linux target
-  and lock files for the Linux distros, a name Arch doesn't ship already for
-  the AUR
-- **this machine:** OS and package manager, and each tool the store's wizard
-  runs, required (✗ stops the run) or optional (!), with an install command for
-  your package manager
-- **F-Droid's GitLab side:** glab login or `$GITLAB_TOKEN`, git new enough
-  (2.22+) for the blob-less fdroiddata clone, whether a clone is already there
-  to reuse, `ssh` for pushing to a `git@gitlab.com:` fork, a git identity for
-  the fdroiddata commit, and a warning when `$FDROIDDATA_UPSTREAM` is set
-
-Picking **Linux** opens a checkbox list of distributions (↑/↓, Space, `a` for
-all, Enter; numbers when there's no terminal). Fedora is listed as coming
-later.
-
-Adding a store is its own script next to the others, a line in `STORES`, and
-a `needs_<id>` and a `tools_<id>` function in `store-submit.sh`. Adding a Linux
-distro is a line in `DISTROS` and a `wizard_<id>` function in
-`linux-submit.sh`, its id in the `case` at the bottom of that file, and a
-`needs_<id>` and `tools_<id>` in `store-submit.sh`.
-
-## F-Droid: `fdroid-submit.sh`
-
-Gets an Android app into F-Droid, or a new version of it: writes the
-`metadata/<applicationId>.yml` entry, validates it, pushes a branch to your
-`fdroiddata` fork and — with `glab` logged in — opens the merge request.
-
-```bash
-cd ~/path/to/your-app
-~/path/to/fdroid-submit.sh        # first time: a few questions
-~/path/to/fdroid-submit.sh --yes  # every release after: one command
-```
-
-| flag | effect |
-| --- | --- |
-| `-y`, `--yes` | use everything detected, ask nothing; stops only on problems |
-| `--ask` | also ask what it can work out about your repo (every recipe line is asked anyway) |
-| `--repo PATH` | the app's checkout (default: the git repo you run it in) |
-| `--build` | also run the full `fdroid build` (slow) |
-| `--rfp` | also open a Request For Packaging issue (new apps) |
-| `-n`, `--dry-run` | no tagging, pushing, issues or merge requests |
-| `-p`, `--pull-request` | pick a task that pushed its branch and open its merge request — nothing else |
-| `--no-save` | don't remember the answers |
-| `--forget` | delete every remembered answer and task |
-| `--forget-app ID` | forget every task for one application id |
-| `--forget-task NAME` | forget one task, named as the task list shows it |
-
-### Tasks
-
-A task is one store, one app, one version, kept in its own file under
-`~/.config/storepublisher/tasks/` — for example
-`fdroid-com.example.app-1001.conf`. It holds every answer that app was given
-and how far the submission got: `started`, `pushed` (branch on your fork), or
-`submitted` (merge request open).
-
-On startup the wizard lists the tasks it knows, newest first, and offers to
-continue one — the chosen task's answers become this run's defaults:
-
-```
-━━ Tasks
-      1) com.example.app        1.0+1001     pushed      2026-09-26 20:10
-      2) com.example.other      2.3+7        submitted   2026-09-20 11:02
-       n) start a new task
-   Continue [1]:
-```
-
-Bumping the version makes a new task, inheriting the answers of the one you
-continued, because it is a new branch and a new merge request.
-
-`-p` skips the wizard entirely: it lists the tasks that pushed a branch but
-never opened a merge request, and opens it for the one you pick, using the
-description saved when the branch was pushed.
-
-### What it works out by itself
-
-Detected values are shown as `✓` lines instead of questions:
-
-- **the app:** the repo you run it in, the Gradle module, application ID,
-  versionName and versionCode (from `pubspec.yaml` for Flutter)
-- **the release tag** `v<version>`: created on HEAD and pushed if missing,
-  pushed if only local, and checked to hold exactly this ID and version; a
-  stale tag can be moved (asked, never automatic)
-- **new app or update**, from upstream fdroiddata
-- **GitLab:** your username from `glab`, the fork (created if missing); where
-  to put the local fdroiddata clone is always asked, with the last path (or
-  `~/fdroiddata`) as the default
-- **the metadata's defaults:** source/issue/changelog URLs from the git
-  remote, AuthorName from git config, the Flutter version from `.fvmrc`, the
-  Gradle module's flavours, NDK and submodules — each line is still asked
-- **validation:** `readmeta`, `rewritemeta` and `lint` run on their own; a
-  failure stops the run before anything is pushed
-- **the merge request:** title in fdroiddata's format (`New app: <name>`,
-  `Update <name> to <version>`), fdroiddata's own template as the description
-  with the checklist items it verified ticked, opened with `glab`
-
-What it asks: **every line of the recipe** (below), each with what it found
-as the default and where it came from — the license from `LICENSE`, with GPL's
-"only" or "or later" read from the notices in your source files; the email
-from `git config user.email`, which becomes public — and, before each action
-that leaves your machine, whether to do it (tag push, branch push, merge
-request). `--yes` takes every default; it never force-pushes and stops where
-only a person can decide (categories for a new app, a missing store listing,
-failing validation).
-
-### The recipe, line by line
-
-F-Droid recipes differ app by app, so every line of `metadata/<appid>.yml` is
-asked, one at a time, in fdroidserver's own order, with a short note saying
-what the field is for:
-
-```
-   subdir — the folder the build runs in: the Gradle module, or the project
-   subdir [app, - for none]:
-   sudo — commands run as root first, e.g. apt-get install -y rustup
-   sudo:
-     - apt-get update
-     - apt-get install -y rustup
-   sudo [Enter keeps · a adds · e edits · - for none]:
-```
-
-Enter keeps a line, typing replaces it, `-` leaves it out. Lists (`sudo:`,
-`srclibs:`, `prebuild:`, `scanignore:`…) take more items with `a`, or open in
-your editor with `e`, one item per line; longer text (`MaintainerNotes`)
-opens in the editor too. With one APK per CPU type, a line that is the same in
-every build entry is asked once, and the ones that differ (`versionCode`,
-`output`…) per entry.
-
-**Where the defaults come from**, in this order: your answer last time (a
-re-run of the same task offers it back), then the recipe this run starts
-from, then what was detected. For a new app it asks where to start:
-
-- **your merge request's recipe**, if its branch is on your fork already
-- **a copy in your app repo**: `fdroid/<appid>.yml`, `metadata/<appid>.yml`
-  or `.fdroid.yml`
-- **another app's recipe in fdroiddata**, one built the way yours is (Fennec
-  F-Droid for a Firefox fork, say): its newest build entry becomes yours, with
-  your version, commit and module folder; its anti-features and update checks
-  are offered too; its license, links and author are not
-- a fresh one, from what was detected
-
-Starting a task from a different recipe than last time sets last time's line
-answers aside, so the new recipe's lines are what you see.
-
-An update always starts from F-Droid's own file: the new build entry is the
-previous release's with the new version lines, so custom `sudo:`, `prebuild:`
-or `rm:` lines carry over (per-CPU entries get their codes from the app's
-`VercodeOperation`), and only the new entry and `CurrentVersion` are asked.
-"Go through the rest of the file too?" opens every other line.
-
-**Adding lines:** after the build entry, and at the end, a numbered list
-offers every field of the Build Metadata Reference the recipe doesn't have
-yet (`timeout`, `submodules`, `srclibs`, `gradleprops`, `MaintainerNotes`,
-`ArchivePolicy`…); a field it doesn't know can be typed by name.
-
-**What reviewers say** shows up next to the line it is about: a `rustup@`
-srclib (they ask for Debian's `rustup` in `sudo:`), `scanignore` (they ask
-for the files to be deleted or come from a srclib instead), a JDK install in
-`sudo:` (the build server has JDKs), Rust code with nothing installing
-`rustup`, a `$$name$$` with no `srclibs:` line behind it (the build would
-fail), native code with no `ndk:` line, and a tree so large that
-`UpdateCheckMode: Tags` gives up. Values fdroiddata's schema refuses
-(`versionCode` above 2100000000, a `srclibs` item without `@ref`, a
-`subdir` starting with `./`…) are asked again.
-
-If the recipe came from your app repo — or the repo has `fdroid/<appid>.yml`
-— the validated file is offered back to it, so the copy there never drifts
-from the merge request (not committed for you).
-
-### fdroiddata's rules it follows
-
-Taken from fdroiddata's merge request checklist and `templates/`:
-
-- `commit:` is the tag's **full commit hash**, not the tag name
-- an **AuthorName** is always set
-- Flutter apps get **one APK per CPU type** (armeabi-v7a, arm64-v8a, x86_64)
-  with the versionCodes F-Droid's reviewers ask for (10 × code + 1/2/3) and a
-  matching `VercodeOperation`, so auto-updates keep working. The app's gradle
-  file has to set those codes; the wizard checks and shows the snippet if not
-- the Flutter version is read from the app's `.fvmrc` at build time
-  (`flutter@stable` + checkout), `pub get --enforce-lockfile`, and unused
-  platform folders (`ios`, `web`…) are removed before the build
-- `AutoUpdateMode` and `UpdateCheckData` are set so F-Droid picks up new tags
-- the file is laid out **the way fdroiddata's CI lays it out**. CI's
-  `rewritemeta` job runs with Debian's `ruamel.yaml` 0.18, which puts a word
-  longer than 80 characters on a line of its own (`output: ` with a trailing
-  space, the path below it); a newer local fdroid writes it on one line, and
-  the job then fails on the difference. The wizard re-wraps those values
-  after every local `rewritemeta` and `checkupdates`, and lays out the whole
-  file that way when there is no local fdroid
-
-### New app or update
-
-The wizard looks up `metadata/<appid>.yml` on current upstream master and picks
-the right mode by itself:
-
-- **new app** — writes the whole file.
-- **update** — keeps the upstream file untouched apart from appending this
-  release's `Builds:` entries (built on the previous release's, see above) and
-  bumping `CurrentVersion`/`CurrentVersionCode`. It refuses if those
-  versionCodes are already there, and shows you the diff.
-
-The branch is always cut from `upstream/master` (`<appid>` for a new app,
-`<appid>-<versionCode>` for an update), so the merge request is a single-file
-change no matter what state your fork was left in. A leftover
-`metadata/<appid>.yml` from an earlier run is reset automatically.
-
-### Pitfall check
-
-Before anything is written, the app repo is checked for the things that most
-often stall a merge request:
-
-- the release tag missing from the **remote** (F-Droid builds the published tag)
-- a tag that doesn't hold the **application ID and version** being submitted
-  (e.g. tagged before the ID was changed) — F-Droid would build the wrong thing
-- prebuilt binaries tracked in git (`.jar`, `.aar`, `.so`, `.apk`, `.keystore`…)
-- proprietary dependencies (Play Services, Firebase, Crashlytics, billing…),
-  and for Flutter apps the plugins that pull them in (`firebase_*`,
-  `google_mobile_ads`, `in_app_purchase`…)
-- a release build signed with the **debug key** (the Flutter template does
-  this) — F-Droid needs builds without your key to come out unsigned
-- no `dependenciesInfo { includeInApk = false }` — the Android Gradle Plugin
-  then signs a "Dependency metadata" block into the APK, which F-Droid's CI
-  flags
-- for Flutter apps, a **pre-release Dart SDK** constraint in `pubspec.yaml`,
-  which only a dev/master Flutter can build
-- no fastlane metadata, which means an F-Droid listing with no description —
-  it offers to create `fastlane/metadata/android/en-US/` for you
-
-### Flutter apps
-
-A Flutter project anywhere in the repo's top two levels (a `pubspec.yaml` that
-depends on the Flutter SDK, with `android/app/` beside it) is recognised:
-
-- the Gradle module defaults to `<flutter dir>/android/app`
-- versionName and versionCode come from `pubspec.yaml` (`version: 1.2.3+45`),
-  since the Gradle file only holds `flutter.versionName`/`flutter.versionCode`
-- the build entries follow fdroiddata's Flutter template instead of
-  `gradle: yes` (see "fdroiddata's rules it follows" above); a flavour you
-  pick is passed as `--flavor`
-- the Flutter version is read from `.fvmrc`, `.fvm/fvm_config.json` or
-  `.tool-versions`, else from the local `flutter --version`. A pre-release (a
-  master/beta build) is offered as its commit hash, with a warning — F-Droid
-  maintainers expect a stable tag
-- new apps get `UpdateCheckData` pointing at `pubspec.yaml`, so F-Droid's update
-  checker can read versions from it
-
-### Kotlin and other Gradle apps
-
-For a plain Gradle project the first build entry is built from the files:
-
-- `gradle:` the FOSS flavour when there is one (`foss`, `fdroid`, `libre`…),
-  else `yes`; the flavours found are shown next to the line
-- `submodules: true` when the repo has a `.gitmodules`
-- `ndk:` the module's `ndkVersion`; native code without one (CMake,
-  `ndkBuild`, `src/main/cpp`) is pointed out
-- `rm:` any `*proprietary*.gradle` — closed-source libraries kept apart in
-  their own file, which the F-Droid build deletes
-- `UpdateCheckMode: None` as the default when the repo holds more than 20
-  `AndroidManifest.xml` files: with `Tags`, `checkupdates` reads them all and
-  gives up (a Firefox tree has hundreds)
-
-Anything beyond that — `sudo:`, `srclibs:`, `prebuild:`, `build:`,
-`output:` — is added line by line, or comes from the recipe it starts from.
-
-### What you need beforehand
-
-- `python3`: it reads and writes the recipe (fdroidserver needs it too)
-
-- a **GitLab account** with a fork of <https://gitlab.com/fdroid/fdroiddata> —
-  once per account, reused for every app and update (each submission is a
-  branch in it). If it's missing, the wizard creates it with `glab` (offering
-  `glab auth login` first) or GitLab's API with `$GITLAB_TOKEN`, then waits for
-  GitLab to finish copying; without either it links the fork page. It won't
-  fork into an account other than the one in the fork URL.
-  The local copy is cloned from **upstream over HTTPS** with history only
-  (`--filter=blob:none`; files load as needed), with your fork added as the
-  `origin` it pushes to — a full SSH clone of a repo this size tends to be cut
-  off midway.
-- the release **tag pushed** to your app's repository
-
-### RFP issue (optional)
-
-A Request For Packaging issue isn't required when you send the metadata
-yourself — F-Droid's quick start guide calls that merge request the best way
-in. For new apps, `--rfp` (or answering yes under `--ask`) opens one after the
-metadata is written, filled from F-Droid's RFP template with your answers (categories,
-license, URLs) plus the summary and description from your fastlane listing.
-It uses the first of these that works:
-
-1. **`glab`**, if it is logged in to gitlab.com
-2. **GitLab's API**, with a personal access token in `$GITLAB_TOKEN` (`api` scope)
-3. **your browser**: a pre-filled new-issue page opens; check it and press
-   *Create issue*, then paste its URL back
-
-`gh` can't be used here: the RFP tracker is on GitLab, not GitHub. The issue
-is linked from the merge request (`Closes fdroid/rfp#N`) so it closes on merge.
-`--dry-run` shows the issue but never opens it.
-
-### fdroid CLI
-
-The script runs `readmeta`, `rewritemeta`, `lint` and optionally `build`. It
-**never installs fdroidserver itself** — it uses the one you have:
-
-1. `fdroid` on `$PATH` (a distro or nix package)
-2. a source checkout of fdroidserver: `$FDROIDSERVER`, the path remembered from
-   last time, or `~/Opt/fdroidserver`, `~/fdroidserver`, `~/src/fdroidserver`,
-   `~/Projects/fdroidserver`. It runs it the way fdroiddata's CI runs master —
-   `PATH` and `PYTHONPATH` pointed at the checkout — so its Python dependencies
-   have to be installed.
-
-If neither is there, it says how to install one and waits: check again, give a
-checkout's path, skip validation (the maintainers' CI still runs it), or quit.
-
-fdroiddata's CI lints with fdroidserver **master**, so a checkout of master
-(`git clone https://gitlab.com/fdroid/fdroidserver.git`) matches it most
-closely; distro packages can be a release or two behind.
-
-### Publishing modes
-
-The wizard asks which you want:
-
-1. **F-Droid builds and signs** — simplest. F-Droid compiles from source and signs
-   with its own key, so an app installed from your own APK cannot update to it.
-2. **Reproducible build** — F-Droid rebuilds from source, verifies the result matches
-   your signed APK, and ships yours. Keeps your signature. Adds `Binaries:` and
-   `AllowedAPKSigningKeys:`, and reads the fingerprint straight out of a local APK
-   with `apksigner` or `keytool`.
-
-### References
-
-- <https://f-droid.org/docs/Submitting_to_F-Droid_Quick_Start_Guide/>
-- <https://f-droid.org/docs/Build_Metadata_Reference/>
+# linux-submit.sh
+
+One script for publishing an app to Linux, from one set of answers: NixOS
+(nixpkgs), Arch (AUR), Debian, Ubuntu (Launchpad PPA), Fedora (COPR and its
+own repositories), openSUSE (OBS), Alpine (aports), Gentoo (GURU), Flathub,
+the Snap Store and Homebrew.
+
+- `linux-submit.sh [options]` — pick the distros, answer once, publish to each
+- `linux-submit.sh <distro> [options]` — one distro's wizard, where `<distro>`
+  is `nix`, `aur`, `debian`, `ppa`, `copr`, `fedora`, `obs`, `alpine`, `guru`,
+  `flathub`, `snap` or `brew` (each takes `--help`)
+
+How far each wizard goes, and what is left to people:
+
+| distro | the wizard | then |
+| --- | --- | --- |
+| `nix` — NixOS / Nix | opens the pull request to nixpkgs | nixpkgs reviewers merge it |
+| `aur` — Arch | publishes the package to the AUR | — |
+| `debian` — Debian | uploads to mentors.debian.net; writes the ITP and the request for a sponsor (and sends them if your mail is set up) | a Debian developer reviews and uploads it |
+| `ppa` — Ubuntu | uploads to your PPA | Launchpad builds it |
+| `copr` — Fedora | uploads the source package to your COPR project | COPR builds it |
+| `fedora` — Fedora | the spec and source package, and files the package review request (with a Bugzilla API key; else it's handed to you) | a Fedora packager reviews it; your first package needs a sponsor |
+| `obs` — openSUSE | commits it to your home project | OBS builds it |
+| `alpine` — Alpine | opens the merge request to aports | Alpine developers review it |
+| `guru` — Gentoo | pushes to GURU once you have access; until then opens a Codeberg pull request, or writes a patch for the mailing list | GURU reviews it |
+| `flathub` — every distro | prepares the submission | you open the pull request; Flathub reviews it |
+| `snap` — every distro | builds and uploads it | the Snap Store reviews it |
+| `brew` — Homebrew | opens the pull request to homebrew/core, or publishes your own tap | Homebrew maintainers review a core pull request |
+
+Each distro's wizard runs in a process of its own, so running one directly or
+from `linux-submit.sh` behaves the same. Remembered answers stay in
+`~/.config/<distro>-submit/` (`nixpkgs-submit` for nix, `linux-submit` for the
+several-distro run); what the packages say about the app is in
+`.store-submit.conf` in the app's own repository.
+
+Adding a distro is a line in `DISTROS`, a `wizard_<id>` function, and its id
+in the `case` at the bottom of `linux-submit.sh` — plus, for questions a
+several-distro run should ask up front, an `<id>_questions` function that
+`wizard_linux` calls.
 
 ## Linux: `linux-submit.sh`
 
@@ -392,10 +53,12 @@ Publishes one app to several Linux distributions in one go:
    and lists everything left for you to do (like opening Flathub's pull
    request)
 
-With Flathub, the Snap Store or the PPA among the distros, their questions —
-the Flathub app ID, the snap name, whether the app uses the internet (asked
-once for both), your Launchpad account, PPA and Ubuntu releases — are part of
-step 2 too.
+Distros with questions of their own ask them in step 2 too: the Flathub app
+ID, the snap name, whether the app uses the internet (asked once for both),
+your Launchpad account, PPA and Ubuntu releases, Debian's package name and
+section, your COPR project and its Fedora releases, your Fedora and Bugzilla
+accounts, your OBS account and openSUSE releases, Alpine's release tarball,
+the Gentoo category, and homebrew/core or a tap.
 
 The answers go into `.store-submit.conf` in the app's repository — a plain
 `key = value` file, read (never executed), yours to edit and commit:
@@ -718,8 +381,8 @@ elementary — are the most used Linux desktops. Their App Center is the Snap
 Store (above); for `apt`, the way a developer publishes directly is a
 [Launchpad PPA](https://launchpad.net/ubuntu/+ppas):
 `sudo add-apt-repository ppa:you/app && sudo apt install app`. (Debian's own
-archive needs a Debian developer to sponsor each upload, so it can't be
-automated.) Launchpad's rules ask only for an open-source license and signed,
+archive needs a Debian developer to sponsor each new upload:
+`linux-submit.sh debian` does everything up to that.) Launchpad's rules ask only for an open-source license and signed,
 source-only uploads; it builds the binaries itself.
 
 ```bash
@@ -770,3 +433,657 @@ source-only uploads; it builds the binaries itself.
 - a [Launchpad account](https://launchpad.net/+login) and podman or docker
 - a GPG key (the wizard can make one); its email must be a confirmed address
   of your Launchpad account
+
+## Debian: `linux-submit.sh debian`
+
+Gets an app into [Debian](https://www.debian.org) itself, or ships a new
+version of one already there. Ubuntu imports Debian's packages, and Linux
+Mint, Pop!_OS, elementary and the rest follow Ubuntu: once the app is in
+Debian, they get it with their next releases.
+
+Only a Debian developer can upload a new package (your **sponsor**), and
+Debian's FTP masters review each new one. So the wizard does everything up to
+the sponsor, the way [mentors.debian.net](https://mentors.debian.net/intro-maintainers/)
+and the [Developer's Reference](https://www.debian.org/doc/manuals/developers-reference/pkgs.en.html#new-package)
+describe it, and ends with your to-do list.
+
+```bash
+~/path/to/linux-submit.sh debian            # new package or a new version
+~/path/to/linux-submit.sh debian --dry-run  # package, build and check; send, sign and upload nothing
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing; mail in your name is written out, never sent, and a new package stops before its upload for you to read it |
+| `--ask` | ask every question again |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--itp NUMBER` | the ITP bug you filed already (otherwise it's found, or filed) |
+| `--fresh` | write the debian/ packaging anew (the old one is kept beside it) |
+| `--no-test` | skip the offline test build and lintian |
+| `-n`, `--dry-run` | package, build and check; send, sign and upload nothing |
+| `--no-save`, `--forget` | control `~/.config/debian-submit/last.conf` |
+
+### What it can package
+
+Debian builds every package from source, **offline, from Debian's own
+packages**; bundled (vendored) dependencies aren't allowed. So:
+
+- **Meson, CMake, Make:** yes — C/C++ libraries come from Debian's `-dev`
+  packages (worked out from your `pkg-config` dependencies)
+- **Rust, Go, Python:** only when every library the app builds with is
+  packaged in Debian already. The wizard checks: each crate in `Cargo.lock`
+  (Windows/macOS-only crates and dev-dependencies left out) against Debian's
+  `rust-*` packages and their semver, each module in `go.mod` against the Go
+  import paths Debian's archive knows, each dependency in `pyproject.toml`
+  against dh-python's list — and names what's missing, with where it would
+  have to go in first (the Rust team's debcargo-conf, one Go package each, the
+  Python team). It also checks the Rust and Go versions the app asks for
+  against Debian unstable's.
+- **Flutter and npm:** no — Debian has no Flutter SDK, and an npm app needs
+  every module in Debian first. The wizard (and the distro picker's
+  questions) say so up front.
+
+What Debian can't take, Debian users get from **Flathub** (`sudo apt install
+flatpak`) or the **Snap Store** (`sudo apt install snapd`) — both work on
+Debian.
+
+### What it does
+
+- **in Debian already?** asks Debian's archive (the package name, as source
+  or binary, in every suite), the NEW queue, the WNPP list and the bug
+  tracker, and mentors.debian.net. The app's name taken by another package,
+  someone else's ITP for it, or the package in Debian under someone else's
+  care each stop it, with who to talk to. An RFP (someone asked for the app)
+  becomes your ITP. If you maintain the package in Debian, it's a new
+  version: it starts from the packaging in the archive and adds a changelog
+  entry
+- **debian/** written to Debian's standards: format `3.0 (quilt)` with the
+  upstream tarball fetched exactly as `uscan` would (GitHub/GitLab's tag
+  archive, or `git archive` of the tag), debhelper compat 14, the current
+  Standards-Version (read from Debian's archive), `Rules-Requires-Root: no`,
+  dh-cargo (build-dependencies from `debcargo deb-dependencies`), dh-golang
+  (`XS-Go-Import-Path`, `Static-Built-Using`) or pybuild, a machine-readable
+  `debian/copyright` (DEP-5: holders from your source's notices, GPL/LGPL/
+  Apache/MPL/CC0 pointing to `/usr/share/common-licenses`, every other
+  license in full from your own license file), `debian/watch` in format 5
+  (its GitHub/GitLab templates, or git mode), `debian/upstream/metadata`,
+  and a changelog that closes the ITP. Section and the long description are
+  asked once
+- **kept for you:** the packaging lives in
+  `~/.local/share/store-submit/debian/<name>/debian` — edit it there when a
+  reviewer asks for changes; every run builds from it and only updates the
+  changelog
+- **build + check**, like Debian's build daemons: in a fresh Debian unstable
+  container (podman or docker), only the build dependencies installed, the
+  network cut, built as an ordinary user with no home directory; then
+  **lintian** `--pedantic --info` (errors stop it, warnings and the rest
+  are listed), **licensecheck** for files under other licenses than the
+  app's, the package installed and its program run with `--version`.
+  Programs without a manual page get one from `help2man` (you're asked
+  first). A failed build names the problem (a missing build dependency, a
+  crate or Go module Debian lacks, a download attempt) and offers edit /
+  read the log / rebuild / skip / quit
+- **ITP:** the "intent to package" bug, in the form `reportbug` writes
+  (`X-Debbugs-Cc: debian-devel`), shown in full; with a mail setup on your
+  machine (msmtp, or a sendmail) it's sent when you say so and the wizard
+  waits for its bug number; otherwise it's saved for you to send, and the
+  next run finds the number by itself
+- **sign + upload:** a new package is shown to you to read first. Your GPG
+  key (one is made if you have none; no gpg installed? GnuPG comes from
+  nixpkgs) signs the upload like `debsign`, and `dput` sends it to
+  mentors.debian.net, whose API then shows it. The one step only you can
+  do — an account there, with your key in it — is walked through once
+- **sponsor:** the RFS (request for sponsorship) from mentors' own template,
+  sent or saved like the ITP; if your RFS is still open, a follow-up to it
+  instead (and the `moreinfo` tag removed)
+
+### What you need
+
+- podman or docker (NixOS: `virtualisation.podman.enable = true;`)
+- your email in the config (it's the package's Maintainer address)
+- a GPG key (the wizard can make one) and a free
+  [mentors.debian.net account](https://mentors.debian.net/accounts/register/)
+  with that key in it
+- to send the ITP and RFS from the wizard: msmtp or a sendmail set up on your
+  machine — otherwise any mail program, from your address, in plain text
+- patience after it: a sponsor reviews it, then the FTP masters (the NEW
+  queue, often weeks); answer them on the RFS bug and re-run the wizard for
+  each change
+
+### References
+
+- <https://mentors.debian.net/intro-maintainers/>, <https://mentors.debian.net/sponsors/rfs-howto/>
+- <https://www.debian.org/devel/wnpp/>
+- <https://www.debian.org/doc/debian-policy/>,
+  <https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/>
+- <https://wiki.debian.org/Teams/RustPackaging/Policy>,
+  <https://go-team.pages.debian.net/packaging.html>
+
+## RPM: the spec they share
+
+The three RPM wizards below — `copr`, `fedora` and `obs` — write the `.spec`
+with one shared writer, for each build system:
+
+| project | how it's built |
+| --- | --- |
+| Rust | crates vendored (`cargo vendor`): Fedora's `%cargo_prep -v vendor` / `%cargo_build` / `%cargo_vendor_manifest`, the executables installed from `target/rpm`, `License:` covering every crate linked in; openSUSE's `cargo-packaging` with `vendor.tar.zst` |
+| Go | Fedora: modules vendored with `go-vendor-tools` (which also fills in `License:`), `%gobuild`; openSUSE: `vendor.tar.zst`, `go build -mod=vendor -buildmode=pie` |
+| Python (`pyproject.toml`) | Fedora: `%pyproject_buildrequires` / `%pyproject_wheel` / `%pyproject_save_files -l <modules>`; openSUSE: `python-rpm-macros`, its dependencies listed as `python3dist()` |
+| Node (npm) | the modules from `package-lock.json` bundled (Fedora's Node.js guidelines: apps bundle), the bundled licenses listed; a build step runs offline with the dev modules |
+| Meson / CMake / Make | `%meson` / `%cmake` / `%make_build`, pkg-config dependencies as `pkgconfig()`, the compilers the project's languages need |
+
+What the package contains is not guessed: a first build installs the app into
+a scratch buildroot, and the `%files` list is written from what's there — the
+programs, man pages, desktop file and metainfo (then validated in `%check`),
+icons, translations (`%find_lang`), a `-devel` package for headers and
+pkg-config files. Then everything is built again with the finished spec, the
+way the build servers will.
+
+Every test build runs **offline** — the build dependencies are installed with
+the network on, then it's cut, like Fedora's, COPR's and OBS's builders — in
+a container (podman or docker): Fedora for `copr` and `fedora`, openSUSE
+Tumbleweed for `obs`. Then `rpmlint`, and the packages are installed in a
+fresh container the way users get them (dependencies from the distro) and
+the program is run with `--version`. A failed build names the cause (a
+missing dependency, a compiler too old, a download attempt, unlisted files)
+and offers edit / read the log / rebuild / skip / quit.
+
+An app that ships its own `<name>.spec` in its repository gets that one,
+with the new Version; its sources are fetched with `spectool`.
+
+Flutter apps can't be RPMs: Fedora and openSUSE have no Flutter SDK and
+their builders are offline — the wizards say so up front (Flathub and the
+Snap Store have them).
+
+## Fedora COPR: `linux-submit.sh copr`
+
+[COPR](https://copr.fedorainfracloud.org) is Fedora's community build
+service: a repository of your own, built on Fedora's servers for the Fedora
+(and EPEL, CentOS Stream…) releases you pick. People install from it with
+`sudo dnf copr enable you/app && sudo dnf install app`. It follows
+[COPR's documentation](https://docs.pagure.org/copr.copr/user_documentation.html)
+and [Fedora's packaging guidelines](https://docs.fedoraproject.org/en-US/packaging-guidelines/).
+
+```bash
+~/path/to/linux-submit.sh copr            # new project or a new version
+~/path/to/linux-submit.sh copr --dry-run  # write and test-build; nothing goes to COPR
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing (the first login still needs you) |
+| `--ask` | ask every question again (project, releases) |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--no-test` | skip the offline test build (the `%files` list is then a guess) |
+| `-n`, `--dry-run` | write, vendor and test-build; create and upload nothing |
+| `--no-save`, `--forget` | control `~/.config/copr-submit/last.conf` |
+
+- **project and releases:** the project name (default: the package name),
+  then two checkbox lists — releases (Fedora's current ones preselected;
+  Rawhide, EPEL, CentOS Stream, openSUSE and Mageia offered, with a note that
+  the spec is Fedora-style) and architectures (x86_64, aarch64 preselected) —
+  read from COPR's API each time, kept in `.store-submit.conf`
+- **login:** copr-cli's own: the API token in `~/.config/copr`. Missing or
+  expired, the wizard shows where to get it
+  (<https://copr.fedorainfracloud.org/api/>), takes the pasted block and
+  saves it readable only by you. No copr-cli installed? It runs in a Fedora
+  container (it isn't in nixpkgs)
+- **spec:** the shared writer with a plain `Release:` and `%changelog`, so
+  EPEL and non-Fedora chroots can build it; the release number goes up by
+  itself when COPR has this version already
+- **test build:** in the newest Fedora release you picked; packages the
+  project already has (dependencies you built there) are available to it
+- **project:** created if missing (description, install instructions,
+  network off for builds, new Fedora releases added by themselves), or given
+  the releases it lacks
+- **build:** the source RPM uploaded with `copr-cli build`, COPR's progress
+  followed (safe to interrupt), each release's result shown — with the end of
+  its build log when it failed
+
+### What you need
+
+- a Fedora account (<https://accounts.fedoraproject.org>), to log in to COPR
+- podman or docker (NixOS: `virtualisation.podman.enable = true;`)
+
+## Fedora: `linux-submit.sh fedora`
+
+Gets an app into Fedora's own repositories — everything **up to the package
+review, which people do**, following Fedora's
+[New Package Process](https://docs.fedoraproject.org/en-US/package-maintainers/New_Package_Process_for_New_Contributors/)
+and [Package Review Process](https://docs.fedoraproject.org/en-US/package-maintainers/Package_Review_Process/).
+
+```bash
+~/path/to/linux-submit.sh fedora            # new package (or a new spec for an open review)
+~/path/to/linux-submit.sh fedora --dry-run  # write and test-build; nothing goes to COPR or Bugzilla
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing — but a new spec still needs you to read it once |
+| `--ask` | ask every question again (Fedora account, Bugzilla email, packager) |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--no-test` | skip the test build (reviewers check that it builds) |
+| `-n`, `--dry-run` | write and test-build; nothing goes to COPR or Bugzilla |
+| `--no-save`, `--forget` | control `~/.config/fedora-submit/` (answers, the saved Bugzilla API key) |
+
+1. **in Fedora already?** — asked of Fedora's own services: the package
+   (mdapi, dist-git), a name taken by a different project, a retired package,
+   and open or closed review requests in Bugzilla. Your own open review gets
+   a new spec and SRPM; someone else's stops the wizard with the link
+2. **spec** — the shared writer as Fedora wants it for a review:
+   `%autorelease` / `%autochangelog`, vendoring where the language
+   guidelines allow it (Rust: allowed, though packaged crates are preferred —
+   it says so; Go: required) and bundling for Node.js apps
+3. **build + check** — offline in a Fedora Rawhide container, `rpmlint`
+   (Fedora's setup fails on any error — named), installed and run;
+   Python dependencies Fedora lacks are listed (each needs its own review).
+   `fedora-review` runs too when you have it and mock. Then you read the spec:
+   Fedora wants packagers who understand their packages
+4. **online copy** — built on COPR (what Fedora's docs recommend for the
+   review), giving the Spec URL and SRPM URL reviewers download
+5. **review request** — `Review Request: <name> - <summary>` with Fedora's
+   template (Spec URL, SRPM URL, description, your Fedora account), filed
+   through Bugzilla's REST API with your API key (kept off the command line,
+   saved readable only by you), blocking FE-NEEDSPONSOR if you're new. No key:
+   the exact text is saved and the form linked. Fedora's Review Service then
+   builds it and posts fedora-review's results on the bug
+6. **hand-off** — what only a person can do: the Fedora account and
+   agreement, a sponsor, answering the reviewers (running the wizard again
+   posts the fixed spec), then after approval the Forge API token,
+   `fedpkg request-repo`, `fedpkg import`, `fedpkg build`, branches and Bodhi
+   updates, and release monitoring
+
+**Already in Fedora?** Updates are made by the package's maintainers with
+fedpkg and Bodhi. The wizard says who they are, bumps Fedora's spec to the
+new version, test-builds it, and hands you the fedpkg steps if you're a
+maintainer — or how to propose it (a pull request on src.fedoraproject.org)
+if you aren't.
+
+### What you need
+
+- a Fedora account, and a Red Hat Bugzilla account with the same email
+- podman or docker; optionally a Bugzilla API key
+  (<https://bugzilla.redhat.com/userprefs.cgi?tab=apikey>) to file the review
+
+## openSUSE (OBS): `linux-submit.sh obs`
+
+Publishes an app for openSUSE through the
+[Open Build Service](https://build.opensuse.org), in your `home:<you>`
+project: OBS builds it for the openSUSE releases you pick, and people add
+your repository with zypper. It follows
+[openSUSE's packaging guidelines](https://en.opensuse.org/openSUSE:Packaging_guidelines).
+
+```bash
+~/path/to/linux-submit.sh obs            # new package or a new version
+~/path/to/linux-submit.sh obs --dry-run  # write and test-build; commit nothing
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing (osc's first login still needs you) |
+| `--ask` | ask every question again (account, releases) |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--no-test` | skip the offline test build in a Tumbleweed container |
+| `-n`, `--dry-run` | write, vendor and test-build; commit nothing to OBS |
+| `--no-save`, `--forget` | control `~/.config/obs-submit/last.conf` |
+
+- **osc:** OBS's own client — yours, or from nixpkgs. Its own login: the
+  first time, osc asks for your openSUSE username and password and keeps them
+  (in your keyring if there is one); the wizard checks it with `osc whois`
+- **releases:** a checkbox list of the openSUSE releases OBS builds for, read
+  from OBS itself (Tumbleweed preselected); they're added to your home
+  project's build targets
+- **spec:** the shared writer in openSUSE's conventions — the spec header,
+  `Release: 0`, the changelog in a `.changes` file (osc's format), vendored
+  dependencies laid out like OBS's own services make them (`vendor.tar.zst`)
+- **test build:** offline in a Tumbleweed container (with the `.changes`
+  turned into `%changelog` the way OBS does), `rpmlint`, installed and run
+- **commit:** the package created if missing, a working copy in the cache,
+  the spec, tarballs and `.changes` committed with `osc commit`
+- **results:** OBS's build results followed until every release is done,
+  failures shown with the end of their build log; then the `zypper addrepo`
+  lines and the one-click install page
+
+**Into openSUSE itself** (optional): Tumbleweed's packages come from
+openSUSE:Factory, which takes packages through a *devel project*: find one
+that fits (`osc develproject openSUSE:Factory <a similar package>`), send it
+there with `osc submitrequest home:<you> <name> <devel project>`; its
+maintainers review it and pass it on to Factory. The wizard prints these
+steps at the end — that review is people's.
+
+### What you need
+
+- an openSUSE account (sign up on <https://build.opensuse.org>)
+- podman or docker; osc (or Nix, which provides it)
+
+## Alpine Linux (aports): `linux-submit.sh alpine`
+
+Gets an app into [Alpine Linux](https://alpinelinux.org)'s package tree,
+[aports](https://gitlab.alpinelinux.org/alpine/aports) — new packages start in
+`testing/`, as Alpine asks — or ships a new version of one that's already
+there, following Alpine's
+[Creating an Alpine package](https://wiki.alpinelinux.org/wiki/Creating_an_Alpine_package),
+the [APKBUILD reference](https://wiki.alpinelinux.org/wiki/APKBUILD_Reference),
+[Creating patches](https://wiki.alpinelinux.org/wiki/Creating_patches) and
+aports' own
+[CODINGSTYLE.md](https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/CODINGSTYLE.md)
+and [COMMITSTYLE.md](https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/COMMITSTYLE.md).
+It ends with a merge request on gitlab.alpinelinux.org.
+
+```bash
+~/path/to/linux-submit.sh alpine            # new package or upgrade: it works out which
+~/path/to/linux-submit.sh alpine --dry-run  # everything up to the commit, nothing pushed
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing; a new package's merge request is opened as a **draft**, for you to review first |
+| `--ask` | ask every question again |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--no-test` | skip the build and checks in an Alpine container (aports' CI still builds it) |
+| `--draft` | open the merge request as a draft |
+| `-n`, `--dry-run` | write, build, check and commit locally; push nothing |
+| `--no-save`, `--forget` | control `~/.config/alpine-submit/last.conf` |
+
+### What it does
+
+- **the name:** checked against aports (main, community, testing) and
+  Alpine's package index, subpackages included. The same software already
+  there makes it an upgrade; a name used by something else is caught and a
+  new one asked for (kept as `alpine-name` in `.store-submit.conf`). Open
+  merge requests for the same aport are shown first
+- **GitLab:** glab (GitLab's CLI; fetched from nixpkgs when it isn't
+  installed) logs in to gitlab.alpinelinux.org once, with a personal access
+  token you make on the page the wizard links (`api` scope) — the token stays
+  in glab's own config, the wizard never sees it. Your fork of `alpine/aports`
+  is found, or made
+- **aports:** a blob-less clone in `~/.cache/store-submit/alpine/aports` (all
+  of its history, file contents fetched only when needed; ~250 MB the first
+  time), with only the aport at hand checked out, updated every run
+- **APKBUILD:** in aports' current style — `maintainer=` first, then
+  `pkgname`/`pkgver`/`pkgrel`, tabs, SPDX `license`, the release tarball as
+  `source` (named so abuild doesn't refuse it, with no `$pkgname` in the URL),
+  `builddir` only when it isn't the default, the recipes of `newapkbuild` and
+  aports for Rust (`cargo-auditable`, `cargo fetch --locked` with
+  `options="net"`), Go, Python (`gpep517`, `-pyc`, the build backend and
+  dependencies mapped to `py3-…` packages), Node (`npm ci`, the published
+  files plus production dependencies in `/usr/lib/node_modules`), Meson
+  (`abuild-meson`), CMake and Make. A `check()` when there are tests,
+  otherwise `options="!check" # no test suite`, as reviewers ask. pkg-config
+  modules and programs the build uses are mapped to Alpine packages through
+  Alpine's own package index; MIT/BSD/ISC license texts are installed into
+  `-doc`. Versions apk can't take (`1.0-rc.1`) become apk's (`1.0_rc1`)
+- **checksums:** `sha512sums` computed the way `abuild checksum` writes them
+- **upgrades:** `pkgver` bumped, `pkgrel` reset to 0, checksums renewed (an
+  aport that builds a git snapshot, `_commit=`, is left to you). Running it
+  again while a merge request is open starts from your branch on GitLab, so
+  the changes the review asked for stay
+- **build + checks:** in an `alpine:edge` container (podman or docker), with a
+  throwaway signing key: first the checks aports' CI runs on a merge request
+  (the APKBUILD parses, `abuild validate`, `apkbuild-shellcheck`,
+  `apkbuild-lint`), then `abuild -r`; the package is installed and its program
+  run with `--version`. What has a clear fix is fixed and said so — man pages,
+  completions, translations or services in the main package get their
+  subpackages (`-doc`, `-bash-completion`, `-lang`, `-openrc`…), `arch` follows
+  abuild's verdict on `noarch`, a missing pkg-config module, program or Python
+  module is added from Alpine's index. Anything else: the relevant log lines,
+  then edit / read the log / rebuild / skip the tests with a reason / quit
+- **review + commit:** the whole change is shown; you'll be the package's
+  maintainer, so a new APKBUILD is read before it's sent (with `--yes`, the
+  merge request becomes a draft). Committed as you, in aports' style:
+  `testing/<name>: new aport` with the homepage and description as the body,
+  or `<repo>/<name>: upgrade to <version>`
+- **merge request:** your fork's master synced with Alpine's (so the push is
+  small), the branch pushed with glab as git's credential helper (no SSH key
+  needed), and the merge request opened against `alpine/aports` master, with
+  commits from maintainers allowed. It says how the APKBUILD was made and
+  checked. Then the to-do list: watch the pipeline (it builds every
+  architecture), answer the reviewers, move the package from testing to
+  community once people have used it (testing is edge-only, and aports
+  removes what isn't moved within 9 months), add it to
+  [Anitya](https://release-monitoring.org)
+
+**Flutter apps** are refused up front: Alpine's Flutter is only in testing
+(x86_64 and aarch64), and each Flutter app needs hand-written patches to build
+with it (see `testing/goguma` or `testing/sly`). Alpine users can install them
+from Flathub — flatpak is in Alpine's community repository.
+
+### What you need
+
+- an account on [gitlab.alpinelinux.org](https://gitlab.alpinelinux.org/users/sign_in)
+  — the wizard links the token page and runs `glab auth login` for you
+- `git`, `curl`, `tar`; podman or docker for the build (recommended)
+- the app on GitHub, GitLab or Codeberg — or anywhere that has a release
+  tarball (self-hosted GitLab and Gitea/Forgejo are found by themselves;
+  otherwise it's asked once and kept as `alpine-source`)
+- an email address for the APKBUILD's `maintainer=` line (the config's
+  `maintainer-email`, or `alpine-email` for Alpine only)
+
+## Gentoo (GURU): `linux-submit.sh guru`
+
+Publishes an app to [GURU](https://wiki.gentoo.org/wiki/Project:GURU) — the
+official Gentoo repository of packages maintained by Gentoo users — or ships a
+new version of one already there, following GURU's
+[rules](https://wiki.gentoo.org/wiki/Project:GURU#Rules) and
+[contributor guide](https://wiki.gentoo.org/wiki/Project:GURU/Information_for_Contributors),
+the [devmanual](https://devmanual.gentoo.org/), and Gentoo's copyright
+([GLEP 76](https://www.gentoo.org/glep/glep-0076.html)) and key
+([GLEP 63](https://www.gentoo.org/glep/glep-0063.html)) policies.
+
+GURU's rules let Gentoo users publish software they wrote, and ask every
+contributor to agree to them first; the wizard asks both once. Newcomers send
+pull requests on Codeberg; after a few are merged, GURU gives you direct push
+access to its `dev` branch — the wizard does whichever you have, and says how
+to ask for access.
+
+```bash
+~/path/to/linux-submit.sh guru            # new package or update: it works out which
+~/path/to/linux-submit.sh guru --dry-run  # write, check, build and commit locally; send nothing
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing; a new ebuild the wizard wrote still stops for your review, and your `Signed-off-by` is only added once you've given it in an earlier run |
+| `--ask` | ask every question again |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--category CAT` | the Gentoo category (else from the config, or asked with a suggestion) |
+| `--key FILE` | the SSH key for git.gentoo.org and codeberg.org |
+| `--gpg-key ID` | the OpenPGP key to sign with (else remembered, or found by your e-mail) |
+| `--pr` | send a pull request even if you can push to `dev` |
+| `--no-test` | skip the test build in a Gentoo container |
+| `-n`, `--dry-run` | write, check, build and commit locally; push and upload nothing |
+| `--no-save`, `--forget` | control `~/.config/guru-submit/` |
+
+### What it does
+
+- **what can't work, first:** Gentoo has no Flutter SDK and Portage builds
+  offline, so Flutter and npm apps are refused up front (GURU only has Flutter
+  apps as `-bin` repackages) — Gentoo users get those from Flathub
+- **the rules:** asks once whether you use Gentoo and agree to GURU's rules
+  (again whenever GURU's pull request form shows they changed); checks the
+  maintainer e-mail against Gentoo Bugzilla — GURU lists only addresses known
+  there in `metadata.xml` — or leaves you out of it if you prefer
+- **the category:** suggested from the description, checked against
+  ::gentoo's and GURU's category lists, kept in `.store-submit.conf`
+- **Gentoo's tree:** the signed daily snapshot, checked against Gentoo's
+  snapshot key in a keyring of its own, refreshed once a day
+- **new, update, or taken:** refuses what ::gentoo already packages (GURU
+  doesn't duplicate it); finds your app in GURU even under another name;
+  asks for another name if a different package has yours
+- **ebuild:** `<category>/<name>/<name>-<version>.ebuild` with the newest EAPI
+  its eclasses support — `cargo.eclass` (CRATES and crate licenses filled in by
+  Gentoo's `pycargoebuild`; a crate tarball above 300 crates, as the eclass
+  asks), `go-module.eclass` (a dependency tarball of the module cache, as the
+  eclass describes, and the modules' licenses), `distutils-r1` (the
+  `DISTUTILS_USE_PEP517` backend from `pyproject.toml`, dependencies mapped to
+  `dev-python/*` and checked to exist), `meson`/`cmake` (pkg-config and
+  `find_package` dependencies mapped to Gentoo packages, `xdg`/`gnome2-utils`
+  for desktop files and schemas), or a plain Makefile with `toolchain-funcs`.
+  `~arch` keywords only, as GURU requires. Plus `metadata.xml` with you as
+  maintainer and the upstream `remote-id`
+- **your own ebuild** (any `<name>-<version>.ebuild` in the app's repository)
+  is used as it is instead — stable keywords turned into `~arch`
+- **updates:** the ebuild already in GURU is copied to the new version (crates
+  or the Go dependency tarball refreshed, the copyright year updated) and the
+  old version dropped, as GURU usually does
+- **dependency tarballs:** Gentoo doesn't host them, and GURU has no space of
+  its own for them — so they're assets of your release: uploaded with `gh`
+  when the app is on GitHub (after you say so), otherwise you upload it and
+  the wizard checks it's the very file the Manifest hashed
+- **Manifest + QA:** `pkgdev manifest` and `pkgcheck scan --net` (errors stop
+  it: edit / carry on / quit), in a Gentoo container made once from
+  `gentoo/stage3` with Gentoo's own tools — or yours, on a Gentoo machine
+  without podman or docker
+- **test build:** `ebuild … merge` in a clean `gentoo/stage3` container with
+  the snapshot: dependencies from Gentoo's binary packages, then the network
+  cut as Portage builds, tests on (`FEATURES=test`), QA notices shown, the
+  program run with `--version`. Failing tests can be skipped for the build or
+  restricted in the ebuild with your reason
+- **review, AI policy, sign-off:** shows the whole change. Gentoo's AI policy
+  (GURU follows it) forbids content made with the help of AI tools — the
+  wizard says plainly that its ebuilds come from fixed templates in a script
+  that was itself written with AI help, and that the call is GURU's; your own
+  ebuild avoids the question. Then the GLEP 76 Certificate of Origin, and a
+  commit signed with your OpenPGP key (checked against GLEP 63; one can be
+  made the GLEP 63 way) and signed off, in GURU's style:
+  `app-misc/foo: new package, add 1.0` / `app-misc/foo: add 1.1, drop 1.0`;
+  then `pkgcheck scan --commits --net`
+- **publish:** with access, rebased on `dev` from git.gentoo.org and pushed
+  (signed push). Without, a pull request on Codeberg via AGit (no fork), as a
+  draft (`WIP:`) with GURU's own form, ticked only where the run checked it or
+  you said so — the AI-policy and Bugzilla boxes stay yours. No Codeberg
+  account: a patch for the gentoo-guru mailing list. Then your to-do list:
+
+```
+   ┏━━ Your turn — GURU's reviewers take it from here
+   ┃ 1. Open the pull request and tick the boxes still empty only if they're true for you …
+   ┃ 2. Then remove "WIP:" from the title — that marks it ready for review
+   ┃ 3. Answer the reviewers there; re-running linux-submit.sh guru updates the same pull request
+   ┃ 4. After a few merged pull requests, ask for direct access to dev: https://bugs.gentoo.org/…
+   ┃
+   ┃    https://codeberg.org/gentoo/guru/pulls/…
+   ┗━━
+```
+
+### What you need
+
+- podman or docker (or, on Gentoo, `dev-util/pkgdev` and `dev-util/pkgcheck`
+  — then without the test build); `git`, `ssh`, `curl`, `python3`, GnuPG
+- a Codeberg account with your SSH key for pull requests — or GURU access for
+  pushing to `dev`
+- an OpenPGP key (the wizard can make one, GLEP 63 style) and, to be listed as
+  maintainer, a [Gentoo Bugzilla](https://bugs.gentoo.org/createaccount.cgi)
+  account with your e-mail
+- the app on GitHub, GitLab, Codeberg or another public git host
+
+## Homebrew: `linux-submit.sh brew`
+
+Publishes an app to [Homebrew](https://brew.sh) — the package manager of macOS,
+and of many Linux users — or ships a new version of it: a formula in
+[homebrew/core](https://github.com/Homebrew/homebrew-core) when the app meets
+Homebrew's [notability bar](https://docs.brew.sh/Package-Acceptance-Policy#notability),
+otherwise in a tap of your own. It follows
+[Adding Software to Homebrew](https://docs.brew.sh/Adding-Software-to-Homebrew),
+[Acceptable Formulae](https://docs.brew.sh/Acceptable-Formulae), the
+[Formula Cookbook](https://docs.brew.sh/Formula-Cookbook),
+[How to Open a Homebrew Pull Request](https://docs.brew.sh/How-To-Open-a-Homebrew-Pull-Request)
+and [Responsible AI Usage](https://docs.brew.sh/Responsible-AI-Usage).
+
+```bash
+~/path/to/linux-submit.sh brew            # new formula or update: it works out which
+~/path/to/linux-submit.sh brew --dry-run  # write, build and check, commit locally; push nothing
+```
+
+| flag | effect |
+| --- | --- |
+| `-y`, `--yes` | ask nothing; a new homebrew/core formula still stops for you to review it |
+| `--ask` | ask every question again |
+| `--repo PATH`, `--config FILE` | the app's checkout, the shared answers |
+| `--core` / `--tap` | homebrew/core, or your own tap (else from the config, or asked) |
+| `--no-test` | don't build and check it — your own tap only |
+| `-n`, `--dry-run` | write, build and check, commit locally; push nothing |
+| `--no-save`, `--forget` | control `~/.config/brew-submit/last.conf` |
+
+### What it does
+
+- **homebrew/core or your tap:** reads the repository's stars, forks and
+  watchers from GitHub, GitLab or Codeberg and checks them against the bar
+  `brew audit --new` applies — 75 stars, 30 forks or 30 watchers; **225, 90 or
+  90 when you own the repository and submit it yourself**; at least 30 days
+  old; not a fork. Then you choose: a pull request to homebrew/core, or your
+  own tap (published right away, `brew install <you>/tap/<name>`). Choosing
+  core below the bar is warned about. The choice is kept in `.store-submit.conf`
+- **the name:** Homebrew's naming rules; another app with the same name in
+  homebrew/core (or, for core, a cask) means picking another name. An app
+  that is in homebrew/core already, from your repository, is an update
+- **Homebrew itself:** yours if `brew` is installed, otherwise Homebrew's own
+  container (`ghcr.io/homebrew/brew`) with podman or docker. Files go in and
+  out through the container's input and output — no mounts, so user ids and
+  SELinux don't matter. Your gh login's token reaches the container only as
+  an environment variable of the commands that call GitHub's API, and is
+  never saved
+- **the formula:** in Homebrew's current style, with its helpers:
+
+  | project | install |
+  | --- | --- |
+  | Rust | `cargo install *std_cargo_args` (the workspace member that builds the program), `def fetch` with `std_cargo_fetch_args`, `deny_network_access!`; `-sys` crates' libraries added |
+  | Go | `go build *std_go_args`, `-X main.version` when `main` has a version variable, `./cmd/<name>`; `def fetch` (`go mod download`) unless vendored |
+  | Python | `include Language::Python::Virtualenv`, homebrew/core's current `python@3.x`, `virtualenv_install_with_resources`; every dependency a pinned `resource`, written by `brew update-python-resources` |
+  | Node (npm) | `npm install *std_npm_args` and the `bin/` links; `npm run build` first when it's built from the tag |
+  | Meson / CMake / Make | `std_meson_args` / `std_cmake_args` / `PREFIX`; pkg-config modules mapped to formulae, `uses_from_macos` and `on_linux` where they belong |
+
+  The source is PyPI's or npm's release when it's published there (Homebrew
+  prefers them), else the forge's tarball of the tag, with the sha256 of the
+  real download. Every dependency is checked to be a Homebrew formula; the
+  description is kept to Homebrew's 80 characters; SPDX licences become
+  `any_of:` / `all_of:` / `with:`
+- **`test do`:** Homebrew wants a test that uses the app — `--version` alone is
+  a "bad test" to its reviewers. The wizard asks for a command and the text
+  its output should contain (kept as `brew-test`), and adds a version check
+  when the build shows `--version` prints the release
+- **build + check:** `brew install --build-from-source` (with
+  `HOMEBREW_NO_INSTALL_FROM_API=1`, as the contribution guide asks),
+  `brew test`, `brew style --fix`, `brew audit --new --strict --online`. A
+  failure is explained (a checksum, a dependency name, network use in the
+  offline install step…) with edit / read the log / build again / quit
+- **review:** Homebrew takes pull requests made with tools, but a person has to
+  review generated code first and answer the reviewers themselves, without
+  AI. So a new homebrew/core formula is shown and needs your "yes"; with
+  `--yes` the wizard stops there with a to-do list
+- **publish to homebrew/core:** your fork (made if missing), homebrew-core's
+  latest commit only, sparse (~13 MB), one commit in Homebrew's style —
+  `<name> <version> (new formula)` in `Formula/<letter>/` (`Formula/lib/` for
+  `lib…`) — pushed with gh, and the pull request with Homebrew's template,
+  ticking only what was done, plus the AI/automation disclosure Homebrew asks
+  for. Already open pull requests for the name, earlier rejected ones, and
+  Homebrew's one-AI-assisted-pull-request-at-a-time rule are checked first
+- **publish to your tap:** `<owner>/homebrew-tap` — the app's owner's when you
+  can push there, else yours. A new tap starts from `brew tap-new`'s template
+  (README and the GitHub Actions that test it), is created with
+  `gh repo create` and pushed; an existing one gets the commit
+- **updates:** a homebrew/core formula that BrewTestBot bumps by itself
+  (autobump, the default for new formulae) is left to it. Otherwise
+  `brew bump-formula-pr --write-only` makes the update, it's built and
+  checked, and the pull request (`<name> <version>`) goes out as above. In
+  your tap the same bump is committed and pushed
+- **your own Homebrew is left as it was:** a formula placed in your
+  homebrew/core checkout for the checks, its test install and a bump are
+  undone when the wizard ends; a dry run puts your tap back too
+
+**Flutter** apps can't be formulae: Homebrew builds formulae from source and
+has no Flutter SDK to build with (Flutter is only a macOS cask, which a formula
+can't depend on). Homebrew's casks install ready-made builds — a macOS `.app`,
+or a Linux AppImage — and this wizard doesn't write casks; on Linux, Flutter
+apps go to Flathub or the Snap Store.
+
+The answers it adds to `.store-submit.conf`: `brew-target` (core or tap),
+`brew-tap`, `brew-name` and `brew-desc` (only when they differ from `name` and
+`description`), `brew-test` and `brew-test-expect`.
+
+### What you need
+
+- `gh`, logged in: homebrew/core's pull requests and taps live on GitHub
+- Homebrew, or podman or docker for Homebrew's container (NixOS:
+  `virtualisation.podman.enable = true;`) — nixpkgs has no Homebrew to fetch
+- the app on GitHub, GitLab, Codeberg or another public git host; for
+  homebrew/core also a license and the notability above
